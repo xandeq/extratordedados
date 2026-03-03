@@ -1,0 +1,15 @@
+AddHandler cgi-script .py
+Options +ExecCGI
+
+# Route everything to index.py
+RewriteEngine On
+RewriteBase /
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^.*$ index.py [QSA,L]
+
+# Allow .py files
+<Files *.py>
+    AddType text/x-python .py
+    AddHandler cgi-script .py
+</Files>
