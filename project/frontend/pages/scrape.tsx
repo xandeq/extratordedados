@@ -198,6 +198,47 @@ export default function Scrape() {
       return ''
     }
 
+    // Derive company name from email domain when text extraction fails
+    const GENERIC_PROVIDERS = new Set([
+      'gmail.com', 'googlemail.com', 'outlook.com', 'outlook.com.br',
+      'hotmail.com', 'hotmail.com.br', 'yahoo.com', 'yahoo.com.br',
+      'live.com', 'msn.com', 'aol.com', 'icloud.com', 'me.com',
+      'protonmail.com', 'proton.me', 'zoho.com', 'mail.com', 'gmx.com',
+      'uol.com.br', 'bol.com.br', 'terra.com.br', 'ig.com.br',
+      'r7.com', 'globo.com', 'globomail.com', 'zipmail.com.br',
+      'oi.com.br', 'veloxmail.com.br',
+    ])
+
+    const deriveCompanyName = (email: string): string => {
+      if (!email || !email.includes('@')) return ''
+      const [localPart, domain] = email.toLowerCase().split('@')
+      if (!domain) return ''
+
+      const normalize = (raw: string): string => {
+        let name = raw
+          .replace(/\d+$/g, '')           // remove trailing numbers: "joao123" -> "joao"
+          .replace(/[._\-]+/g, ' ')       // dots, underscores, hyphens -> spaces
+          .replace(/\s+/g, ' ')           // collapse multiple spaces
+          .trim()
+        if (!name) return ''
+        // Title case
+        return name
+          .split(' ')
+          .filter(w => w.length > 0)
+          .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+          .join(' ')
+      }
+
+      if (GENERIC_PROVIDERS.has(domain)) {
+        // Generic provider: use local part as name
+        return normalize(localPart)
+      } else {
+        // Business domain: use first part of domain
+        const domainName = domain.split('.')[0]
+        return normalize(domainName)
+      }
+    }
+
     // Group: for each email, find nearby phone & URL
     emailHits.forEach(({ value: email, line }) => {
       let phone = ''
@@ -224,11 +265,12 @@ export default function Scrape() {
       })
       if (urlIdx >= 0) usedUrls.add(urlIdx)
 
+      const textCompany = findCompanyName(line)
       contacts.push({
         id: contacts.length + 1,
         email,
         phone: phone ? formatPhone(phone) : '',
-        company_name: findCompanyName(line),
+        company_name: textCompany || deriveCompanyName(email),
         website,
         selected: true,
       })
@@ -249,7 +291,7 @@ export default function Scrape() {
           id: contacts.length + 1,
           email: '',
           phone: formatPhone(ph.value),
-          company_name: findCompanyName(ph.line),
+          company_name: findCompanyName(ph.line) || '',
           website,
           selected: true,
         })

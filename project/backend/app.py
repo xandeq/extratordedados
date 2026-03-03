@@ -2266,6 +2266,45 @@ def bulk_add_tag():
 
     return jsonify({'message': f'Tag "{tag}" added to {len(lead_ids)} leads'})
 
+# ============= Company Name Derivation from Email =============
+
+GENERIC_EMAIL_PROVIDERS = {
+    'gmail.com', 'googlemail.com', 'outlook.com', 'outlook.com.br',
+    'hotmail.com', 'hotmail.com.br', 'yahoo.com', 'yahoo.com.br',
+    'live.com', 'msn.com', 'aol.com', 'icloud.com', 'me.com',
+    'protonmail.com', 'proton.me', 'zoho.com', 'mail.com', 'gmx.com',
+    'uol.com.br', 'bol.com.br', 'terra.com.br', 'ig.com.br',
+    'r7.com', 'globo.com', 'globomail.com', 'zipmail.com.br',
+    'oi.com.br', 'veloxmail.com.br',
+}
+
+def derive_company_name(email):
+    """Derive a company/contact name from an email address.
+    For business domains: uses the domain name (e.g., contato@acme.com.br -> Acme)
+    For generic providers: uses the local part (e.g., joao.silva@gmail.com -> Joao Silva)
+    """
+    if not email or '@' not in email:
+        return ''
+    local_part, domain = email.lower().split('@', 1)
+    if not domain:
+        return ''
+
+    def normalize(raw):
+        import re as _re
+        name = _re.sub(r'\d+$', '', raw)           # remove trailing numbers
+        name = _re.sub(r'[._\-]+', ' ', name)      # dots/underscores/hyphens -> spaces
+        name = _re.sub(r'\s+', ' ', name).strip()   # collapse spaces
+        if not name:
+            return ''
+        return ' '.join(w.capitalize() for w in name.split())
+
+    if domain in GENERIC_EMAIL_PROVIDERS:
+        return normalize(local_part)
+    else:
+        domain_name = domain.split('.')[0]
+        return normalize(domain_name)
+
+
 # ============= Import Leads from Text Extraction =============
 
 @app.route('/api/leads/import', methods=['POST'])
@@ -2301,6 +2340,8 @@ def import_leads():
             email = (c.get('email') or '').strip().lower()
             phone = (c.get('phone') or '').strip()
             company = (c.get('company_name') or '').strip()
+            if not company and email:
+                company = derive_company_name(email)
             website = (c.get('website') or '').strip()
             whatsapp = (c.get('whatsapp') or phone or '').strip()
             contact_name = (c.get('contact_name') or '').strip()
