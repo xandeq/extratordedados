@@ -329,6 +329,49 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )''')
 
+        # API configs table (stores API keys per user per provider)
+        c.execute('''CREATE TABLE IF NOT EXISTS api_configs (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            provider VARCHAR(30) NOT NULL,
+            api_key VARCHAR(500),
+            api_secret VARCHAR(500),
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP,
+            UNIQUE(user_id, provider)
+        )''')
+
+        # API usage tracking (monthly credits)
+        c.execute('''CREATE TABLE IF NOT EXISTS api_usage (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            provider VARCHAR(30) NOT NULL,
+            month_year VARCHAR(7) NOT NULL,
+            credits_used INTEGER DEFAULT 0,
+            credits_limit INTEGER DEFAULT 0,
+            last_reset_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, provider, month_year)
+        )''')
+
+        # API cache (avoid re-querying same domain within 30 days)
+        c.execute('''CREATE TABLE IF NOT EXISTS api_cache (
+            id SERIAL PRIMARY KEY,
+            domain VARCHAR(255) NOT NULL,
+            provider VARCHAR(30) NOT NULL,
+            response_data JSONB,
+            credits_cost INTEGER DEFAULT 1,
+            queried_at TIMESTAMP DEFAULT NOW(),
+            expires_at TIMESTAMP NOT NULL,
+            UNIQUE(domain, provider)
+        )''')
+
+        # enrichment_source column on search_jobs
+        try:
+            c.execute("ALTER TABLE search_jobs ADD COLUMN enrichment_source VARCHAR(30) DEFAULT 'scraping'")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+
         # Indexes
         c.execute('CREATE INDEX IF NOT EXISTS idx_emails_job_id ON emails(job_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id)')
@@ -339,6 +382,10 @@ def init_db():
         c.execute('CREATE INDEX IF NOT EXISTS idx_search_jobs_batch_id ON search_jobs(batch_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_search_logs_job_id ON search_logs(search_job_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_leads_quality ON leads(quality_score)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_api_configs_user ON api_configs(user_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_api_usage_user_month ON api_usage(user_id, month_year)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_api_cache_domain ON api_cache(domain, provider)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_api_cache_expires ON api_cache(expires_at)')
 
         # Insert admin user if not exists
         c.execute('SELECT id FROM users WHERE username = %s', (ADMIN_USERNAME,))
@@ -1263,6 +1310,225 @@ def process_search_job(batch_id, search_jobs_data, user_id):
     finally:
         conn.close()
 
+# ============= API Search Background Job =============
+
+def process_api_search_job(batch_id, search_jobs_data, user_id):
+    """Background thread: search for domains -> enrich via API -> fallback to scraping."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+
+    try:
+        c = conn.cursor()
+        c.execute('UPDATE batches SET status = %s, started_at = %s WHERE id = %s',
+                  ('processing', datetime.now(), batch_id))
+
+        safety = SafetyTracker()
+        session = http_requests.Session()
+        total_leads_found = 0
+
+        for job_idx, job_data in enumerate(search_jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche = job_data['niche']
+            city = job_data['city']
+            state = job_data['state']
+            max_pages = job_data.get('max_pages', 2)
+
+            query = f'{niche} {city} {state}'
+            c.execute('UPDATE search_jobs SET status = %s, started_at = %s, query = %s WHERE id = %s',
+                      ('processing', datetime.now(), query, search_job_id))
+            log_search(c, search_job_id, 'start', message=f'Busca API: {query}')
+
+            if not safety.should_continue():
+                c.execute('UPDATE search_jobs SET status = %s, error_message = %s, finished_at = %s WHERE id = %s',
+                          ('paused', 'Anti-blocking safety pause', datetime.now(), search_job_id))
+                continue
+
+            try:
+                # Phase 1: Domain discovery via web search
+                start_time = time.time()
+                results, engine_used = search_with_fallback(query, max_pages, safety)
+                search_duration = int((time.time() - start_time) * 1000)
+
+                c.execute('UPDATE search_jobs SET engine = %s, total_results = %s WHERE id = %s',
+                          (engine_used, len(results), search_job_id))
+                log_search(c, search_job_id, 'search_complete',
+                          message=f'{engine_used}: {len(results)} dominios em {search_duration}ms',
+                          duration_ms=search_duration)
+
+                # Phase 2: Enrich each domain
+                job_leads = 0
+                job_source = 'scraping'
+                for i, result in enumerate(results):
+                    if not safety.should_continue():
+                        log_search(c, search_job_id, 'safety_pause', message='Pausa durante enriquecimento')
+                        break
+
+                    result_url = result['url']
+                    domain = urlparse(result_url).hostname
+                    if domain:
+                        domain = domain.replace('www.', '')
+
+                    log_search(c, search_job_id, 'enrich_start', url=result_url,
+                              message=f'Enriquecendo {i+1}/{len(results)}: {domain}')
+
+                    # Try API enrichment first
+                    api_leads, source = enrich_domain_with_fallback(c, domain, user_id, search_job_id)
+
+                    if api_leads:
+                        # Save API-sourced leads
+                        job_source = source
+                        now = datetime.now()
+                        org_name = ''
+                        # Get organization from cached result
+                        for prov in ('hunter', 'snov'):
+                            cached = check_api_cache(c, domain, prov)
+                            if cached and cached.get('organization'):
+                                org_name = cached['organization']
+                                break
+
+                        for api_lead in api_leads:
+                            email = normalize_email(api_lead.get('email', ''))
+                            if not email:
+                                continue
+                            contact_name = ' '.join(filter(None, [
+                                api_lead.get('first_name', ''),
+                                api_lead.get('last_name', '')
+                            ])).strip()
+                            phone = api_lead.get('phone', '') or ''
+                            company = org_name or derive_company_name(email)
+                            lead_data = {
+                                'email': email, 'phone': phone,
+                                'company_name': company,
+                            }
+                            quality = calculate_quality_score(lead_data)
+                            try:
+                                c.execute(
+                                    '''INSERT INTO leads
+                                       (batch_id, company_name, email, phone, website, source_url, source,
+                                        city, state, category, contact_name, quality_score,
+                                        extra_data, extracted_at)
+                                       VALUES (%s, %s, %s, %s, %s, %s, %s,
+                                               %s, %s, %s, %s, %s, %s, %s)
+                                       ON CONFLICT (batch_id, email) DO NOTHING''',
+                                    (batch_id, company, email, phone or None,
+                                     f'https://{domain}', result_url, f'api_{source}',
+                                     city, state, niche, contact_name or None, quality,
+                                     json.dumps({'position': api_lead.get('position', ''),
+                                                 'confidence': api_lead.get('confidence', 0),
+                                                 'source_api': source}),
+                                     now)
+                                )
+                                job_leads += 1
+                            except Exception as e:
+                                print(f"[api_search] Lead insert error: {e}")
+
+                        safety.record_success()
+                    else:
+                        # Fallback: deep crawl (scraping)
+                        try:
+                            crawl_start = time.time()
+                            crawl_data = deep_crawl_domain(result_url, session)
+                            crawl_duration = int((time.time() - crawl_start) * 1000)
+
+                            quality = calculate_quality_score(crawl_data)
+                            if not crawl_data.get('city'):
+                                crawl_data['city'] = city
+                            if not crawl_data.get('state'):
+                                crawl_data['state'] = state
+
+                            now = datetime.now()
+                            first_phone = crawl_data['phones'][0] if crawl_data['phones'] else None
+
+                            if crawl_data['emails']:
+                                for email in crawl_data['emails']:
+                                    try:
+                                        c.execute(
+                                            '''INSERT INTO leads
+                                               (batch_id, company_name, email, phone, website, source_url, source,
+                                                instagram, facebook, linkedin, twitter, youtube,
+                                                whatsapp, cnpj, address, city, state, category,
+                                                quality_score, extracted_at)
+                                               VALUES (%s, %s, %s, %s, %s, %s, %s,
+                                                       %s, %s, %s, %s, %s,
+                                                       %s, %s, %s, %s, %s, %s,
+                                                       %s, %s)
+                                               ON CONFLICT (batch_id, email) DO NOTHING''',
+                                            (batch_id, crawl_data['company_name'], email, first_phone,
+                                             crawl_data['website'], result_url, 'search_engine',
+                                             crawl_data.get('instagram'), crawl_data.get('facebook'),
+                                             crawl_data.get('linkedin'), crawl_data.get('twitter'),
+                                             crawl_data.get('youtube'), crawl_data.get('whatsapp'),
+                                             crawl_data.get('cnpj'), crawl_data.get('address'),
+                                             crawl_data.get('city'), crawl_data.get('state'),
+                                             niche, quality, now)
+                                        )
+                                        job_leads += 1
+                                    except Exception as e:
+                                        print(f"[api_search] Scrape lead insert error: {e}")
+
+                            log_search(c, search_job_id, 'crawl_complete', url=result_url,
+                                      message=f'Scraping: {len(crawl_data["emails"])} emails, quality={quality}',
+                                      duration_ms=crawl_duration)
+                            safety.record_success()
+
+                        except Exception as e:
+                            log_search(c, search_job_id, 'crawl_error', url=result_url,
+                                      message=str(e)[:200])
+                            safety.record_error('generic')
+
+                    # Update progress
+                    c.execute('UPDATE search_jobs SET processed_results = %s WHERE id = %s',
+                              (i + 1, search_job_id))
+
+                    # Delay between domains
+                    if i < len(results) - 1:
+                        if source in ('hunter', 'snov', 'hunter_cache', 'snov_cache'):
+                            time.sleep(random.uniform(0.5, 1.5))
+                        else:
+                            time.sleep(random.uniform(*SEARCH_DELAY_BETWEEN_SITES))
+
+                # Finalize search job
+                c.execute('SELECT COUNT(*) FROM leads WHERE batch_id = %s', (batch_id,))
+                total_leads_found = c.fetchone()[0]
+
+                c.execute('UPDATE search_jobs SET status = %s, total_leads = %s, finished_at = %s, enrichment_source = %s WHERE id = %s',
+                          ('completed', job_leads, datetime.now(), job_source, search_job_id))
+
+                log_search(c, search_job_id, 'complete',
+                          message=f'{job_leads} leads ({job_source}) para {city}/{state}')
+
+            except Exception as e:
+                print(f"[api_search] Error in job {search_job_id}: {e}")
+                c.execute('UPDATE search_jobs SET status = %s, error_message = %s, finished_at = %s WHERE id = %s',
+                          ('failed', str(e)[:500], datetime.now(), search_job_id))
+                log_search(c, search_job_id, 'error', message=str(e)[:200])
+
+            # Update batch progress
+            c.execute('UPDATE batches SET processed_urls = %s, total_leads = %s WHERE id = %s',
+                      (job_idx + 1, total_leads_found, batch_id))
+
+            # Delay between cities
+            if job_idx < len(search_jobs_data) - 1:
+                time.sleep(random.uniform(*SEARCH_DELAY_BETWEEN_CITIES))
+
+        # Final batch update
+        c.execute('SELECT COUNT(*) FROM leads WHERE batch_id = %s', (batch_id,))
+        final_count = c.fetchone()[0]
+        c.execute('UPDATE batches SET status = %s, total_leads = %s, finished_at = %s WHERE id = %s',
+                  ('completed', final_count, datetime.now(), batch_id))
+
+    except Exception as e:
+        print(f"[api_search] Fatal error batch {batch_id}: {e}")
+        try:
+            c = conn.cursor()
+            c.execute('UPDATE batches SET status = %s, finished_at = %s WHERE id = %s',
+                      ('failed', datetime.now(), batch_id))
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
 # ============= Background Batch Worker =============
 
 def process_batch(batch_id, urls):
@@ -1924,7 +2190,7 @@ def search_progress(batch_id):
         # Get search sub-jobs
         c.execute(
             '''SELECT id, city, state, engine, status, total_results, processed_results, total_leads,
-                      started_at, finished_at, error_message
+                      started_at, finished_at, error_message, enrichment_source
                FROM search_jobs WHERE batch_id = %s ORDER BY id''',
             (batch_id,)
         )
@@ -1939,6 +2205,7 @@ def search_progress(batch_id):
             'started_at': j[8].isoformat() if j[8] else None,
             'finished_at': j[9].isoformat() if j[9] else None,
             'error_message': j[10],
+            'enrichment_source': j[11] if len(j) > 11 else None,
         })
 
     return jsonify({
@@ -1989,6 +2256,206 @@ def search_logs(batch_id):
             'created_at': l[6].isoformat() if l[6] else None,
             'city': l[7], 'state': l[8],
         } for l in logs]
+    })
+
+
+# ============= API Config & Search Endpoints =============
+
+@app.route('/api/api-config', methods=['POST'])
+@limiter.limit("10/minute")
+def save_api_config_endpoint():
+    """Save or update API configuration for a provider."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json()
+    provider = (data.get('provider') or '').strip().lower()
+    api_key = (data.get('api_key') or '').strip()
+    api_secret = (data.get('api_secret') or '').strip()
+
+    if provider not in ('hunter', 'snov'):
+        return jsonify({'error': 'Provider invalido (hunter ou snov)'}), 400
+    if not api_key:
+        return jsonify({'error': 'API key obrigatoria'}), 400
+    if provider == 'snov' and not api_secret:
+        return jsonify({'error': 'Client Secret obrigatorio para Snov.io'}), 400
+
+    # Validate key
+    valid = False
+    if provider == 'hunter':
+        try:
+            resp = http_requests.get(f'https://api.hunter.io/v2/account?api_key={api_key}', timeout=10)
+            valid = resp.status_code == 200
+        except Exception:
+            pass
+    elif provider == 'snov':
+        token = get_snov_access_token(api_key, api_secret)
+        valid = token is not None
+
+    if not valid:
+        return jsonify({'error': f'Chave de API invalida para {provider}. Verifique as credenciais.'}), 400
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            '''INSERT INTO api_configs (user_id, provider, api_key, api_secret, is_active, created_at, updated_at)
+               VALUES (%s, %s, %s, %s, TRUE, %s, %s)
+               ON CONFLICT (user_id, provider)
+               DO UPDATE SET api_key = %s, api_secret = %s, is_active = TRUE, updated_at = %s''',
+            (user_id, provider, api_key, api_secret or None, datetime.now(), datetime.now(),
+             api_key, api_secret or None, datetime.now())
+        )
+    return jsonify({'message': f'Configuracao {provider} salva com sucesso', 'provider': provider, 'valid': True})
+
+
+@app.route('/api/api-config', methods=['GET'])
+@limiter.limit("30/minute")
+def get_api_configs_endpoint():
+    """Get API configurations and credit usage for the user."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    month_year = datetime.now().strftime('%Y-%m')
+
+    with get_db() as conn:
+        c = conn.cursor()
+        configs = []
+        for provider in ('hunter', 'snov'):
+            c.execute(
+                'SELECT api_key, api_secret, is_active, updated_at FROM api_configs WHERE user_id = %s AND provider = %s',
+                (user_id, provider)
+            )
+            config_row = c.fetchone()
+
+            c.execute(
+                'SELECT credits_used, credits_limit FROM api_usage WHERE user_id = %s AND provider = %s AND month_year = %s',
+                (user_id, provider, month_year)
+            )
+            usage_row = c.fetchone()
+
+            limit = API_CREDIT_LIMITS.get(provider, 0)
+            configs.append({
+                'provider': provider,
+                'configured': config_row is not None,
+                'is_active': config_row[2] if config_row else False,
+                'has_key': bool(config_row[0]) if config_row else False,
+                'updated_at': config_row[3].isoformat() if config_row and config_row[3] else None,
+                'credits_used': usage_row[0] if usage_row else 0,
+                'credits_limit': usage_row[1] if usage_row else limit,
+                'credits_remaining': max(0, (usage_row[1] if usage_row else limit) - (usage_row[0] if usage_row else 0)),
+                'month': month_year,
+            })
+
+    return jsonify({'configs': configs})
+
+
+@app.route('/api/api-config/<provider>', methods=['DELETE'])
+@limiter.limit("10/minute")
+def delete_api_config_endpoint(provider):
+    """Remove API config for a provider."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    if provider not in ('hunter', 'snov'):
+        return jsonify({'error': 'Provider invalido'}), 400
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('DELETE FROM api_configs WHERE user_id = %s AND provider = %s', (user_id, provider))
+
+    return jsonify({'message': f'Configuracao {provider} removida'})
+
+
+@app.route('/api/search-api', methods=['POST'])
+@limiter.limit("3/hour")
+def start_api_search():
+    """Start search + API enrichment job."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'JSON body required'}), 400
+
+    niche = (data.get('niche') or '').strip()
+    region_id = (data.get('region') or '').strip()
+    city = (data.get('city') or '').strip()
+    state = (data.get('state') or '').strip()
+    max_pages = min(3, max(1, int(data.get('max_pages', 2))))
+
+    if not niche:
+        return jsonify({'error': 'Nicho obrigatorio'}), 400
+
+    # Build cities list
+    cities_to_search = []
+    if region_id and region_id in SEARCH_REGIONS:
+        region_data = SEARCH_REGIONS[region_id]
+        for c_name in region_data['cities']:
+            cities_to_search.append({'city': c_name, 'state': region_data['state'], 'region': region_id})
+    elif city and state:
+        cities_to_search.append({'city': city, 'state': state, 'region': 'manual'})
+    else:
+        return jsonify({'error': 'Selecione uma regiao ou informe cidade/estado'}), 400
+
+    # Check if user has any API configured
+    has_apis = False
+    with get_db() as conn:
+        c = conn.cursor()
+        for provider in ('hunter', 'snov'):
+            config = get_api_config(c, user_id, provider)
+            if config and get_api_credits_remaining(c, user_id, provider) > 0:
+                has_apis = True
+                break
+
+    batch_name = f'Busca API: {niche}'
+    if region_id and region_id in SEARCH_REGIONS:
+        batch_name += f' - {SEARCH_REGIONS[region_id]["name"]}'
+    elif city:
+        batch_name += f' - {city}/{state}'
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO batches (user_id, name, status, total_urls, created_at) VALUES (%s, %s, %s, %s, %s) RETURNING id',
+            (user_id, batch_name, 'pending', len(cities_to_search), datetime.now())
+        )
+        batch_id = c.fetchone()[0]
+
+        search_jobs_data = []
+        for city_data in cities_to_search:
+            c.execute(
+                '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, enrichment_source, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                 city_data['region'], max_pages, 'pending', 'api', datetime.now())
+            )
+            sj_id = c.fetchone()[0]
+            search_jobs_data.append({
+                'search_job_id': sj_id,
+                'niche': niche,
+                'city': city_data['city'],
+                'state': city_data['state'],
+                'max_pages': max_pages,
+            })
+
+    thread = threading.Thread(
+        target=process_api_search_job,
+        args=(batch_id, search_jobs_data, user_id),
+        daemon=True
+    )
+    thread.start()
+
+    return jsonify({
+        'batch_id': batch_id,
+        'name': batch_name,
+        'total_cities': len(cities_to_search),
+        'status': 'processing',
+        'search_type': 'api',
+        'has_api_keys': has_apis,
     })
 
 
@@ -2265,6 +2732,237 @@ def bulk_add_tag():
             )
 
     return jsonify({'message': f'Tag "{tag}" added to {len(lead_ids)} leads'})
+
+# ============= API Enrichment Functions =============
+
+API_CREDIT_LIMITS = {'hunter': 25, 'snov': 50}
+
+def get_api_config(cursor, user_id, provider):
+    """Get active API config for a user and provider."""
+    cursor.execute(
+        'SELECT api_key, api_secret, is_active FROM api_configs WHERE user_id = %s AND provider = %s',
+        (user_id, provider)
+    )
+    row = cursor.fetchone()
+    if row and row[2]:
+        return {'api_key': row[0], 'api_secret': row[1]}
+    return None
+
+
+def get_api_credits_remaining(cursor, user_id, provider):
+    """Get remaining API credits for current month."""
+    month_year = datetime.now().strftime('%Y-%m')
+    cursor.execute(
+        'SELECT credits_used, credits_limit FROM api_usage WHERE user_id = %s AND provider = %s AND month_year = %s',
+        (user_id, provider, month_year)
+    )
+    row = cursor.fetchone()
+    if not row:
+        return API_CREDIT_LIMITS.get(provider, 0)
+    return max(0, row[1] - row[0])
+
+
+def record_api_usage(cursor, user_id, provider, cost=1):
+    """Record API credit usage for current month (upsert)."""
+    month_year = datetime.now().strftime('%Y-%m')
+    limit = API_CREDIT_LIMITS.get(provider, 0)
+    cursor.execute(
+        '''INSERT INTO api_usage (user_id, provider, month_year, credits_used, credits_limit)
+           VALUES (%s, %s, %s, %s, %s)
+           ON CONFLICT (user_id, provider, month_year)
+           DO UPDATE SET credits_used = api_usage.credits_used + %s''',
+        (user_id, provider, month_year, cost, limit, cost)
+    )
+
+
+def check_api_cache(cursor, domain, provider):
+    """Check cache for recent API results on domain."""
+    cursor.execute(
+        'SELECT response_data FROM api_cache WHERE domain = %s AND provider = %s AND expires_at > %s',
+        (domain, provider, datetime.now())
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def save_api_cache(cursor, domain, provider, response_data):
+    """Cache API response for domain (30 days)."""
+    expires_at = datetime.now() + timedelta(days=30)
+    cursor.execute(
+        '''INSERT INTO api_cache (domain, provider, response_data, queried_at, expires_at)
+           VALUES (%s, %s, %s, %s, %s)
+           ON CONFLICT (domain, provider)
+           DO UPDATE SET response_data = %s, queried_at = %s, expires_at = %s''',
+        (domain, provider, json.dumps(response_data), datetime.now(), expires_at,
+         json.dumps(response_data), datetime.now(), expires_at)
+    )
+
+
+def enrich_domain_hunter(domain, api_key):
+    """Call Hunter.io Domain Search API."""
+    url = f'https://api.hunter.io/v2/domain-search?domain={domain}&api_key={api_key}'
+    try:
+        start = time.time()
+        resp = http_requests.get(url, timeout=15, headers={'User-Agent': random.choice(USER_AGENTS)})
+        duration = int((time.time() - start) * 1000)
+
+        if resp.status_code == 401:
+            return {'error': 'invalid_key', 'status': 401, 'duration': duration}
+        if resp.status_code == 429:
+            return {'error': 'rate_limited', 'status': 429, 'duration': duration}
+        if resp.status_code != 200:
+            return {'error': f'http_{resp.status_code}', 'status': resp.status_code, 'duration': duration}
+
+        data = resp.json().get('data', {})
+        leads = []
+        for email_obj in data.get('emails', []):
+            lead = {
+                'email': email_obj.get('value', ''),
+                'first_name': email_obj.get('first_name', ''),
+                'last_name': email_obj.get('last_name', ''),
+                'position': email_obj.get('position', ''),
+                'confidence': email_obj.get('confidence', 0),
+                'phone': email_obj.get('phone_number') or '',
+            }
+            if lead['email']:
+                leads.append(lead)
+
+        return {
+            'leads': leads,
+            'organization': data.get('organization', ''),
+            'domain': domain,
+            'status': 200,
+            'duration': duration,
+        }
+    except Exception as e:
+        return {'error': str(e)[:200], 'status': 0, 'duration': 0}
+
+
+def get_snov_access_token(client_id, client_secret):
+    """Get Snov.io OAuth2 access token."""
+    try:
+        resp = http_requests.post('https://api.snov.io/v1/oauth/access_token', json={
+            'grant_type': 'client_credentials',
+            'client_id': client_id,
+            'client_secret': client_secret,
+        }, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get('access_token')
+        return None
+    except Exception:
+        return None
+
+
+def enrich_domain_snov(domain, client_id, client_secret):
+    """Call Snov.io Domain Search API."""
+    token = get_snov_access_token(client_id, client_secret)
+    if not token:
+        return {'error': 'auth_failed', 'status': 401, 'duration': 0}
+
+    try:
+        start = time.time()
+        resp = http_requests.post('https://api.snov.io/v2/domain-emails-with-info', json={
+            'domain': domain,
+            'type': 'all',
+            'limit': 10,
+        }, headers={'Authorization': f'Bearer {token}'}, timeout=15)
+        duration = int((time.time() - start) * 1000)
+
+        if resp.status_code != 200:
+            return {'error': f'http_{resp.status_code}', 'status': resp.status_code, 'duration': duration}
+
+        data = resp.json()
+        if not data.get('success', True) and 'error' in data:
+            return {'error': data['error'], 'status': resp.status_code, 'duration': duration}
+
+        leads = []
+        for email_obj in data.get('emails', []):
+            lead = {
+                'email': email_obj.get('email', ''),
+                'first_name': email_obj.get('first_name', ''),
+                'last_name': email_obj.get('last_name', ''),
+                'position': email_obj.get('position', ''),
+                'confidence': 0,
+                'phone': '',
+            }
+            if lead['email']:
+                leads.append(lead)
+
+        return {
+            'leads': leads,
+            'organization': data.get('name', '') or data.get('companyName', ''),
+            'domain': domain,
+            'status': 200,
+            'duration': duration,
+        }
+    except Exception as e:
+        return {'error': str(e)[:200], 'status': 0, 'duration': 0}
+
+
+def enrich_domain_with_fallback(cursor, domain, user_id, search_job_id=None):
+    """Enrich domain using fallback chain: cache -> Hunter -> Snov -> empty.
+    Returns (leads_list, source_name)."""
+
+    # 1. Check cache for any provider
+    for provider in ('hunter', 'snov'):
+        cached = check_api_cache(cursor, domain, provider)
+        if cached:
+            if search_job_id:
+                log_search(cursor, search_job_id, 'api_cache_hit',
+                          message=f'Cache hit ({provider}) {domain}: {len(cached.get("leads", []))} leads')
+            return cached.get('leads', []), provider + '_cache'
+
+    # 2. Try Hunter.io
+    hunter_config = get_api_config(cursor, user_id, 'hunter')
+    if hunter_config and get_api_credits_remaining(cursor, user_id, 'hunter') > 0:
+        result = enrich_domain_hunter(domain, hunter_config['api_key'])
+        if result.get('status') == 200 and result.get('leads'):
+            record_api_usage(cursor, user_id, 'hunter', 1)
+            save_api_cache(cursor, domain, 'hunter', result)
+            if search_job_id:
+                log_search(cursor, search_job_id, 'api_enrichment', url=f'https://{domain}',
+                          status_code=200, message=f'Hunter: {len(result["leads"])} leads',
+                          duration_ms=result.get('duration', 0))
+            return result['leads'], 'hunter'
+        elif result.get('error') == 'invalid_key':
+            cursor.execute('UPDATE api_configs SET is_active = FALSE WHERE user_id = %s AND provider = %s',
+                          (user_id, 'hunter'))
+            if search_job_id:
+                log_search(cursor, search_job_id, 'api_error', url=f'https://{domain}',
+                          message='Hunter API key invalid - deactivated')
+        elif result.get('status') == 200:
+            # Valid response but 0 leads - cache empty result too
+            record_api_usage(cursor, user_id, 'hunter', 1)
+            save_api_cache(cursor, domain, 'hunter', result)
+            if search_job_id:
+                log_search(cursor, search_job_id, 'api_enrichment', url=f'https://{domain}',
+                          status_code=200, message='Hunter: 0 leads', duration_ms=result.get('duration', 0))
+
+    # 3. Try Snov.io
+    snov_config = get_api_config(cursor, user_id, 'snov')
+    if snov_config and get_api_credits_remaining(cursor, user_id, 'snov') > 0:
+        result = enrich_domain_snov(domain, snov_config['api_key'], snov_config['api_secret'])
+        if result.get('status') == 200 and result.get('leads'):
+            record_api_usage(cursor, user_id, 'snov', 1)
+            save_api_cache(cursor, domain, 'snov', result)
+            if search_job_id:
+                log_search(cursor, search_job_id, 'api_enrichment', url=f'https://{domain}',
+                          status_code=200, message=f'Snov: {len(result["leads"])} leads',
+                          duration_ms=result.get('duration', 0))
+            return result['leads'], 'snov'
+        elif result.get('error') == 'auth_failed':
+            cursor.execute('UPDATE api_configs SET is_active = FALSE WHERE user_id = %s AND provider = %s',
+                          (user_id, 'snov'))
+            if search_job_id:
+                log_search(cursor, search_job_id, 'api_error', url=f'https://{domain}',
+                          message='Snov auth failed - deactivated')
+        elif result.get('status') == 200:
+            record_api_usage(cursor, user_id, 'snov', 1)
+            save_api_cache(cursor, domain, 'snov', result)
+
+    # 4. No API results - caller will fallback to scraping
+    return [], 'scraping'
+
 
 # ============= Company Name Derivation from Email =============
 

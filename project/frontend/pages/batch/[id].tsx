@@ -47,6 +47,7 @@ interface SearchJob {
   started_at: string | null
   finished_at: string | null
   error_message: string | null
+  enrichment_source: string | null
 }
 
 interface SearchLog {
@@ -331,6 +332,23 @@ export default function BatchResults() {
                             : 'bg-sky-50 text-sky-600 border border-sky-200'
                         }`}>
                           {job.engine === 'duckduckgo' ? 'DDG' : 'Bing'}
+                        </span>
+                      )}
+                      {/* Enrichment source badge */}
+                      {job.enrichment_source && job.enrichment_source !== 'scraping' && (
+                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                          job.enrichment_source === 'api_hunter'
+                            ? 'bg-green-50 text-green-600 border border-green-200'
+                            : job.enrichment_source === 'api_snov'
+                            ? 'bg-blue-50 text-blue-600 border border-blue-200'
+                            : job.enrichment_source === 'api_mixed'
+                            ? 'bg-purple-50 text-purple-600 border border-purple-200'
+                            : 'bg-gray-50 text-gray-600 border border-gray-200'
+                        }`}>
+                          {job.enrichment_source === 'api_hunter' ? 'API Hunter' :
+                           job.enrichment_source === 'api_snov' ? 'API Snov' :
+                           job.enrichment_source === 'api_mixed' ? 'API Mix' :
+                           job.enrichment_source}
                         </span>
                       )}
                       {/* Progress bar */}

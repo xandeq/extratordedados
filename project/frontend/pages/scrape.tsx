@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/router'
-import { Globe, FileJson, FileText, ClipboardList, Zap, Info, Loader2, Search, Save, Trash2, MapPin } from 'lucide-react'
+import { Globe, FileJson, FileText, ClipboardList, Zap, Info, Loader2, Search, Save, Trash2, MapPin, Key, ChevronDown, ChevronUp, CheckCircle2, XCircle, AlertTriangle } from 'lucide-react'
 import api from '../lib/api'
 import { useToast } from '../components/Toast'
 
@@ -20,10 +20,20 @@ interface Region {
   cities: string[]
 }
 
-type Tab = 'search' | 'url' | 'json' | 'text' | 'paste'
+interface ApiConfig {
+  provider: string
+  is_active: boolean
+  has_key: boolean
+  credits_used: number
+  credits_limit: number
+  credits_remaining: number
+}
+
+type Tab = 'search' | 'api-search' | 'url' | 'json' | 'text' | 'paste'
 
 const tabItems: { key: Tab; label: string; icon: any }[] = [
   { key: 'search', label: 'Busca', icon: Search },
+  { key: 'api-search', label: 'Busca API', icon: Zap },
   { key: 'url', label: 'URL Unica', icon: Globe },
   { key: 'json', label: 'JSON / Lote', icon: FileJson },
   { key: 'text', label: 'URLs Texto', icon: FileText },
@@ -68,6 +78,124 @@ export default function Scrape() {
       .then((res) => setRegions(res.data.regions || []))
       .catch(() => {})
   }, [])
+
+  // API Search states
+  const [apiConfigs, setApiConfigs] = useState<ApiConfig[]>([])
+  const [apiConfigsLoading, setApiConfigsLoading] = useState(false)
+  const [showApiSettings, setShowApiSettings] = useState(false)
+  const [hunterKey, setHunterKey] = useState('')
+  const [snovClientId, setSnovClientId] = useState('')
+  const [snovSecret, setSnovSecret] = useState('')
+  const [savingApiConfig, setSavingApiConfig] = useState<string | null>(null)
+  const [apiSearchNiche, setApiSearchNiche] = useState('')
+  const [apiSearchRegion, setApiSearchRegion] = useState('')
+  const [apiSearchCity, setApiSearchCity] = useState('')
+  const [apiSearchState, setApiSearchState] = useState('')
+  const [apiSearchMaxPages, setApiSearchMaxPages] = useState(2)
+  const [apiSearchMode, setApiSearchMode] = useState<'region' | 'manual'>('region')
+
+  // Load API configs when tab switches to api-search
+  useEffect(() => {
+    if (tab === 'api-search') {
+      loadApiConfigs()
+    }
+  }, [tab])
+
+  const loadApiConfigs = async () => {
+    setApiConfigsLoading(true)
+    try {
+      const res = await api.get('/api/api-config')
+      setApiConfigs(res.data.configs || [])
+    } catch {
+      // silently fail
+    } finally {
+      setApiConfigsLoading(false)
+    }
+  }
+
+  const handleSaveApiConfig = async (provider: string) => {
+    setSavingApiConfig(provider)
+    setError('')
+    try {
+      const payload: any = { provider }
+      if (provider === 'hunter') {
+        if (!hunterKey.trim()) { setError('Informe a API key do Hunter.io'); setSavingApiConfig(null); return }
+        payload.api_key = hunterKey.trim()
+      } else if (provider === 'snov') {
+        if (!snovClientId.trim() || !snovSecret.trim()) { setError('Informe o Client ID e Secret do Snov.io'); setSavingApiConfig(null); return }
+        payload.api_key = snovClientId.trim()
+        payload.api_secret = snovSecret.trim()
+      }
+      await api.post('/api/api-config', payload)
+      addToast(`API ${provider === 'hunter' ? 'Hunter.io' : 'Snov.io'} configurada com sucesso!`, 'success')
+      setHunterKey('')
+      setSnovClientId('')
+      setSnovSecret('')
+      await loadApiConfigs()
+    } catch (err: any) {
+      setError(err.response?.data?.error || `Erro ao salvar config ${provider}`)
+    } finally {
+      setSavingApiConfig(null)
+    }
+  }
+
+  const handleDeleteApiConfig = async (provider: string) => {
+    try {
+      await api.delete(`/api/api-config/${provider}`)
+      addToast(`API ${provider === 'hunter' ? 'Hunter.io' : 'Snov.io'} removida`, 'success')
+      await loadApiConfigs()
+    } catch (err: any) {
+      setError(err.response?.data?.error || 'Erro ao remover config')
+    }
+  }
+
+  const handleApiSearchSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError('')
+
+    if (!apiSearchNiche.trim()) { setError('Informe o nicho/segmento'); return }
+    if (apiSearchMode === 'region' && !apiSearchRegion) { setError('Selecione uma regiao'); return }
+    if (apiSearchMode === 'manual' && (!apiSearchCity.trim() || !apiSearchState.trim())) {
+      setError('Informe cidade e estado'); return
+    }
+
+    const hasActiveApi = apiConfigs.some(c => c.is_active && c.credits_remaining > 0)
+    if (!hasActiveApi) {
+      setError('Configure ao menos uma API (Hunter.io ou Snov.io) com creditos disponiveis')
+      return
+    }
+
+    setLoading(true)
+    const token = localStorage.getItem('token')
+    if (!token) { router.push('/login'); return }
+
+    try {
+      const payload: any = {
+        niche: apiSearchNiche,
+        max_pages: apiSearchMaxPages,
+      }
+      if (apiSearchMode === 'region') {
+        payload.region = apiSearchRegion
+      } else {
+        payload.city = apiSearchCity
+        payload.state = apiSearchState
+      }
+
+      const response = await api.post('/api/search-api', payload)
+      const { batch_id, total_cities } = response.data
+      addToast(`Busca API iniciada! ${total_cities} cidade(s) sendo processada(s)`, 'success')
+      setTimeout(() => router.push(`/batch/${batch_id}`), 1000)
+    } catch (err: any) {
+      setError(err.response?.data?.error || 'Erro ao iniciar busca API')
+      if (err.response?.status === 401) router.push('/login')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const getApiConfig = (provider: string): ApiConfig | undefined => {
+    return apiConfigs.find(c => c.provider === provider)
+  }
 
   // Paste / Extract states
   const [pasteInput, setPasteInput] = useState('')
@@ -673,6 +801,328 @@ export default function Scrape() {
         </div>
       )}
 
+      {/* Busca API (Hunter.io / Snov.io) */}
+      {tab === 'api-search' && (
+        <div className="space-y-4">
+          {/* Credit Status */}
+          <div className="bg-white rounded-xl border border-gray-200 p-5">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-base font-semibold text-gray-900">Busca via API</h2>
+              <div className="flex gap-2">
+                {apiConfigsLoading ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-gray-400" />
+                ) : (
+                  <>
+                    {(() => {
+                      const hunter = getApiConfig('hunter')
+                      return hunter && hunter.is_active ? (
+                        <span className={`px-2.5 py-1 rounded-lg text-xs font-semibold border ${
+                          hunter.credits_remaining > 5
+                            ? 'bg-green-50 text-green-700 border-green-200'
+                            : hunter.credits_remaining > 0
+                            ? 'bg-amber-50 text-amber-700 border-amber-200'
+                            : 'bg-red-50 text-red-700 border-red-200'
+                        }`}>
+                          Hunter: {hunter.credits_remaining}/{hunter.credits_limit}
+                        </span>
+                      ) : (
+                        <span className="px-2.5 py-1 rounded-lg text-xs font-medium bg-gray-100 text-gray-400 border border-gray-200">
+                          Hunter: -
+                        </span>
+                      )
+                    })()}
+                    {(() => {
+                      const snov = getApiConfig('snov')
+                      return snov && snov.is_active ? (
+                        <span className={`px-2.5 py-1 rounded-lg text-xs font-semibold border ${
+                          snov.credits_remaining > 10
+                            ? 'bg-green-50 text-green-700 border-green-200'
+                            : snov.credits_remaining > 0
+                            ? 'bg-amber-50 text-amber-700 border-amber-200'
+                            : 'bg-red-50 text-red-700 border-red-200'
+                        }`}>
+                          Snov: {snov.credits_remaining}/{snov.credits_limit}
+                        </span>
+                      ) : (
+                        <span className="px-2.5 py-1 rounded-lg text-xs font-medium bg-gray-100 text-gray-400 border border-gray-200">
+                          Snov: -
+                        </span>
+                      )
+                    })()}
+                  </>
+                )}
+              </div>
+            </div>
+            <p className="text-sm text-gray-500">
+              Busca dominios via DuckDuckGo/Bing e enriquece com APIs de email (Hunter.io + Snov.io).
+              Fallback automatico para scraping quando APIs nao retornam resultados.
+            </p>
+          </div>
+
+          {/* API Settings (collapsible) */}
+          <div className="bg-white rounded-xl border border-gray-200">
+            <button
+              onClick={() => setShowApiSettings(!showApiSettings)}
+              className="w-full flex items-center justify-between px-5 py-3.5 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors rounded-xl"
+            >
+              <span className="flex items-center gap-2">
+                <Key className="w-4 h-4 text-gray-400" />
+                Configurar API Keys
+              </span>
+              {showApiSettings ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
+            </button>
+            {showApiSettings && (
+              <div className="border-t border-gray-200 p-5 space-y-5">
+                {/* Hunter.io */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm font-semibold text-gray-800">Hunter.io</label>
+                    {getApiConfig('hunter')?.is_active ? (
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
+                        <span className="text-xs text-green-600 font-medium">Configurada</span>
+                        <button
+                          onClick={() => handleDeleteApiConfig('hunter')}
+                          className="text-xs text-red-400 hover:text-red-600 ml-1"
+                        >
+                          Remover
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-gray-400">Nao configurada</span>
+                    )}
+                  </div>
+                  {!getApiConfig('hunter')?.is_active && (
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={hunterKey}
+                        onChange={(e) => setHunterKey(e.target.value)}
+                        placeholder="API Key do Hunter.io"
+                        className="flex-1 px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all text-sm"
+                      />
+                      <button
+                        onClick={() => handleSaveApiConfig('hunter')}
+                        disabled={savingApiConfig === 'hunter'}
+                        className="px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white rounded-xl text-sm font-medium transition-colors disabled:opacity-60 whitespace-nowrap"
+                      >
+                        {savingApiConfig === 'hunter' ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Salvar'}
+                      </button>
+                    </div>
+                  )}
+                  <p className="text-xs text-gray-400">25 buscas/mes gratis. Obtenha em hunter.io/api</p>
+                </div>
+
+                {/* Snov.io */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm font-semibold text-gray-800">Snov.io</label>
+                    {getApiConfig('snov')?.is_active ? (
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
+                        <span className="text-xs text-green-600 font-medium">Configurada</span>
+                        <button
+                          onClick={() => handleDeleteApiConfig('snov')}
+                          className="text-xs text-red-400 hover:text-red-600 ml-1"
+                        >
+                          Remover
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-gray-400">Nao configurada</span>
+                    )}
+                  </div>
+                  {!getApiConfig('snov')?.is_active && (
+                    <div className="space-y-2">
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          value={snovClientId}
+                          onChange={(e) => setSnovClientId(e.target.value)}
+                          placeholder="Client ID"
+                          className="flex-1 px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all text-sm"
+                        />
+                        <input
+                          type="text"
+                          value={snovSecret}
+                          onChange={(e) => setSnovSecret(e.target.value)}
+                          placeholder="Client Secret"
+                          className="flex-1 px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all text-sm"
+                        />
+                      </div>
+                      <button
+                        onClick={() => handleSaveApiConfig('snov')}
+                        disabled={savingApiConfig === 'snov'}
+                        className="px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white rounded-xl text-sm font-medium transition-colors disabled:opacity-60"
+                      >
+                        {savingApiConfig === 'snov' ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Validar e Salvar'}
+                      </button>
+                    </div>
+                  )}
+                  <p className="text-xs text-gray-400">50 creditos/mes gratis. Obtenha em snov.io/app/api</p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* API Search Form */}
+          <div className="bg-white rounded-xl border border-gray-200 p-6">
+            <h2 className="text-base font-semibold text-gray-900 mb-1">Buscar Leads por Nicho + Cidade (via API)</h2>
+            <p className="text-sm text-gray-500 mb-5">
+              Busca dominios em motores de busca e enriquece cada um via Hunter.io/Snov.io.
+              Se a API nao encontrar dados, faz scraping automatico como fallback.
+            </p>
+
+            <form onSubmit={handleApiSearchSubmit} className="space-y-4">
+              {/* Nicho */}
+              <div>
+                <label htmlFor="apiSearchNiche" className="block text-sm font-medium text-gray-700 mb-1.5">
+                  Nicho / Segmento
+                </label>
+                <input
+                  id="apiSearchNiche"
+                  type="text"
+                  value={apiSearchNiche}
+                  onChange={(e) => setApiSearchNiche(e.target.value)}
+                  placeholder="Ex: dentista, advogado, pet shop, restaurante..."
+                  required
+                  className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all text-sm"
+                />
+              </div>
+
+              {/* Mode toggle */}
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setApiSearchMode('region')}
+                  className={`flex-1 px-4 py-2.5 rounded-xl text-sm font-medium transition-all border ${
+                    apiSearchMode === 'region'
+                      ? 'bg-primary-50 border-primary-200 text-primary-700'
+                      : 'bg-gray-50 border-gray-200 text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  <MapPin className="w-3.5 h-3.5 inline mr-1.5" />
+                  Regiao Pre-definida
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setApiSearchMode('manual')}
+                  className={`flex-1 px-4 py-2.5 rounded-xl text-sm font-medium transition-all border ${
+                    apiSearchMode === 'manual'
+                      ? 'bg-primary-50 border-primary-200 text-primary-700'
+                      : 'bg-gray-50 border-gray-200 text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  Cidade/Estado Manual
+                </button>
+              </div>
+
+              {/* Region select */}
+              {apiSearchMode === 'region' && (
+                <div>
+                  <label htmlFor="apiSearchRegion" className="block text-sm font-medium text-gray-700 mb-1.5">
+                    Regiao
+                  </label>
+                  <select
+                    id="apiSearchRegion"
+                    value={apiSearchRegion}
+                    onChange={(e) => setApiSearchRegion(e.target.value)}
+                    className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all text-sm"
+                  >
+                    <option value="">Selecione uma regiao...</option>
+                    {regions.map((r) => (
+                      <option key={r.id} value={r.id}>
+                        {r.name} ({r.cities.length} cidades)
+                      </option>
+                    ))}
+                  </select>
+                  {apiSearchRegion && regions.find((r) => r.id === apiSearchRegion) && (
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {regions.find((r) => r.id === apiSearchRegion)?.cities.map((city) => (
+                        <span key={city} className="px-2.5 py-1 bg-gray-100 text-gray-600 rounded-lg text-xs font-medium">
+                          {city}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Manual city/state */}
+              {apiSearchMode === 'manual' && (
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="col-span-2">
+                    <label htmlFor="apiSearchCity" className="block text-sm font-medium text-gray-700 mb-1.5">
+                      Cidade
+                    </label>
+                    <input
+                      id="apiSearchCity"
+                      type="text"
+                      value={apiSearchCity}
+                      onChange={(e) => setApiSearchCity(e.target.value)}
+                      placeholder="Ex: Vitoria"
+                      className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="apiSearchState" className="block text-sm font-medium text-gray-700 mb-1.5">
+                      Estado
+                    </label>
+                    <input
+                      id="apiSearchState"
+                      type="text"
+                      value={apiSearchState}
+                      onChange={(e) => setApiSearchState(e.target.value.toUpperCase().slice(0, 2))}
+                      placeholder="ES"
+                      maxLength={2}
+                      className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all text-sm"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Max pages */}
+              <div>
+                <label htmlFor="apiSearchMaxPages" className="block text-sm font-medium text-gray-700 mb-1.5">
+                  Paginas de resultado (1-3)
+                </label>
+                <select
+                  id="apiSearchMaxPages"
+                  value={apiSearchMaxPages}
+                  onChange={(e) => setApiSearchMaxPages(Number(e.target.value))}
+                  className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all text-sm"
+                >
+                  <option value={1}>1 pagina (~10 resultados por cidade)</option>
+                  <option value={2}>2 paginas (~20 resultados por cidade)</option>
+                  <option value={3}>3 paginas (~30 resultados por cidade) - mais lento</option>
+                </select>
+              </div>
+
+              {/* Info box */}
+              <div className="px-4 py-3 bg-purple-50 border border-purple-200 rounded-xl text-purple-700 text-sm space-y-1">
+                <p className="font-semibold">Fluxo de enriquecimento:</p>
+                <ol className="list-decimal list-inside text-xs space-y-0.5">
+                  <li>Busca dominios via DuckDuckGo/Bing</li>
+                  <li>Para cada dominio: verifica cache (30 dias)</li>
+                  <li>Se nao tem cache: tenta Hunter.io (se houver creditos)</li>
+                  <li>Se Hunter nao retornou: tenta Snov.io (se houver creditos)</li>
+                  <li>Se nenhuma API retornou: faz scraping tradicional como fallback</li>
+                </ol>
+              </div>
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="flex items-center justify-center gap-2 w-full px-4 py-3 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-semibold text-sm transition-colors disabled:opacity-60 disabled:cursor-not-allowed shadow-sm"
+              >
+                {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+                {loading ? 'Iniciando busca API...' : 'Iniciar Busca com API'}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* URL Unica */}
       {tab === 'url' && (
         <div className="bg-white rounded-xl border border-gray-200 p-6">
@@ -973,6 +1423,7 @@ export default function Scrape() {
         </div>
         <ol className="space-y-2 text-sm text-gray-600 list-decimal list-inside">
           <li><strong className="text-gray-800">Busca:</strong> Busca automatica por nicho + cidade em motores de busca (DuckDuckGo/Bing)</li>
+          <li><strong className="text-gray-800">Busca API:</strong> Busca dominios + enriquece via Hunter.io/Snov.io com fallback para scraping</li>
           <li><strong className="text-gray-800">URL Unica:</strong> Extrai dados de uma pagina com deep crawl</li>
           <li><strong className="text-gray-800">JSON / Lote:</strong> Cole o resultado do Apify ou lista JSON (ate 500 URLs)</li>
           <li><strong className="text-gray-800">URLs Texto:</strong> Cole URLs simples, uma por linha (ate 500)</li>
