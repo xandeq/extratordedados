@@ -343,11 +343,14 @@ export default function BatchResults() {
                             ? 'bg-blue-50 text-blue-600 border border-blue-200'
                             : job.enrichment_source === 'api_mixed'
                             ? 'bg-purple-50 text-purple-600 border border-purple-200'
+                            : job.enrichment_source === 'api'
+                            ? 'bg-violet-50 text-violet-600 border border-violet-200'
                             : 'bg-gray-50 text-gray-600 border border-gray-200'
                         }`}>
-                          {job.enrichment_source === 'api_hunter' ? 'API Hunter' :
-                           job.enrichment_source === 'api_snov' ? 'API Snov' :
+                          {job.enrichment_source === 'api_hunter' ? 'Hunter.io' :
+                           job.enrichment_source === 'api_snov' ? 'Snov.io' :
                            job.enrichment_source === 'api_mixed' ? 'API Mix' :
+                           job.enrichment_source === 'api' ? 'API' :
                            job.enrichment_source}
                         </span>
                       )}

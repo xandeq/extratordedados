@@ -901,6 +901,11 @@ class SafetyTracker:
         delay = self.base_delay * (2 ** min(self.consecutive_errors, 6))
         return min(delay, self.max_delay)
 
+    def reset_for_new_city(self):
+        """Reset error counters for a new city search (keep blocked/captcha counts but be more lenient)."""
+        self.consecutive_errors = 0
+        self.is_paused = False
+
     def should_continue(self):
         """Check if we should keep going or stop."""
         if self.is_paused:
@@ -1322,7 +1327,6 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
         c.execute('UPDATE batches SET status = %s, started_at = %s WHERE id = %s',
                   ('processing', datetime.now(), batch_id))
 
-        safety = SafetyTracker()
         session = http_requests.Session()
         total_leads_found = 0
 
@@ -1338,31 +1342,68 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                       ('processing', datetime.now(), query, search_job_id))
             log_search(c, search_job_id, 'start', message=f'Busca API: {query}')
 
-            if not safety.should_continue():
-                c.execute('UPDATE search_jobs SET status = %s, error_message = %s, finished_at = %s WHERE id = %s',
-                          ('paused', 'Anti-blocking safety pause', datetime.now(), search_job_id))
-                continue
+            # Fresh safety tracker per city - API mode is more tolerant
+            safety = SafetyTracker()
 
             try:
-                # Phase 1: Domain discovery via web search
+                # Phase 1: Domain discovery via web search (DDG/Bing)
                 start_time = time.time()
                 results, engine_used = search_with_fallback(query, max_pages, safety)
                 search_duration = int((time.time() - start_time) * 1000)
 
                 c.execute('UPDATE search_jobs SET engine = %s, total_results = %s WHERE id = %s',
                           (engine_used, len(results), search_job_id))
-                log_search(c, search_job_id, 'search_complete',
-                          message=f'{engine_used}: {len(results)} dominios em {search_duration}ms',
-                          duration_ms=search_duration)
 
-                # Phase 2: Enrich each domain
+                if results:
+                    log_search(c, search_job_id, 'search_complete',
+                              message=f'{engine_used}: {len(results)} dominios em {search_duration}ms',
+                              duration_ms=search_duration)
+                else:
+                    # Web search returned 0 results (likely CAPTCHA blocked)
+                    # Try to generate candidate domains from niche keywords
+                    log_search(c, search_job_id, 'search_blocked',
+                              message=f'{engine_used}: 0 resultados (CAPTCHA/blocked). Tentando dominios candidatos...',
+                              duration_ms=search_duration)
+
+                    # Generate candidate domains from niche + city
+                    niche_clean = niche.lower().strip().replace(' ', '')
+                    niche_hyphen = niche.lower().strip().replace(' ', '-')
+                    city_clean = city.lower().strip().replace(' ', '')
+                    city_hyphen = city.lower().strip().replace(' ', '-')
+                    state_lower = state.lower().strip()
+
+                    candidate_domains = []
+                    # Common patterns for Brazilian business websites
+                    suffixes = ['.com.br', '.com']
+                    for suffix in suffixes:
+                        candidate_domains.append(f'{niche_clean}{city_clean}{suffix}')
+                        candidate_domains.append(f'{niche_hyphen}-{city_hyphen}{suffix}')
+                        candidate_domains.append(f'{niche_clean}{state_lower}{suffix}')
+                        candidate_domains.append(f'{niche_clean}s{city_clean}{suffix}')
+
+                    # Try enriching candidate domains directly via API
+                    candidates_tried = 0
+                    for cand_domain in candidate_domains[:8]:
+                        api_leads, source = enrich_domain_with_fallback(c, cand_domain, user_id, search_job_id)
+                        candidates_tried += 1
+                        if api_leads:
+                            # Found leads via candidate domain! Add to results
+                            results.append({'url': f'https://{cand_domain}', 'title': f'Candidate: {cand_domain}'})
+                            log_search(c, search_job_id, 'candidate_hit',
+                                      message=f'Dominio candidato {cand_domain}: {len(api_leads)} leads via {source}')
+                        time.sleep(random.uniform(0.3, 0.8))
+
+                    log_search(c, search_job_id, 'candidates_done',
+                              message=f'Testados {candidates_tried} dominios candidatos')
+
+                    c.execute('UPDATE search_jobs SET total_results = %s WHERE id = %s',
+                              (len(results), search_job_id))
+
+                # Phase 2: Enrich each domain via API (Hunter/Snov) with scraping fallback
+                # NOTE: Don't check safety.should_continue() here - API calls are safe
                 job_leads = 0
                 job_source = 'scraping'
                 for i, result in enumerate(results):
-                    if not safety.should_continue():
-                        log_search(c, search_job_id, 'safety_pause', message='Pausa durante enriquecimento')
-                        break
-
                     result_url = result['url']
                     domain = urlparse(result_url).hostname
                     if domain:
@@ -1376,7 +1417,10 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
 
                     if api_leads:
                         # Save API-sourced leads
-                        job_source = source
+                        if source in ('hunter', 'snov'):
+                            job_source = f'api_{source}'
+                        elif '_cache' in source:
+                            job_source = f'api_{source.replace("_cache", "")}'
                         now = datetime.now()
                         org_name = ''
                         # Get organization from cached result
@@ -1411,7 +1455,7 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                                                %s, %s, %s, %s, %s, %s, %s)
                                        ON CONFLICT (batch_id, email) DO NOTHING''',
                                     (batch_id, company, email, phone or None,
-                                     f'https://{domain}', result_url, f'api_{source}',
+                                     f'https://{domain}', result_url, job_source,
                                      city, state, niche, contact_name or None, quality,
                                      json.dumps({'position': api_lead.get('position', ''),
                                                  'confidence': api_lead.get('confidence', 0),
@@ -1422,59 +1466,62 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                             except Exception as e:
                                 print(f"[api_search] Lead insert error: {e}")
 
-                        safety.record_success()
                     else:
-                        # Fallback: deep crawl (scraping)
-                        try:
-                            crawl_start = time.time()
-                            crawl_data = deep_crawl_domain(result_url, session)
-                            crawl_duration = int((time.time() - crawl_start) * 1000)
+                        # Fallback: deep crawl (scraping) - only if safety allows
+                        if not safety.should_continue():
+                            log_search(c, search_job_id, 'safety_pause',
+                                      message=f'Scraping fallback pausado para {domain}')
+                        else:
+                            try:
+                                crawl_start = time.time()
+                                crawl_data = deep_crawl_domain(result_url, session)
+                                crawl_duration = int((time.time() - crawl_start) * 1000)
 
-                            quality = calculate_quality_score(crawl_data)
-                            if not crawl_data.get('city'):
-                                crawl_data['city'] = city
-                            if not crawl_data.get('state'):
-                                crawl_data['state'] = state
+                                quality = calculate_quality_score(crawl_data)
+                                if not crawl_data.get('city'):
+                                    crawl_data['city'] = city
+                                if not crawl_data.get('state'):
+                                    crawl_data['state'] = state
 
-                            now = datetime.now()
-                            first_phone = crawl_data['phones'][0] if crawl_data['phones'] else None
+                                now = datetime.now()
+                                first_phone = crawl_data['phones'][0] if crawl_data['phones'] else None
 
-                            if crawl_data['emails']:
-                                for email in crawl_data['emails']:
-                                    try:
-                                        c.execute(
-                                            '''INSERT INTO leads
-                                               (batch_id, company_name, email, phone, website, source_url, source,
-                                                instagram, facebook, linkedin, twitter, youtube,
-                                                whatsapp, cnpj, address, city, state, category,
-                                                quality_score, extracted_at)
-                                               VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                                       %s, %s, %s, %s, %s,
-                                                       %s, %s, %s, %s, %s, %s,
-                                                       %s, %s)
-                                               ON CONFLICT (batch_id, email) DO NOTHING''',
-                                            (batch_id, crawl_data['company_name'], email, first_phone,
-                                             crawl_data['website'], result_url, 'search_engine',
-                                             crawl_data.get('instagram'), crawl_data.get('facebook'),
-                                             crawl_data.get('linkedin'), crawl_data.get('twitter'),
-                                             crawl_data.get('youtube'), crawl_data.get('whatsapp'),
-                                             crawl_data.get('cnpj'), crawl_data.get('address'),
-                                             crawl_data.get('city'), crawl_data.get('state'),
-                                             niche, quality, now)
-                                        )
-                                        job_leads += 1
-                                    except Exception as e:
-                                        print(f"[api_search] Scrape lead insert error: {e}")
+                                if crawl_data['emails']:
+                                    for email in crawl_data['emails']:
+                                        try:
+                                            c.execute(
+                                                '''INSERT INTO leads
+                                                   (batch_id, company_name, email, phone, website, source_url, source,
+                                                    instagram, facebook, linkedin, twitter, youtube,
+                                                    whatsapp, cnpj, address, city, state, category,
+                                                    quality_score, extracted_at)
+                                                   VALUES (%s, %s, %s, %s, %s, %s, %s,
+                                                           %s, %s, %s, %s, %s,
+                                                           %s, %s, %s, %s, %s, %s,
+                                                           %s, %s)
+                                                   ON CONFLICT (batch_id, email) DO NOTHING''',
+                                                (batch_id, crawl_data['company_name'], email, first_phone,
+                                                 crawl_data['website'], result_url, 'search_engine',
+                                                 crawl_data.get('instagram'), crawl_data.get('facebook'),
+                                                 crawl_data.get('linkedin'), crawl_data.get('twitter'),
+                                                 crawl_data.get('youtube'), crawl_data.get('whatsapp'),
+                                                 crawl_data.get('cnpj'), crawl_data.get('address'),
+                                                 crawl_data.get('city'), crawl_data.get('state'),
+                                                 niche, quality, now)
+                                            )
+                                            job_leads += 1
+                                        except Exception as e:
+                                            print(f"[api_search] Scrape lead insert error: {e}")
 
-                            log_search(c, search_job_id, 'crawl_complete', url=result_url,
-                                      message=f'Scraping: {len(crawl_data["emails"])} emails, quality={quality}',
-                                      duration_ms=crawl_duration)
-                            safety.record_success()
+                                log_search(c, search_job_id, 'crawl_complete', url=result_url,
+                                          message=f'Scraping: {len(crawl_data["emails"])} emails, quality={quality}',
+                                          duration_ms=crawl_duration)
+                                safety.record_success()
 
-                        except Exception as e:
-                            log_search(c, search_job_id, 'crawl_error', url=result_url,
-                                      message=str(e)[:200])
-                            safety.record_error('generic')
+                            except Exception as e:
+                                log_search(c, search_job_id, 'crawl_error', url=result_url,
+                                          message=str(e)[:200])
+                                safety.record_error('generic')
 
                     # Update progress
                     c.execute('UPDATE search_jobs SET processed_results = %s WHERE id = %s',
