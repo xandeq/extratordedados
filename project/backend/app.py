@@ -1092,16 +1092,21 @@ def search_bing(query, max_pages=2, safety=None):
 
 
 def search_with_fallback(query, max_pages=2, safety=None):
-    """Search DuckDuckGo first, fallback to Bing if no results."""
+    """Search DuckDuckGo first, fallback to Bing if no results. Detailed logging!"""
     engine_used = 'duckduckgo'
+    print(f"\n[WEBSEARCH] Iniciando busca web para: '{query}'")
+    print(f"[WEBSEARCH] Tentativa 1: DuckDuckGo (max_pages={max_pages})")
     results = search_duckduckgo(query, max_pages, safety)
+    print(f"[WEBSEARCH] DDG resultado: {len(results)} URLs encontradas")
 
     if not results:
-        print(f"[search] DDG returned 0 results, trying Bing...")
+        delay = random.uniform(3, 6)
+        print(f"[WEBSEARCH] DDG falhou! Esperando {delay:.1f}s antes de tentar Bing...")
         engine_used = 'bing'
-        # Small delay before switching engine
-        time.sleep(random.uniform(3, 6))
+        time.sleep(delay)
+        print(f"[WEBSEARCH] Tentativa 2: Bing")
         results = search_bing(query, max_pages, safety)
+        print(f"[WEBSEARCH] Bing resultado: {len(results)} URLs encontradas")
 
     # Deduplicate by domain
     seen_domains = set()
@@ -1318,14 +1323,27 @@ def process_search_job(batch_id, search_jobs_data, user_id):
 # ============= API Search Background Job =============
 
 def process_api_search_job(batch_id, search_jobs_data, user_id):
-    """Background thread: search for domains -> enrich via API -> fallback to scraping."""
+    """Background thread: search for domains -> enrich via API -> fallback to scraping.
+    Now with SUPER detailed logging for every step!"""
     conn = psycopg2.connect(**DB_CONFIG)
     conn.autocommit = True
+    print(f"\n{'='*60}")
+    print(f"[JOB] Iniciando busca API! batch={batch_id}, cidades={len(search_jobs_data)}")
+    print(f"{'='*60}")
 
     try:
         c = conn.cursor()
         c.execute('UPDATE batches SET status = %s, started_at = %s WHERE id = %s',
                   ('processing', datetime.now(), batch_id))
+
+        # Log API config status upfront
+        for prov in ('hunter', 'snov'):
+            cfg = get_api_config(c, user_id, prov)
+            credits = get_api_credits_remaining(c, user_id, prov) if cfg else 0
+            status = f"ativa, {credits} creditos restantes" if cfg else "NAO configurada"
+            print(f"[JOB] API {prov}: {status}")
+            log_search(c, search_jobs_data[0]['search_job_id'], 'config_check',
+                      message=f'API {prov}: {status}')
 
         session = http_requests.Session()
         total_leads_found = 0
@@ -1338,15 +1356,22 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
             max_pages = job_data.get('max_pages', 2)
 
             query = f'{niche} {city} {state}'
+            print(f"\n{'─'*50}")
+            print(f"[CIDADE {job_idx+1}/{len(search_jobs_data)}] {city}/{state} - query: '{query}'")
+            print(f"{'─'*50}")
             c.execute('UPDATE search_jobs SET status = %s, started_at = %s, query = %s WHERE id = %s',
                       ('processing', datetime.now(), query, search_job_id))
-            log_search(c, search_job_id, 'start', message=f'Busca API: {query}')
+            log_search(c, search_job_id, 'start',
+                      message=f'Partiu! Buscando "{niche}" em {city}/{state} (max {max_pages} pags)')
 
-            # Fresh safety tracker per city - API mode is more tolerant
+            # Fresh safety tracker per city
             safety = SafetyTracker()
 
             try:
-                # Phase 1: Domain discovery via web search (DDG/Bing)
+                # ─── Phase 1: Domain Discovery via Web Search ───
+                log_search(c, search_job_id, 'phase1',
+                          message=f'FASE 1: Cacando dominios no DuckDuckGo/Bing para "{query}"...')
+
                 start_time = time.time()
                 results, engine_used = search_with_fallback(query, max_pages, safety)
                 search_duration = int((time.time() - start_time) * 1000)
@@ -1355,52 +1380,28 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                           (engine_used, len(results), search_job_id))
 
                 if results:
-                    log_search(c, search_job_id, 'search_complete',
-                              message=f'{engine_used}: {len(results)} dominios em {search_duration}ms',
+                    domains_found = [urlparse(r['url']).hostname for r in results if urlparse(r['url']).hostname]
+                    log_search(c, search_job_id, 'search_ok',
+                              message=f'Boa! {engine_used} achou {len(results)} dominios em {search_duration}ms: {", ".join(domains_found[:5])}{"..." if len(domains_found) > 5 else ""}',
                               duration_ms=search_duration)
+                    print(f"[BUSCA] {engine_used} retornou {len(results)} resultados em {search_duration}ms")
+                    for r in results[:5]:
+                        print(f"[BUSCA]   -> {r['url']}")
                 else:
-                    # Web search returned 0 results (likely CAPTCHA blocked)
-                    # Try to generate candidate domains from niche keywords
                     log_search(c, search_job_id, 'search_blocked',
-                              message=f'{engine_used}: 0 resultados (CAPTCHA/blocked). Tentando dominios candidatos...',
+                              message=f'Bloqueado! {engine_used} retornou 0 resultados em {search_duration}ms (CAPTCHA/IP bloqueado). Sem dominios para enriquecer via API.',
                               duration_ms=search_duration)
+                    print(f"[BUSCA] BLOQUEADO! {engine_used} = 0 resultados. DDG e Bing com CAPTCHA.")
 
-                    # Generate candidate domains from niche + city
-                    niche_clean = niche.lower().strip().replace(' ', '')
-                    niche_hyphen = niche.lower().strip().replace(' ', '-')
-                    city_clean = city.lower().strip().replace(' ', '')
-                    city_hyphen = city.lower().strip().replace(' ', '-')
-                    state_lower = state.lower().strip()
+                    # Log skip reason - no candidate domain generation
+                    log_search(c, search_job_id, 'search_skip',
+                              message=f'Sem dominios reais encontrados. APIs precisam de dominios reais para buscar emails. Pulando {city}.')
 
-                    candidate_domains = []
-                    # Common patterns for Brazilian business websites
-                    suffixes = ['.com.br', '.com']
-                    for suffix in suffixes:
-                        candidate_domains.append(f'{niche_clean}{city_clean}{suffix}')
-                        candidate_domains.append(f'{niche_hyphen}-{city_hyphen}{suffix}')
-                        candidate_domains.append(f'{niche_clean}{state_lower}{suffix}')
-                        candidate_domains.append(f'{niche_clean}s{city_clean}{suffix}')
+                # ─── Phase 2: Enrich via API (Hunter/Snov) + Scraping Fallback ───
+                if results:
+                    log_search(c, search_job_id, 'phase2',
+                              message=f'FASE 2: Enriquecendo {len(results)} dominios via Hunter.io / Snov.io...')
 
-                    # Try enriching candidate domains directly via API
-                    candidates_tried = 0
-                    for cand_domain in candidate_domains[:8]:
-                        api_leads, source = enrich_domain_with_fallback(c, cand_domain, user_id, search_job_id)
-                        candidates_tried += 1
-                        if api_leads:
-                            # Found leads via candidate domain! Add to results
-                            results.append({'url': f'https://{cand_domain}', 'title': f'Candidate: {cand_domain}'})
-                            log_search(c, search_job_id, 'candidate_hit',
-                                      message=f'Dominio candidato {cand_domain}: {len(api_leads)} leads via {source}')
-                        time.sleep(random.uniform(0.3, 0.8))
-
-                    log_search(c, search_job_id, 'candidates_done',
-                              message=f'Testados {candidates_tried} dominios candidatos')
-
-                    c.execute('UPDATE search_jobs SET total_results = %s WHERE id = %s',
-                              (len(results), search_job_id))
-
-                # Phase 2: Enrich each domain via API (Hunter/Snov) with scraping fallback
-                # NOTE: Don't check safety.should_continue() here - API calls are safe
                 job_leads = 0
                 job_source = 'scraping'
                 for i, result in enumerate(results):
@@ -1409,8 +1410,9 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                     if domain:
                         domain = domain.replace('www.', '')
 
-                    log_search(c, search_job_id, 'enrich_start', url=result_url,
-                              message=f'Enriquecendo {i+1}/{len(results)}: {domain}')
+                    print(f"\n[DOMINIO {i+1}/{len(results)}] {domain}")
+                    log_search(c, search_job_id, 'domain_start', url=result_url,
+                              message=f'[{i+1}/{len(results)}] Investigando {domain}...')
 
                     # Try API enrichment first
                     api_leads, source = enrich_domain_with_fallback(c, domain, user_id, search_job_id)
@@ -1423,13 +1425,13 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                             job_source = f'api_{source.replace("_cache", "")}'
                         now = datetime.now()
                         org_name = ''
-                        # Get organization from cached result
                         for prov in ('hunter', 'snov'):
                             cached = check_api_cache(c, domain, prov)
                             if cached and cached.get('organization'):
                                 org_name = cached['organization']
                                 break
 
+                        saved_count = 0
                         for api_lead in api_leads:
                             email = normalize_email(api_lead.get('email', ''))
                             if not email:
@@ -1440,10 +1442,7 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                             ])).strip()
                             phone = api_lead.get('phone', '') or ''
                             company = org_name or derive_company_name(email)
-                            lead_data = {
-                                'email': email, 'phone': phone,
-                                'company_name': company,
-                            }
+                            lead_data = {'email': email, 'phone': phone, 'company_name': company}
                             quality = calculate_quality_score(lead_data)
                             try:
                                 c.execute(
@@ -1462,15 +1461,23 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                                                  'source_api': source}),
                                      now)
                                 )
+                                saved_count += 1
                                 job_leads += 1
                             except Exception as e:
-                                print(f"[api_search] Lead insert error: {e}")
+                                print(f"[SAVE] Erro ao salvar lead: {e}")
+
+                        log_search(c, search_job_id, 'leads_saved', url=result_url,
+                                  message=f'Salvos {saved_count} leads de {domain} via {source}! (org: {org_name or "N/A"})')
+                        print(f"[SAVE] {saved_count} leads salvos de {domain}")
 
                     else:
-                        # Fallback: deep crawl (scraping) - only if safety allows
+                        # Fallback: deep crawl (scraping)
+                        log_search(c, search_job_id, 'scrape_fallback', url=result_url,
+                                  message=f'APIs nao acharam emails em {domain}. Tentando scraping direto...')
+
                         if not safety.should_continue():
-                            log_search(c, search_job_id, 'safety_pause',
-                                      message=f'Scraping fallback pausado para {domain}')
+                            log_search(c, search_job_id, 'safety_pause', url=result_url,
+                                      message=f'Scraping pausado por seguranca (muitos erros). Pulando {domain}')
                         else:
                             try:
                                 crawl_start = time.time()
@@ -1485,9 +1492,10 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
 
                                 now = datetime.now()
                                 first_phone = crawl_data['phones'][0] if crawl_data['phones'] else None
+                                emails_found = crawl_data.get('emails', [])
 
-                                if crawl_data['emails']:
-                                    for email in crawl_data['emails']:
+                                if emails_found:
+                                    for email in emails_found:
                                         try:
                                             c.execute(
                                                 '''INSERT INTO leads
@@ -1511,16 +1519,16 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                                             )
                                             job_leads += 1
                                         except Exception as e:
-                                            print(f"[api_search] Scrape lead insert error: {e}")
+                                            print(f"[SAVE] Erro scrape lead: {e}")
 
-                                log_search(c, search_job_id, 'crawl_complete', url=result_url,
-                                          message=f'Scraping: {len(crawl_data["emails"])} emails, quality={quality}',
+                                log_search(c, search_job_id, 'scrape_done', url=result_url,
+                                          message=f'Scraping de {domain}: {len(emails_found)} emails, empresa="{crawl_data.get("company_name", "?")}", quality={quality} ({crawl_duration}ms)',
                                           duration_ms=crawl_duration)
                                 safety.record_success()
 
                             except Exception as e:
-                                log_search(c, search_job_id, 'crawl_error', url=result_url,
-                                          message=str(e)[:200])
+                                log_search(c, search_job_id, 'scrape_error', url=result_url,
+                                          message=f'Scraping falhou em {domain}: {str(e)[:150]}')
                                 safety.record_error('generic')
 
                     # Update progress
@@ -1530,25 +1538,33 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                     # Delay between domains
                     if i < len(results) - 1:
                         if source in ('hunter', 'snov', 'hunter_cache', 'snov_cache'):
-                            time.sleep(random.uniform(0.5, 1.5))
+                            delay = random.uniform(0.5, 1.5)
                         else:
-                            time.sleep(random.uniform(*SEARCH_DELAY_BETWEEN_SITES))
+                            delay = random.uniform(*SEARCH_DELAY_BETWEEN_SITES)
+                        time.sleep(delay)
 
-                # Finalize search job
+                # ─── Finalize search job ───
                 c.execute('SELECT COUNT(*) FROM leads WHERE batch_id = %s', (batch_id,))
                 total_leads_found = c.fetchone()[0]
 
                 c.execute('UPDATE search_jobs SET status = %s, total_leads = %s, finished_at = %s, enrichment_source = %s WHERE id = %s',
                           ('completed', job_leads, datetime.now(), job_source, search_job_id))
 
-                log_search(c, search_job_id, 'complete',
-                          message=f'{job_leads} leads ({job_source}) para {city}/{state}')
+                summary_msg = f'Fim! {city}/{state}: {job_leads} leads encontrados via {job_source}'
+                if job_leads == 0 and not results:
+                    summary_msg = f'Fim! {city}/{state}: 0 leads (busca web bloqueada, sem dominios para APIs)'
+                elif job_leads == 0 and results:
+                    summary_msg = f'Fim! {city}/{state}: 0 leads ({len(results)} dominios testados, nenhum tinha emails)'
+                log_search(c, search_job_id, 'complete', message=summary_msg)
+                print(f"[FIM] {summary_msg}")
 
             except Exception as e:
-                print(f"[api_search] Error in job {search_job_id}: {e}")
+                print(f"[ERRO] Falha na cidade {city}: {e}")
+                import traceback
+                traceback.print_exc()
                 c.execute('UPDATE search_jobs SET status = %s, error_message = %s, finished_at = %s WHERE id = %s',
                           ('failed', str(e)[:500], datetime.now(), search_job_id))
-                log_search(c, search_job_id, 'error', message=str(e)[:200])
+                log_search(c, search_job_id, 'error', message=f'Erro fatal em {city}: {str(e)[:200]}')
 
             # Update batch progress
             c.execute('UPDATE batches SET processed_urls = %s, total_leads = %s WHERE id = %s',
@@ -1556,16 +1572,23 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
 
             # Delay between cities
             if job_idx < len(search_jobs_data) - 1:
-                time.sleep(random.uniform(*SEARCH_DELAY_BETWEEN_CITIES))
+                delay = random.uniform(*SEARCH_DELAY_BETWEEN_CITIES)
+                print(f"[DELAY] Esperando {delay:.1f}s antes da proxima cidade...")
+                time.sleep(delay)
 
         # Final batch update
         c.execute('SELECT COUNT(*) FROM leads WHERE batch_id = %s', (batch_id,))
         final_count = c.fetchone()[0]
         c.execute('UPDATE batches SET status = %s, total_leads = %s, finished_at = %s WHERE id = %s',
                   ('completed', final_count, datetime.now(), batch_id))
+        print(f"\n{'='*60}")
+        print(f"[JOB] CONCLUIDO! batch={batch_id}, total_leads={final_count}")
+        print(f"{'='*60}\n")
 
     except Exception as e:
-        print(f"[api_search] Fatal error batch {batch_id}: {e}")
+        print(f"[FATAL] Erro fatal no batch {batch_id}: {e}")
+        import traceback
+        traceback.print_exc()
         try:
             c = conn.cursor()
             c.execute('UPDATE batches SET status = %s, finished_at = %s WHERE id = %s',
@@ -2283,15 +2306,15 @@ def search_logs(batch_id):
         if not c.fetchone():
             return jsonify({'error': 'Batch not found'}), 404
 
-        # Get logs from all search jobs in this batch
+        # Get logs from all search jobs in this batch (increased limit, chronological order)
         c.execute(
             '''SELECT sl.id, sl.log_type, sl.url, sl.status_code, sl.message, sl.duration_ms, sl.created_at,
                       sj.city, sj.state
                FROM search_logs sl
                JOIN search_jobs sj ON sl.search_job_id = sj.id
                WHERE sj.batch_id = %s
-               ORDER BY sl.created_at DESC
-               LIMIT 200''',
+               ORDER BY sl.created_at ASC
+               LIMIT 500''',
             (batch_id,)
         )
         logs = c.fetchall()
@@ -2846,19 +2869,29 @@ def save_api_cache(cursor, domain, provider, response_data):
 
 
 def enrich_domain_hunter(domain, api_key):
-    """Call Hunter.io Domain Search API."""
-    url = f'https://api.hunter.io/v2/domain-search?domain={domain}&api_key={api_key}'
+    """Call Hunter.io Domain Search API - with full request/response logging."""
+    req_url = f'https://api.hunter.io/v2/domain-search?domain={domain}&api_key={api_key[:8]}...'
+    full_url = f'https://api.hunter.io/v2/domain-search?domain={domain}&api_key={api_key}'
+    print(f"[hunter] Batendo na porta do Hunter.io para '{domain}' ...")
+    print(f"[hunter] REQUEST: GET {req_url}")
     try:
         start = time.time()
-        resp = http_requests.get(url, timeout=15, headers={'User-Agent': random.choice(USER_AGENTS)})
+        resp = http_requests.get(full_url, timeout=15, headers={'User-Agent': random.choice(USER_AGENTS)})
         duration = int((time.time() - start) * 1000)
+        # Log response details
+        resp_preview = resp.text[:300] if resp.text else '(vazio)'
+        print(f"[hunter] RESPONSE: status={resp.status_code}, duration={duration}ms, body_size={len(resp.text)}")
+        print(f"[hunter] BODY PREVIEW: {resp_preview}")
 
         if resp.status_code == 401:
-            return {'error': 'invalid_key', 'status': 401, 'duration': duration}
+            print(f"[hunter] ERRO: Chave invalida! O Hunter disse 'quem eh voce?' (401)")
+            return {'error': 'invalid_key', 'status': 401, 'duration': duration, 'raw_response': resp_preview}
         if resp.status_code == 429:
-            return {'error': 'rate_limited', 'status': 429, 'duration': duration}
+            print(f"[hunter] ERRO: Limite excedido! Hunter pediu calma (429)")
+            return {'error': 'rate_limited', 'status': 429, 'duration': duration, 'raw_response': resp_preview}
         if resp.status_code != 200:
-            return {'error': f'http_{resp.status_code}', 'status': resp.status_code, 'duration': duration}
+            print(f"[hunter] ERRO: Resposta inesperada HTTP {resp.status_code}")
+            return {'error': f'http_{resp.status_code}', 'status': resp.status_code, 'duration': duration, 'raw_response': resp_preview}
 
         data = resp.json().get('data', {})
         leads = []
@@ -2874,53 +2907,74 @@ def enrich_domain_hunter(domain, api_key):
             if lead['email']:
                 leads.append(lead)
 
+        org = data.get('organization', '')
+        print(f"[hunter] RESULTADO: {len(leads)} emails encontrados, org='{org}', domain='{domain}'")
+        if leads:
+            for i, l in enumerate(leads[:3]):
+                print(f"[hunter]   Lead {i+1}: {l['email']} ({l['first_name']} {l['last_name']}) - {l['position']}")
+
         return {
             'leads': leads,
-            'organization': data.get('organization', ''),
+            'organization': org,
             'domain': domain,
             'status': 200,
             'duration': duration,
+            'raw_response': resp_preview,
         }
     except Exception as e:
-        return {'error': str(e)[:200], 'status': 0, 'duration': 0}
+        print(f"[hunter] EXCECAO: {e}")
+        return {'error': str(e)[:200], 'status': 0, 'duration': 0, 'raw_response': str(e)[:200]}
 
 
 def get_snov_access_token(client_id, client_secret):
-    """Get Snov.io OAuth2 access token."""
+    """Get Snov.io OAuth2 access token - with logging."""
+    print(f"[snov] Pedindo token OAuth ao Snov.io (client_id={client_id[:8]}...)")
     try:
         resp = http_requests.post('https://api.snov.io/v1/oauth/access_token', json={
             'grant_type': 'client_credentials',
             'client_id': client_id,
             'client_secret': client_secret,
         }, timeout=10)
+        print(f"[snov] Token response: status={resp.status_code}, body={resp.text[:200]}")
         if resp.status_code == 200:
-            return resp.json().get('access_token')
+            token = resp.json().get('access_token')
+            print(f"[snov] Token obtido com sucesso! (len={len(token) if token else 0})")
+            return token
+        print(f"[snov] ERRO ao obter token! Status={resp.status_code}")
         return None
-    except Exception:
+    except Exception as e:
+        print(f"[snov] EXCECAO no token: {e}")
         return None
 
 
 def enrich_domain_snov(domain, client_id, client_secret):
-    """Call Snov.io Domain Search API."""
+    """Call Snov.io Domain Search API - with full request/response logging."""
+    print(f"[snov] Acordando o Snov.io para '{domain}' ...")
     token = get_snov_access_token(client_id, client_secret)
     if not token:
-        return {'error': 'auth_failed', 'status': 401, 'duration': 0}
+        print(f"[snov] Snov se recusou a dar o token! Auth falhou")
+        return {'error': 'auth_failed', 'status': 401, 'duration': 0, 'raw_response': 'token_failed'}
 
     try:
+        req_body = {'domain': domain, 'type': 'all', 'limit': 10}
+        print(f"[snov] REQUEST: POST https://api.snov.io/v2/domain-emails-with-info")
+        print(f"[snov] BODY: {json.dumps(req_body)}")
         start = time.time()
-        resp = http_requests.post('https://api.snov.io/v2/domain-emails-with-info', json={
-            'domain': domain,
-            'type': 'all',
-            'limit': 10,
-        }, headers={'Authorization': f'Bearer {token}'}, timeout=15)
+        resp = http_requests.post('https://api.snov.io/v2/domain-emails-with-info', json=req_body,
+                                  headers={'Authorization': f'Bearer {token[:15]}...'}, timeout=15)
         duration = int((time.time() - start) * 1000)
+        resp_preview = resp.text[:400] if resp.text else '(vazio)'
+        print(f"[snov] RESPONSE: status={resp.status_code}, duration={duration}ms, body_size={len(resp.text)}")
+        print(f"[snov] BODY PREVIEW: {resp_preview}")
 
         if resp.status_code != 200:
-            return {'error': f'http_{resp.status_code}', 'status': resp.status_code, 'duration': duration}
+            print(f"[snov] ERRO: Snov retornou HTTP {resp.status_code}")
+            return {'error': f'http_{resp.status_code}', 'status': resp.status_code, 'duration': duration, 'raw_response': resp_preview}
 
         data = resp.json()
         if not data.get('success', True) and 'error' in data:
-            return {'error': data['error'], 'status': resp.status_code, 'duration': duration}
+            print(f"[snov] ERRO na resposta: {data['error']}")
+            return {'error': data['error'], 'status': resp.status_code, 'duration': duration, 'raw_response': resp_preview}
 
         leads = []
         for email_obj in data.get('emails', []):
@@ -2935,40 +2989,61 @@ def enrich_domain_snov(domain, client_id, client_secret):
             if lead['email']:
                 leads.append(lead)
 
+        org = data.get('name', '') or data.get('companyName', '')
+        print(f"[snov] RESULTADO: {len(leads)} emails encontrados, org='{org}', domain='{domain}'")
+        if leads:
+            for i, l in enumerate(leads[:3]):
+                print(f"[snov]   Lead {i+1}: {l['email']} ({l['first_name']} {l['last_name']})")
+
         return {
             'leads': leads,
-            'organization': data.get('name', '') or data.get('companyName', ''),
+            'organization': org,
             'domain': domain,
             'status': 200,
             'duration': duration,
+            'raw_response': resp_preview,
         }
     except Exception as e:
-        return {'error': str(e)[:200], 'status': 0, 'duration': 0}
+        print(f"[snov] EXCECAO: {e}")
+        return {'error': str(e)[:200], 'status': 0, 'duration': 0, 'raw_response': str(e)[:200]}
 
 
 def enrich_domain_with_fallback(cursor, domain, user_id, search_job_id=None):
     """Enrich domain using fallback chain: cache -> Hunter -> Snov -> empty.
-    Returns (leads_list, source_name)."""
+    Returns (leads_list, source_name).
+    FIX: Only cache results WITH leads. 0-lead cache was blocking Snov from being tried."""
 
-    # 1. Check cache for any provider
+    print(f"[enrich] === Iniciando enriquecimento para '{domain}' ===")
+
+    # 1. Check cache - but ONLY return cache hits that have leads
     for provider in ('hunter', 'snov'):
         cached = check_api_cache(cursor, domain, provider)
         if cached:
-            if search_job_id:
-                log_search(cursor, search_job_id, 'api_cache_hit',
-                          message=f'Cache hit ({provider}) {domain}: {len(cached.get("leads", []))} leads')
-            return cached.get('leads', []), provider + '_cache'
+            cached_leads = cached.get('leads', [])
+            if cached_leads:
+                if search_job_id:
+                    log_search(cursor, search_job_id, 'api_cache',
+                              url=f'https://{domain}',
+                              message=f'Cache com leads! ({provider}) {domain}: {len(cached_leads)} leads - pulando API')
+                print(f"[enrich] Cache HIT com leads ({provider}) para {domain}: {len(cached_leads)} leads")
+                return cached_leads, provider + '_cache'
+            else:
+                print(f"[enrich] Cache existe ({provider}) para {domain} mas com 0 leads - ignorando, vou tentar outra API")
 
     # 2. Try Hunter.io
     hunter_config = get_api_config(cursor, user_id, 'hunter')
-    if hunter_config and get_api_credits_remaining(cursor, user_id, 'hunter') > 0:
+    hunter_credits = get_api_credits_remaining(cursor, user_id, 'hunter') if hunter_config else 0
+    print(f"[enrich] Hunter.io: config={'SIM' if hunter_config else 'NAO'}, creditos_restantes={hunter_credits}")
+
+    if hunter_config and hunter_credits > 0:
         result = enrich_domain_hunter(domain, hunter_config['api_key'])
         if result.get('status') == 200 and result.get('leads'):
             record_api_usage(cursor, user_id, 'hunter', 1)
             save_api_cache(cursor, domain, 'hunter', result)
             if search_job_id:
-                log_search(cursor, search_job_id, 'api_enrichment', url=f'https://{domain}',
-                          status_code=200, message=f'Hunter: {len(result["leads"])} leads',
+                log_search(cursor, search_job_id, 'api_hunter_ok', url=f'https://{domain}',
+                          status_code=200,
+                          message=f'Hunter achou ouro! {len(result["leads"])} leads em {domain} ({result.get("duration", 0)}ms)',
                           duration_ms=result.get('duration', 0))
             return result['leads'], 'hunter'
         elif result.get('error') == 'invalid_key':
@@ -2976,25 +3051,50 @@ def enrich_domain_with_fallback(cursor, domain, user_id, search_job_id=None):
                           (user_id, 'hunter'))
             if search_job_id:
                 log_search(cursor, search_job_id, 'api_error', url=f'https://{domain}',
-                          message='Hunter API key invalid - deactivated')
-        elif result.get('status') == 200:
-            # Valid response but 0 leads - cache empty result too
-            record_api_usage(cursor, user_id, 'hunter', 1)
-            save_api_cache(cursor, domain, 'hunter', result)
+                          status_code=401,
+                          message=f'Hunter rejeitou a chave! API key desativada automaticamente')
+        elif result.get('error') == 'rate_limited':
             if search_job_id:
-                log_search(cursor, search_job_id, 'api_enrichment', url=f'https://{domain}',
-                          status_code=200, message='Hunter: 0 leads', duration_ms=result.get('duration', 0))
+                log_search(cursor, search_job_id, 'api_error', url=f'https://{domain}',
+                          status_code=429,
+                          message=f'Hunter pediu calma! Rate limited (429)')
+        elif result.get('status') == 200:
+            # 0 leads - charge credit but DON'T cache (so Snov can try later)
+            record_api_usage(cursor, user_id, 'hunter', 1)
+            if search_job_id:
+                log_search(cursor, search_job_id, 'api_hunter_empty', url=f'https://{domain}',
+                          status_code=200,
+                          message=f'Hunter respondeu mas 0 leads para {domain} ({result.get("duration", 0)}ms) - tentando Snov...',
+                          duration_ms=result.get('duration', 0))
+        else:
+            err = result.get('error', 'desconhecido')
+            if search_job_id:
+                log_search(cursor, search_job_id, 'api_error', url=f'https://{domain}',
+                          status_code=result.get('status', 0),
+                          message=f'Hunter deu erro: {err} (status={result.get("status", 0)})')
+    elif hunter_config and hunter_credits <= 0:
+        if search_job_id:
+            log_search(cursor, search_job_id, 'api_skip', url=f'https://{domain}',
+                      message=f'Hunter sem creditos! 0 restantes este mes - pulando')
+    elif not hunter_config:
+        if search_job_id:
+            log_search(cursor, search_job_id, 'api_skip', url=f'https://{domain}',
+                      message=f'Hunter nao configurado - pulando')
 
-    # 3. Try Snov.io
+    # 3. Try Snov.io (ALWAYS try if Hunter didn't find leads)
     snov_config = get_api_config(cursor, user_id, 'snov')
-    if snov_config and get_api_credits_remaining(cursor, user_id, 'snov') > 0:
+    snov_credits = get_api_credits_remaining(cursor, user_id, 'snov') if snov_config else 0
+    print(f"[enrich] Snov.io: config={'SIM' if snov_config else 'NAO'}, creditos_restantes={snov_credits}")
+
+    if snov_config and snov_credits > 0:
         result = enrich_domain_snov(domain, snov_config['api_key'], snov_config['api_secret'])
         if result.get('status') == 200 and result.get('leads'):
             record_api_usage(cursor, user_id, 'snov', 1)
             save_api_cache(cursor, domain, 'snov', result)
             if search_job_id:
-                log_search(cursor, search_job_id, 'api_enrichment', url=f'https://{domain}',
-                          status_code=200, message=f'Snov: {len(result["leads"])} leads',
+                log_search(cursor, search_job_id, 'api_snov_ok', url=f'https://{domain}',
+                          status_code=200,
+                          message=f'Snov salvou o dia! {len(result["leads"])} leads em {domain} ({result.get("duration", 0)}ms)',
                           duration_ms=result.get('duration', 0))
             return result['leads'], 'snov'
         elif result.get('error') == 'auth_failed':
@@ -3002,10 +3102,30 @@ def enrich_domain_with_fallback(cursor, domain, user_id, search_job_id=None):
                           (user_id, 'snov'))
             if search_job_id:
                 log_search(cursor, search_job_id, 'api_error', url=f'https://{domain}',
-                          message='Snov auth failed - deactivated')
+                          status_code=401,
+                          message=f'Snov nao reconheceu as credenciais! Config desativada')
         elif result.get('status') == 200:
+            # 0 leads from Snov too
             record_api_usage(cursor, user_id, 'snov', 1)
-            save_api_cache(cursor, domain, 'snov', result)
+            if search_job_id:
+                log_search(cursor, search_job_id, 'api_snov_empty', url=f'https://{domain}',
+                          status_code=200,
+                          message=f'Snov tambem 0 leads para {domain} ({result.get("duration", 0)}ms) - dominio seco!',
+                          duration_ms=result.get('duration', 0))
+        else:
+            err = result.get('error', 'desconhecido')
+            if search_job_id:
+                log_search(cursor, search_job_id, 'api_error', url=f'https://{domain}',
+                          status_code=result.get('status', 0),
+                          message=f'Snov deu erro: {err} (status={result.get("status", 0)})')
+    elif snov_config and snov_credits <= 0:
+        if search_job_id:
+            log_search(cursor, search_job_id, 'api_skip', url=f'https://{domain}',
+                      message=f'Snov sem creditos! 0 restantes este mes')
+    elif not snov_config:
+        if search_job_id:
+            log_search(cursor, search_job_id, 'api_skip', url=f'https://{domain}',
+                      message=f'Snov nao configurado - pulando')
 
     # 4. No API results - caller will fallback to scraping
     return [], 'scraping'

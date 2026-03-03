@@ -160,15 +160,19 @@ export default function BatchResults() {
             name: sp.name || prev.name,
           } : prev)
 
+          // Always fetch logs during processing too (live updates!)
+          try {
+            const logsResp = await api.get(`/api/search/${id}/logs`)
+            if (logsResp.data.logs && logsResp.data.logs.length > 0) {
+              setSearchLogs(logsResp.data.logs)
+              if (!showLogs && logsResp.data.logs.length > 0) setShowLogs(true)
+            }
+          } catch { /* ignore */ }
+
           if (sp.status === 'completed' || sp.status === 'failed') {
             if (pollRef.current) clearInterval(pollRef.current)
             const full = await api.get(`/api/batch/${id}`)
             setBatch(full.data)
-            // Fetch logs
-            try {
-              const logsResp = await api.get(`/api/search/${id}/logs`)
-              setSearchLogs(logsResp.data.logs || [])
-            } catch { /* ignore */ }
           }
           return
         }
@@ -383,38 +387,84 @@ export default function BatchResults() {
             </div>
           )}
 
-          {/* Search Logs (collapsible) */}
+          {/* Search Logs - Detailed */}
           {isSearch && searchLogs.length > 0 && (
             <div className="bg-white rounded-xl border border-gray-200">
               <button
                 onClick={() => setShowLogs(!showLogs)}
                 className="w-full flex items-center justify-between px-5 py-3 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors rounded-xl"
               >
-                <span>Logs de Execucao ({searchLogs.length})</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-base">📋</span>
+                  <span>Logs Detalhados ({searchLogs.length} eventos)</span>
+                </div>
                 <span className="text-gray-400">{showLogs ? '▲' : '▼'}</span>
               </button>
               {showLogs && (
-                <div className="border-t border-gray-200 max-h-64 overflow-y-auto">
+                <div className="border-t border-gray-200 max-h-[500px] overflow-y-auto">
                   <div className="divide-y divide-gray-50">
-                    {searchLogs.slice(0, 100).map((log) => (
-                      <div key={log.id} className="px-5 py-2 text-xs">
-                        <div className="flex items-center gap-2">
-                          <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                            log.type === 'error' || log.type === 'crawl_error' ? 'bg-red-500' :
-                            log.type === 'safety_pause' ? 'bg-amber-500' :
-                            log.type === 'complete' || log.type === 'crawl_complete' ? 'bg-green-500' :
-                            'bg-gray-400'
-                          }`} />
-                          <span className="text-gray-400 w-24 flex-shrink-0">
-                            {log.city}/{log.state}
-                          </span>
-                          <span className="text-gray-600 flex-1 truncate">{log.message}</span>
-                          {log.duration_ms > 0 && (
-                            <span className="text-gray-400 flex-shrink-0">{log.duration_ms}ms</span>
-                          )}
+                    {searchLogs.map((log) => {
+                      const icon =
+                        log.type === 'start' || log.type === 'phase1' || log.type === 'phase2' ? '🚀' :
+                        log.type === 'config_check' ? '🔑' :
+                        log.type === 'search_ok' ? '🔍' :
+                        log.type === 'search_blocked' ? '🚫' :
+                        log.type === 'search_skip' ? '⏭️' :
+                        log.type === 'domain_start' ? '🌐' :
+                        log.type === 'api_hunter_ok' || log.type === 'api_snov_ok' ? '🎯' :
+                        log.type === 'api_hunter_empty' || log.type === 'api_snov_empty' ? '😐' :
+                        log.type === 'api_cache' ? '💾' :
+                        log.type === 'api_skip' ? '⏩' :
+                        log.type === 'api_error' ? '❌' :
+                        log.type === 'leads_saved' ? '✅' :
+                        log.type === 'scrape_fallback' ? '🔧' :
+                        log.type === 'scrape_done' ? '🕷️' :
+                        log.type === 'scrape_error' ? '💥' :
+                        log.type === 'safety_pause' ? '⚠️' :
+                        log.type === 'complete' ? '🏁' :
+                        log.type === 'error' ? '🔥' :
+                        '📝'
+
+                      const bgColor =
+                        log.type.includes('error') || log.type === 'search_blocked' ? 'bg-red-50' :
+                        log.type.includes('_ok') || log.type === 'leads_saved' ? 'bg-green-50' :
+                        log.type === 'complete' ? 'bg-blue-50' :
+                        log.type === 'start' || log.type.startsWith('phase') ? 'bg-indigo-50' :
+                        log.type === 'api_skip' || log.type === 'search_skip' ? 'bg-gray-50' :
+                        log.type.includes('empty') ? 'bg-amber-50' :
+                        ''
+
+                      return (
+                        <div key={log.id} className={`px-4 py-2.5 text-xs ${bgColor} hover:bg-gray-100 transition-colors`}>
+                          <div className="flex items-start gap-2">
+                            <span className="flex-shrink-0 text-sm leading-4">{icon}</span>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2 mb-0.5">
+                                <span className="font-semibold text-gray-700">{log.city}/{log.state}</span>
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-gray-200 text-gray-600">{log.type}</span>
+                                {log.duration_ms > 0 && (
+                                  <span className="text-gray-400 text-[10px]">{log.duration_ms}ms</span>
+                                )}
+                                {log.status_code && (
+                                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${
+                                    log.status_code === 200 ? 'bg-green-200 text-green-700' :
+                                    log.status_code >= 400 ? 'bg-red-200 text-red-700' :
+                                    'bg-gray-200 text-gray-700'
+                                  }`}>HTTP {log.status_code}</span>
+                                )}
+                              </div>
+                              <p className="text-gray-600 leading-relaxed break-words">{log.message}</p>
+                              {log.url && (
+                                <p className="text-gray-400 text-[10px] mt-0.5 truncate font-mono">{log.url}</p>
+                              )}
+                            </div>
+                            <span className="text-[10px] text-gray-400 flex-shrink-0 whitespace-nowrap">
+                              {log.created_at ? new Date(log.created_at).toLocaleTimeString('pt-BR') : ''}
+                            </span>
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      )
+                    })}
                   </div>
                 </div>
               )}
