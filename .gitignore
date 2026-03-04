@@ -1,39 +1,29 @@
-# Dependencies
-node_modules/
-__pycache__/
-*.pyc
-*.pyo
-
-# Next.js build output
-project/frontend/.next/
-project/frontend/out/
-
-# Environment
-.env
-.env.local
-.env.production
+# Secrets and API Keys
 *.env
+.env.local
+*.token
+token.tmp
+*.key
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
+# Temporary files with API keys
+apify_*.py
+download_last_run_data.py
+extract_emails_from_websites.py
+testar_apify_actors_gratis.py
+*_api_*.py
 
-# OS
-.DS_Store
-Thumbs.db
+# JSON data files
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
 
 # Python
-*.egg-info/
-dist/
-build/
-venv/
-.venv/
+__pycache__/
+*.pyc
 
 # Logs
 *.log
-npm-debug.log*
 
-# Claude internal
-.claude/
+# OS
+NUL

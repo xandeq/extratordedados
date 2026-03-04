@@ -1,20 +1,25 @@
-# CLAUDE.md - Extrator de Dados
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Visao Geral
 Sistema web de extracao automatizada de leads empresariais (emails, telefones, WhatsApp, redes sociais, CNPJ). Permite scraping de URLs, busca por motores de busca, importacao JSON, extracao de texto e colagem direta. Inclui CRM basico, export multi-formato e dashboard analitico.
 
+**Metodos de extracao**: Scraping tradicional (requests+BeautifulSoup), Playwright (Google Maps, LinkedIn), Instagram API (instaloader), Busca em motores (DuckDuckGo, Bing), APIs de enrichment (Hunter.io, Snov.io)
+
 ## Arquitetura
 
 ### Backend
-- **Framework**: Flask (Python 3) - monolito em `project/backend/app.py`
+- **Framework**: Flask (Python 3) - monolito em `project/backend/app.py` (~4200 linhas)
 - **Banco**: PostgreSQL 16 (Docker container na VPS)
 - **Pool**: psycopg2 SimpleConnectionPool (1-10 conexoes)
 - **Rate Limiting**: Flask-Limiter (200/hour default, memory storage)
 - **CORS**: Flask-CORS (aberto)
 - **Proxy**: Traefik reverse proxy -> Gunicorn (2 workers, 120s timeout)
 - **Background Jobs**: threading.Thread(daemon=True) com conexao dedicada ao DB
-- **Scraping**: requests + BeautifulSoup4 + lxml (sem browser automation)
-- **Anti-blocking**: User-Agent rotation, delays entre requests, CAPTCHA detection
+- **Scraping Basico**: requests + BeautifulSoup4 + lxml
+- **Scraping Avancado**: Playwright (Chromium headless) + Instaloader
+- **Anti-blocking**: User-Agent rotation, delays entre requests, CAPTCHA detection, SafetyTracker
 
 ### Frontend
 - **Framework**: Next.js 13.4 (Pages Router, static export)
@@ -104,11 +109,18 @@ _test_python/
 - GET /api/leads - Listagem com paginacao, filtros (search, city, state, source, batch_id, crm_status, quality)
 - PUT /api/leads/<id> - Atualizar lead (crm_status, tags, notes)
 - PUT /api/leads/bulk-status - Atualizar status em massa
-- DELETE /api/leads/<id> - Deletar lead
+- PUT /api/leads/bulk-tag - Adicionar tag em massa
+- DELETE /api/leads/<id> - Deletar lead individual
+- POST /api/leads/bulk-delete - Deletar leads em massa (max 500)
 - GET /api/leads/export/csv - Export CSV
 - GET /api/leads/export/json - Export JSON
 - POST /api/leads/export/marketing - Export marketing (WhatsApp, email, telemarketing)
 - GET /api/leads/stats - Estatisticas
+
+### Scrapers Avancados
+- POST /api/scrape/google-maps - Google Maps scraping (Playwright, rate limit 5/hour)
+- POST /api/scrape/instagram - Instagram business profiles (Instaloader, rate limit 3/hour)
+- POST /api/scrape/linkedin - LinkedIn companies (Playwright, rate limit 2/hour)
 
 ### Dashboard
 - GET /api/dashboard - Metricas gerais

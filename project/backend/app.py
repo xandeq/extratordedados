@@ -146,6 +146,49 @@ SKIP_DOMAINS = {
     'yahoo.com', 'uol.com.br', 'globo.com', 'terra.com.br',
 }
 
+# ============= Email Quality Filters =============
+
+# Agregadores, diretórios e plataformas que não são leads reais
+EMAIL_AGGREGATOR_DOMAINS = {
+    'doctoralia.com.br', 'doctoralia.es', 'doctoralia.com',
+    'zhihu.com', 'stackoverflow.com', 'quora.com',
+    'listamais.com.br', 'guiafacil.com', 'encontrasp.com.br',
+    'forum-pet.de', 'forum-pet.com',
+    'hospitales-privados.es', 'quironsalud.es', 'quironsalud.com',
+    'sentry.io', 'wixpress.com', 'wix.com',
+    'hostinger.com', 'vercel.com', 'netlify.com',
+    'nesx.co', 'weebly.com', 'squarespace.com',
+    'sjd.es', 'vithas.es', 'sanitas.es',
+}
+
+# Padrões de emails genéricos/inválidos
+EMAIL_INVALID_PATTERNS = [
+    r'@(example|test|domain|email|company|yourdomain|yourcompany|site|website)\.',
+    r'(noreply|no-reply|donotreply)@',
+    r'@(localhost|127\.0\.0\.1)',
+    r'@(placeholder|dummy|fake|sample)\.',
+    r'^(image|img|photo|foto|icon|banner|logo)@',
+    r'@(svg|png|jpg|jpeg|gif|webp|ico)\.',
+    r'\.(jpg|jpeg|png|svg|gif|webp|ico|pdf|doc|zip)$',
+    r'^[0-9]+@',  # Email começa só com números
+    r'@[0-9]+\.',  # Domínio começa só com números
+    r'javascript:|mailto:$|void\(0\)',
+]
+
+# Emails genéricos de baixa qualidade (podem ser reais mas não são decisores)
+EMAIL_LOW_QUALITY_PATTERNS = [
+    r'^(webmaster|postmaster|hostmaster|abuse|spam)@',
+    r'^(root|admin|administrator|system|daemon)@',
+    r'^(info|contact|contato|atendimento|suporte|support|sales|vendas)@',
+    r'^(newsletter|news|noticias|updates|marketing)@',
+]
+
+# TLDs de países irrelevantes (quando busca é Brasil)
+EMAIL_FOREIGN_TLDS = {
+    '.es', '.de', '.fr', '.it', '.uk', '.cn', '.jp', '.kr', '.ru',
+    '.pt',  # Portugal pode ser irrelevante dependendo do contexto
+}
+
 # Search safety delays (seconds)
 SEARCH_DELAY_BETWEEN_PAGES = (5, 15)      # Between search result pages
 SEARCH_DELAY_BETWEEN_SITES = (3, 8)       # Between crawled sites
@@ -443,17 +486,100 @@ INVALID_EMAIL_EXTENSIONS = {
     '.css', '.js', '.woff', '.woff2', '.ttf', '.eot',
 }
 
+def calculate_email_quality_score(email_str):
+    """
+    Calculate quality score for email (0-100).
+    Returns: (score, is_valid, rejection_reason)
+
+    Score ranges:
+    - 80-100: High quality (nome@empresa.com.br, contato corporativo real)
+    - 50-79: Medium quality (emails genéricos mas válidos)
+    - 0-49: Low quality / Invalid
+    """
+    email_lower = email_str.lower().strip()
+
+    # Validação básica de formato
+    if '@' not in email_lower or '.' not in email_lower.split('@')[-1]:
+        return 0, False, 'formato_invalido'
+
+    if len(email_lower) > 320:
+        return 0, False, 'email_muito_longo'
+
+    # Extrair domínio
+    try:
+        local_part, domain = email_lower.split('@')
+    except ValueError:
+        return 0, False, 'formato_invalido'
+
+    # Check 1: Agregadores e diretórios (BLOQUEIO TOTAL)
+    for aggregator_domain in EMAIL_AGGREGATOR_DOMAINS:
+        if aggregator_domain in domain:
+            return 0, False, f'agregador:{aggregator_domain}'
+
+    # Check 2: Padrões inválidos (BLOQUEIO TOTAL)
+    for pattern in EMAIL_INVALID_PATTERNS:
+        if re.search(pattern, email_lower):
+            return 0, False, f'padrao_invalido:{pattern[:30]}'
+
+    # Check 3: TLDs estrangeiros (BLOQUEIO se não é .br)
+    for foreign_tld in EMAIL_FOREIGN_TLDS:
+        if email_lower.endswith(foreign_tld):
+            return 0, False, f'tld_estrangeiro:{foreign_tld}'
+
+    # Check 4: Extensões de arquivo inválidas
+    for ext in INVALID_EMAIL_EXTENSIONS:
+        if email_lower.endswith(ext):
+            return 0, False, f'extensao_arquivo:{ext}'
+
+    # A partir daqui, o email é VÁLIDO, mas calculamos qualidade
+    score = 100
+
+    # Penalização: Emails genéricos de baixa qualidade (-30 pontos)
+    for pattern in EMAIL_LOW_QUALITY_PATTERNS:
+        if re.search(pattern, email_lower):
+            score -= 30
+            break
+
+    # Penalização: Domínios de email gratuito (-20 pontos)
+    free_email_domains = ['gmail.com', 'hotmail.com', 'yahoo.com', 'outlook.com',
+                          'bol.com.br', 'ig.com.br', 'uol.com.br', 'terra.com.br']
+    if any(free_domain in domain for free_domain in free_email_domains):
+        score -= 20
+
+    # Bônus: Email corporativo com nome real (+10 pontos)
+    # Exemplo: joao.silva@empresa.com.br (tem ponto no local_part)
+    if '.' in local_part and len(local_part) > 5:
+        score += 10
+
+    # Bônus: Domínio .com.br ou .med.br (email brasileiro corporativo)
+    if domain.endswith('.com.br') or domain.endswith('.med.br'):
+        score += 10
+
+    # Garantir range 0-100
+    score = max(0, min(100, score))
+
+    return score, True, None
+
 def normalize_email(email_str):
-    """Normalize and validate an email address."""
+    """
+    Normalize and validate an email address with quality filtering.
+    Returns the normalized email or None if invalid/low-quality.
+    """
     email_str = email_str.strip().lower()
     email_str = email_str.rstrip('.')
-    for ext in INVALID_EMAIL_EXTENSIONS:
-        if email_str.endswith(ext):
-            return None
-    if '@' not in email_str or '.' not in email_str.split('@')[-1]:
+
+    score, is_valid, rejection_reason = calculate_email_quality_score(email_str)
+
+    # BLOQUEIO: Rejeitar emails inválidos ou de agregadores
+    if not is_valid:
+        print(f"[email_filter] REJECTED: {email_str} - {rejection_reason}")
         return None
-    if len(email_str) > 320:
+
+    # BLOQUEIO: Rejeitar emails com score muito baixo (<40)
+    if score < 40:
+        print(f"[email_filter] LOW QUALITY: {email_str} - score {score}")
         return None
+
     return email_str
 
 # ============= Phone Extraction =============
@@ -938,6 +1064,37 @@ def is_valid_result_url(url):
         return False
 
 
+def search_duckduckgo_api(query, max_results=20, safety=None):
+    """Search DuckDuckGo using the official duckduckgo-search library (API-based, no HTML scraping).
+    This method uses DDG's JSON API endpoints, which are less likely to be CAPTCHA-blocked."""
+    results = []
+    try:
+        from duckduckgo_search import DDGS
+        print(f"[search] DDGS API: buscando '{query}' (max_results={max_results})...")
+        with DDGS() as ddgs:
+            search_results = list(ddgs.text(query, region='br-pt', max_results=max_results))
+        for item in search_results:
+            url = item.get('href', '')
+            if url and is_valid_result_url(url):
+                results.append({'url': url, 'title': item.get('title', '')})
+        if safety:
+            safety.record_success()
+        print(f"[search] DDGS API: {len(results)} resultados validos encontrados")
+    except ImportError:
+        print("[search] DDGS API: biblioteca duckduckgo-search nao instalada")
+    except Exception as e:
+        error_str = str(e).lower()
+        if 'ratelimit' in error_str or '429' in error_str or 'captcha' in error_str:
+            print(f"[search] DDGS API: rate limit/CAPTCHA: {e}")
+            if safety:
+                safety.record_error('captcha')
+        else:
+            print(f"[search] DDGS API: erro: {e}")
+            if safety:
+                safety.record_error('generic')
+    return results
+
+
 def search_duckduckgo(query, max_pages=2, safety=None):
     """Search DuckDuckGo HTML version and extract result URLs."""
     results = []
@@ -971,11 +1128,23 @@ def search_duckduckgo(query, max_pages=2, safety=None):
                 print(f"[search] DDG page {page+1} returned {resp.status_code}")
                 break
 
-            # Check for CAPTCHA
-            if 'captcha' in resp.text.lower() or 'robot' in resp.text.lower():
+            # Check for CAPTCHA - specific markers to avoid false positives
+            text_lower = resp.text.lower()
+            captcha_markers = ['captcha', '/challenge', 'are you a robot', 'robot check',
+                             'unusual traffic', 'automated queries', 'verify you are human',
+                             'please verify', 'security check', 'blocked', 'rate limit']
+            detected_marker = None
+            for marker in captcha_markers:
+                if marker in text_lower:
+                    detected_marker = marker
+                    break
+            if detected_marker:
                 if safety:
                     safety.record_error('captcha')
-                print(f"[search] DDG CAPTCHA detected on page {page+1}")
+                # Log HTML snippet for debugging
+                html_snippet = resp.text[:500].replace('\n', ' ')
+                print(f"[search] DDG CAPTCHA detected on page {page+1} (marker: '{detected_marker}')")
+                print(f"[search] DDG HTML snippet: {html_snippet}")
                 break
 
             soup = BeautifulSoup(resp.text, 'html.parser')
@@ -1054,10 +1223,21 @@ def search_bing(query, max_pages=2, safety=None):
                 print(f"[search] Bing page {page+1} returned {resp.status_code}")
                 break
 
-            if 'captcha' in resp.text.lower():
+            # Check for CAPTCHA - specific markers to avoid false positives
+            text_lower = resp.text.lower()
+            bing_captcha_markers = ['captcha', '/challenge', 'unusual traffic', 'verify you are human',
+                                   'automated queries', 'bot detection', 'blocked']
+            detected_marker = None
+            for marker in bing_captcha_markers:
+                if marker in text_lower:
+                    detected_marker = marker
+                    break
+            if detected_marker:
                 if safety:
                     safety.record_error('captcha')
-                print(f"[search] Bing CAPTCHA detected on page {page+1}")
+                html_snippet = resp.text[:500].replace('\n', ' ')
+                print(f"[search] Bing CAPTCHA detected on page {page+1} (marker: '{detected_marker}')")
+                print(f"[search] Bing HTML snippet: {html_snippet}")
                 break
 
             soup = BeautifulSoup(resp.text, 'html.parser')
@@ -1091,22 +1271,468 @@ def search_bing(query, max_pages=2, safety=None):
     return results
 
 
-def search_with_fallback(query, max_pages=2, safety=None):
-    """Search DuckDuckGo first, fallback to Bing if no results. Detailed logging!"""
-    engine_used = 'duckduckgo'
-    print(f"\n[WEBSEARCH] Iniciando busca web para: '{query}'")
-    print(f"[WEBSEARCH] Tentativa 1: DuckDuckGo (max_pages={max_pages})")
-    results = search_duckduckgo(query, max_pages, safety)
-    print(f"[WEBSEARCH] DDG resultado: {len(results)} URLs encontradas")
+# ============= Official Search APIs (no CAPTCHA!) =============
 
+def search_bing_api(query, api_key, max_results=10):
+    """Search using official Bing Web Search API v7 - no CAPTCHA, 1000/month free!"""
+    url = 'https://api.bing.microsoft.com/v7.0/search'
+    headers = {'Ocp-Apim-Subscription-Key': api_key}
+    params = {
+        'q': query,
+        'count': min(max_results, 50),
+        'mkt': 'pt-BR',
+        'responseFilter': 'Webpages',
+    }
+    try:
+        start = time.time()
+        print(f"[bing_api] REQUEST: GET {url}?q={query[:50]}...&count={params['count']}")
+        resp = http_requests.get(url, headers=headers, params=params, timeout=15)
+        duration = int((time.time() - start) * 1000)
+        print(f"[bing_api] RESPONSE: status={resp.status_code}, duration={duration}ms, body_size={len(resp.text)}")
+
+        if resp.status_code == 401:
+            print(f"[bing_api] ERRO: Chave invalida ou expirada (401)")
+            return [], 'invalid_key', duration
+        if resp.status_code == 403:
+            print(f"[bing_api] ERRO: Cota excedida ou acesso negado (403)")
+            return [], 'quota_exceeded', duration
+        if resp.status_code == 429:
+            print(f"[bing_api] ERRO: Rate limited (429)")
+            return [], 'rate_limited', duration
+        if resp.status_code != 200:
+            print(f"[bing_api] ERRO: HTTP {resp.status_code}")
+            return [], f'http_{resp.status_code}', duration
+
+        data = resp.json()
+        results = []
+        for page in data.get('webPages', {}).get('value', []):
+            result_url = page.get('url', '')
+            if result_url and is_valid_result_url(result_url):
+                results.append({'url': result_url, 'title': page.get('name', '')})
+
+        print(f"[bing_api] RESULTADO: {len(results)} URLs validas encontradas")
+        for r in results[:3]:
+            print(f"[bing_api]   -> {r['url']}")
+        return results, None, duration
+    except Exception as e:
+        print(f"[bing_api] EXCECAO: {e}")
+        return [], str(e)[:200], 0
+
+
+def search_google_custom(query, api_key, cx, max_results=10):
+    """Search using Google Custom Search API - no CAPTCHA, 100/day free!"""
+    url = 'https://www.googleapis.com/customsearch/v1'
+    params = {
+        'key': api_key,
+        'cx': cx,
+        'q': query,
+        'num': min(max_results, 10),
+        'lr': 'lang_pt',
+        'gl': 'br',
+    }
+    try:
+        start = time.time()
+        print(f"[google_cse] REQUEST: GET customsearch?q={query[:50]}...&num={params['num']}")
+        resp = http_requests.get(url, params=params, timeout=15)
+        duration = int((time.time() - start) * 1000)
+        print(f"[google_cse] RESPONSE: status={resp.status_code}, duration={duration}ms, body_size={len(resp.text)}")
+
+        if resp.status_code == 400:
+            err_msg = resp.json().get('error', {}).get('message', '')
+            print(f"[google_cse] ERRO: Bad request - {err_msg[:200]}")
+            return [], f'bad_request: {err_msg[:100]}', duration
+        if resp.status_code == 401 or resp.status_code == 403:
+            print(f"[google_cse] ERRO: Chave invalida ou API nao habilitada ({resp.status_code})")
+            return [], 'invalid_key', duration
+        if resp.status_code == 429:
+            print(f"[google_cse] ERRO: Cota diaria excedida (429)")
+            return [], 'quota_exceeded', duration
+        if resp.status_code != 200:
+            print(f"[google_cse] ERRO: HTTP {resp.status_code}")
+            return [], f'http_{resp.status_code}', duration
+
+        data = resp.json()
+        results = []
+        for item in data.get('items', []):
+            result_url = item.get('link', '')
+            if result_url and is_valid_result_url(result_url):
+                results.append({'url': result_url, 'title': item.get('title', '')})
+
+        print(f"[google_cse] RESULTADO: {len(results)} URLs validas encontradas")
+        for r in results[:3]:
+            print(f"[google_cse]   -> {r['url']}")
+        return results, None, duration
+    except Exception as e:
+        print(f"[google_cse] EXCECAO: {e}")
+        return [], str(e)[:200], 0
+
+
+# ============= Directory Scraping (BR Directories) =============
+
+def scrape_guiamais(niche, city, state, session=None):
+    """Scrape GuiaMais.com.br directory for business listings."""
+    leads = []
+    domains = set()
+    import unicodedata
+    def slugify(text):
+        text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+        return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
+
+    city_slug = slugify(city)
+    state_slug = state.upper()
+    niche_slug = slugify(niche)
+    url = f'https://www.guiamais.com.br/busca/{niche_slug}+em+{city_slug}-{state_slug}'
+    print(f"[guiamais] Buscando: {url}")
+
+    try:
+        s = session or http_requests.Session()
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'pt-BR,pt;q=0.9',
+        }
+        resp = s.get(url, headers=headers, timeout=15)
+        print(f"[guiamais] Response: status={resp.status_code}, size={len(resp.text)}")
+        if resp.status_code != 200:
+            return leads, domains
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        # Try multiple selectors for GuiaMais listing items
+        items = soup.select('.companyItem') or soup.select('.result-item') or soup.select('.listing-item') or soup.select('[itemtype*="LocalBusiness"]')
+
+        for item in items:
+            lead = {}
+            # Company name
+            name_el = item.select_one('h2 a, h3 a, .companyName, .company-name, [itemprop="name"]')
+            if name_el:
+                lead['company_name'] = name_el.get_text(strip=True)
+            # Phone
+            phone_el = item.select_one('.phone, .tel, [itemprop="telephone"], a[href^="tel:"]')
+            if phone_el:
+                phone_text = phone_el.get_text(strip=True) or phone_el.get('href', '').replace('tel:', '')
+                if phone_text:
+                    lead['phone'] = re.sub(r'[^\d\+\(\)\-\s]', '', phone_text).strip()
+            # Address
+            addr_el = item.select_one('.address, .endereco, [itemprop="address"]')
+            if addr_el:
+                lead['address'] = addr_el.get_text(strip=True)
+            # Website
+            for a_tag in item.select('a[href]'):
+                href = a_tag.get('href', '')
+                if href and 'http' in href and 'guiamais' not in href:
+                    lead['website'] = href
+                    try:
+                        d = urlparse(href).hostname
+                        if d:
+                            domains.add(d.replace('www.', ''))
+                    except Exception:
+                        pass
+                    break
+
+            if lead.get('company_name') or lead.get('phone'):
+                lead['city'] = city
+                lead['state'] = state
+                lead['source'] = 'guiamais'
+                leads.append(lead)
+
+        print(f"[guiamais] Encontrou {len(leads)} empresas, {len(domains)} dominios")
+    except Exception as e:
+        print(f"[guiamais] Erro: {e}")
+
+    return leads, domains
+
+
+def scrape_telelistas(niche, city, state, session=None):
+    """Scrape TeleListas.net directory for business listings."""
+    leads = []
+    domains = set()
+    import unicodedata
+    def slugify(text):
+        text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+        return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
+
+    city_slug = slugify(city)
+    state_slug = state.upper()
+    niche_slug = niche.lower().replace(' ', '+')
+    url = f'https://www.telelistas.net/busca/{state_slug}/{city_slug}/{niche_slug}'
+    print(f"[telelistas] Buscando: {url}")
+
+    try:
+        s = session or http_requests.Session()
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'pt-BR,pt;q=0.9',
+        }
+        resp = s.get(url, headers=headers, timeout=15)
+        print(f"[telelistas] Response: status={resp.status_code}, size={len(resp.text)}")
+        if resp.status_code != 200:
+            return leads, domains
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        items = soup.select('.result-item') or soup.select('.listing-item') or soup.select('.company-card') or soup.select('article.listing') or soup.select('[itemtype*="LocalBusiness"]')
+
+        for item in items:
+            lead = {}
+            name_el = item.select_one('h2, h3, .company-name, .title, [itemprop="name"]')
+            if name_el:
+                lead['company_name'] = name_el.get_text(strip=True)
+            phone_el = item.select_one('.phone, .tel, [itemprop="telephone"], a[href^="tel:"]')
+            if phone_el:
+                phone_text = phone_el.get_text(strip=True) or phone_el.get('href', '').replace('tel:', '')
+                if phone_text:
+                    lead['phone'] = re.sub(r'[^\d\+\(\)\-\s]', '', phone_text).strip()
+            addr_el = item.select_one('.address, .endereco, [itemprop="address"]')
+            if addr_el:
+                lead['address'] = addr_el.get_text(strip=True)
+            for a_tag in item.select('a[href]'):
+                href = a_tag.get('href', '')
+                if href and 'http' in href and 'telelistas' not in href:
+                    lead['website'] = href
+                    try:
+                        d = urlparse(href).hostname
+                        if d:
+                            domains.add(d.replace('www.', ''))
+                    except Exception:
+                        pass
+                    break
+
+            if lead.get('company_name') or lead.get('phone'):
+                lead['city'] = city
+                lead['state'] = state
+                lead['source'] = 'telelistas'
+                leads.append(lead)
+
+        print(f"[telelistas] Encontrou {len(leads)} empresas, {len(domains)} dominios")
+    except Exception as e:
+        print(f"[telelistas] Erro: {e}")
+
+    return leads, domains
+
+
+def scrape_apontador(niche, city, state, session=None):
+    """Scrape Apontador.com.br directory for business listings."""
+    leads = []
+    domains = set()
+    import unicodedata
+    def slugify(text):
+        text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+        return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
+
+    city_slug = slugify(city)
+    state_slug = state.lower()
+    niche_slug = slugify(niche)
+    url = f'https://www.apontador.com.br/local/{state_slug}/{city_slug}/{niche_slug}.html'
+    print(f"[apontador] Buscando: {url}")
+
+    try:
+        s = session or http_requests.Session()
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'pt-BR,pt;q=0.9',
+        }
+        resp = s.get(url, headers=headers, timeout=15)
+        print(f"[apontador] Response: status={resp.status_code}, size={len(resp.text)}")
+        if resp.status_code != 200:
+            return leads, domains
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        items = soup.select('.card') or soup.select('.listing') or soup.select('.result-item') or soup.select('.place-card') or soup.select('[itemtype*="LocalBusiness"]')
+
+        for item in items:
+            lead = {}
+            name_el = item.select_one('h2, h3, .place-name, .title, [itemprop="name"]')
+            if name_el:
+                lead['company_name'] = name_el.get_text(strip=True)
+            phone_el = item.select_one('.phone, .tel, [itemprop="telephone"], a[href^="tel:"]')
+            if phone_el:
+                phone_text = phone_el.get_text(strip=True) or phone_el.get('href', '').replace('tel:', '')
+                if phone_text:
+                    lead['phone'] = re.sub(r'[^\d\+\(\)\-\s]', '', phone_text).strip()
+            addr_el = item.select_one('.address, .endereco, [itemprop="address"], .place-address')
+            if addr_el:
+                lead['address'] = addr_el.get_text(strip=True)
+            for a_tag in item.select('a[href]'):
+                href = a_tag.get('href', '')
+                if href and 'http' in href and 'apontador' not in href:
+                    lead['website'] = href
+                    try:
+                        d = urlparse(href).hostname
+                        if d:
+                            domains.add(d.replace('www.', ''))
+                    except Exception:
+                        pass
+                    break
+
+            if lead.get('company_name') or lead.get('phone'):
+                lead['city'] = city
+                lead['state'] = state
+                lead['source'] = 'apontador'
+                leads.append(lead)
+
+        print(f"[apontador] Encontrou {len(leads)} empresas, {len(domains)} dominios")
+    except Exception as e:
+        print(f"[apontador] Erro: {e}")
+
+    return leads, domains
+
+
+def scrape_all_directories(niche, city, state, session=None):
+    """Scrape all BR directories and merge results."""
+    all_leads = []
+    all_domains = set()
+
+    for scraper_fn, name in [
+        (scrape_guiamais, 'GuiaMais'),
+        (scrape_telelistas, 'TeleListas'),
+        (scrape_apontador, 'Apontador'),
+    ]:
+        try:
+            leads, domains = scraper_fn(niche, city, state, session)
+            all_leads.extend(leads)
+            all_domains.update(domains)
+            if leads:
+                print(f"[diretorios] {name}: {len(leads)} empresas encontradas!")
+            # Small delay between directories
+            time.sleep(random.uniform(1, 2))
+        except Exception as e:
+            print(f"[diretorios] Erro em {name}: {e}")
+
+    # Deduplicate leads by company name
+    seen_names = set()
+    unique_leads = []
+    for lead in all_leads:
+        name_key = (lead.get('company_name', '') or '').lower().strip()
+        if name_key and name_key not in seen_names:
+            seen_names.add(name_key)
+            unique_leads.append(lead)
+        elif not name_key:
+            unique_leads.append(lead)
+
+    print(f"[diretorios] TOTAL: {len(unique_leads)} empresas unicas, {len(all_domains)} dominios de {len(all_leads)} resultados brutos")
+    return unique_leads, all_domains
+
+
+# ============= Multi-Source Search with Fallback =============
+
+def search_with_fallback(query, max_pages=2, safety=None, cursor=None, user_id=None, search_job_id=None):
+    """Multi-source domain search with detailed logging.
+    Priority: Bing API (oficial) -> Google CSE -> DDG scraping -> Bing scraping"""
+    engine_used = 'duckduckgo'
+    results = []
+
+    print(f"\n[WEBSEARCH] Iniciando busca web multi-fonte para: '{query}'")
+
+    # 1. Try Bing Web Search API (official, no CAPTCHA, 1000/month)
+    if not results and cursor and user_id:
+        bing_config = get_api_config(cursor, user_id, 'bing_api')
+        if bing_config:
+            bing_credits = get_api_credits_remaining(cursor, user_id, 'bing_api')
+            if bing_credits > 0:
+                print(f"[WEBSEARCH] Fonte 1: Bing API oficial ({bing_credits} creditos restantes)...")
+                api_results, error, duration = search_bing_api(query, bing_config['api_key'], max_results=max_pages * 10)
+                if api_results:
+                    record_api_usage(cursor, user_id, 'bing_api', 1)
+                    engine_used = 'bing_api'
+                    results = api_results
+                    print(f"[WEBSEARCH] Bing API: {len(results)} resultados em {duration}ms!")
+                    if search_job_id:
+                        log_search(cursor, search_job_id, 'search_ok',
+                                  message=f'Bing API oficial achou {len(results)} resultados em {duration}ms! Sem CAPTCHA!',
+                                  duration_ms=duration)
+                elif error == 'invalid_key':
+                    cursor.execute('UPDATE api_configs SET is_active = FALSE WHERE user_id = %s AND provider = %s',
+                                  (user_id, 'bing_api'))
+                    print(f"[WEBSEARCH] Bing API: chave invalida! Desativada.")
+                    if search_job_id:
+                        log_search(cursor, search_job_id, 'api_error',
+                                  message=f'Bing API: chave invalida, desativada automaticamente')
+                elif error:
+                    print(f"[WEBSEARCH] Bing API falhou: {error}")
+                    if search_job_id:
+                        log_search(cursor, search_job_id, 'api_error',
+                                  message=f'Bing API falhou: {error}')
+            else:
+                print(f"[WEBSEARCH] Bing API: sem creditos restantes")
+        else:
+            print(f"[WEBSEARCH] Bing API: nao configurada")
+
+    # 2. Try Google Custom Search API (no CAPTCHA, 100/day)
+    if not results and cursor and user_id:
+        google_config = get_api_config(cursor, user_id, 'google_cse')
+        if google_config and google_config.get('api_secret'):
+            google_credits = get_api_credits_remaining(cursor, user_id, 'google_cse')
+            if google_credits > 0:
+                print(f"[WEBSEARCH] Fonte 2: Google Custom Search ({google_credits} creditos restantes)...")
+                api_results, error, duration = search_google_custom(
+                    query, google_config['api_key'], google_config['api_secret'], max_results=10)
+                if api_results:
+                    record_api_usage(cursor, user_id, 'google_cse', 1)
+                    engine_used = 'google_cse'
+                    results = api_results
+                    print(f"[WEBSEARCH] Google CSE: {len(results)} resultados em {duration}ms!")
+                    if search_job_id:
+                        log_search(cursor, search_job_id, 'search_ok',
+                                  message=f'Google Custom Search achou {len(results)} resultados em {duration}ms!',
+                                  duration_ms=duration)
+                elif error == 'invalid_key':
+                    cursor.execute('UPDATE api_configs SET is_active = FALSE WHERE user_id = %s AND provider = %s',
+                                  (user_id, 'google_cse'))
+                    print(f"[WEBSEARCH] Google CSE: chave invalida! Desativada.")
+                    if search_job_id:
+                        log_search(cursor, search_job_id, 'api_error',
+                                  message=f'Google CSE: chave/cx invalida, desativada automaticamente')
+                elif error:
+                    print(f"[WEBSEARCH] Google CSE falhou: {error}")
+                    if search_job_id:
+                        log_search(cursor, search_job_id, 'api_error',
+                                  message=f'Google CSE falhou: {error}')
+            else:
+                print(f"[WEBSEARCH] Google CSE: sem creditos restantes hoje")
+        else:
+            print(f"[WEBSEARCH] Google CSE: nao configurada")
+
+    # 3. DDG API (duckduckgo-search library - API JSON, sem HTML scraping)
+    if not results:
+        print(f"[WEBSEARCH] Fonte 3: DuckDuckGo API (biblioteca duckduckgo-search)...")
+        if search_job_id and cursor:
+            log_search(cursor, search_job_id, 'search_attempt',
+                      message=f'APIs oficiais falharam/nao configuradas. Tentando DDG API (biblioteca)...')
+        results = search_duckduckgo_api(query, max_results=max_pages * 10, safety=safety)
+        if results:
+            engine_used = 'ddgs_api'
+            print(f"[WEBSEARCH] DDG API: {len(results)} URLs encontradas!")
+            if search_job_id and cursor:
+                log_search(cursor, search_job_id, 'search_ok',
+                          message=f'DDG API (biblioteca) achou {len(results)} resultados!')
+        else:
+            print(f"[WEBSEARCH] DDG API: sem resultados")
+
+    # 4. DDG HTML scraping fallback
+    if not results:
+        print(f"[WEBSEARCH] Fonte 4: DuckDuckGo HTML scraping (max_pages={max_pages})...")
+        if search_job_id and cursor:
+            log_search(cursor, search_job_id, 'search_attempt',
+                      message=f'DDG API falhou. Tentando DDG HTML scraping...')
+        results = search_duckduckgo(query, max_pages, safety)
+        engine_used = 'duckduckgo'
+        print(f"[WEBSEARCH] DDG scraping resultado: {len(results)} URLs encontradas")
+
+    # 5. Bing scraping fallback
     if not results:
         delay = random.uniform(3, 6)
-        print(f"[WEBSEARCH] DDG falhou! Esperando {delay:.1f}s antes de tentar Bing...")
+        print(f"[WEBSEARCH] Fonte 5: Bing scraping (esperando {delay:.1f}s)...")
+        if search_job_id and cursor:
+            log_search(cursor, search_job_id, 'search_attempt',
+                      message=f'Todas as fontes anteriores falharam. Ultima tentativa: Bing scraping...')
         engine_used = 'bing'
         time.sleep(delay)
-        print(f"[WEBSEARCH] Tentativa 2: Bing")
         results = search_bing(query, max_pages, safety)
-        print(f"[WEBSEARCH] Bing resultado: {len(results)} URLs encontradas")
+        print(f"[WEBSEARCH] Bing scraping resultado: {len(results)} URLs encontradas")
 
     # Deduplicate by domain
     seen_domains = set()
@@ -1235,6 +1861,16 @@ def process_search_job(batch_id, search_jobs_data, user_id):
                         if crawl_data['emails']:
                             for email in crawl_data['emails']:
                                 try:
+                                    # Calcular quality score baseado no email
+                                    email_score, _, _ = calculate_email_quality_score(email)
+                                    # Usar categorias antigas para compatibilidade
+                                    if email_score >= 70:
+                                        quality = 'premium'
+                                    elif email_score >= 50:
+                                        quality = 'medio'
+                                    else:
+                                        quality = 'basico'
+
                                     c.execute(
                                         '''INSERT INTO leads
                                            (batch_id, company_name, email, phone, website, source_url, source,
@@ -1255,6 +1891,7 @@ def process_search_job(batch_id, search_jobs_data, user_id):
                                          niche, quality, now)
                                     )
                                     job_leads += 1
+                                    print(f"[search] Lead inserido: {email} (quality: {quality}, score: {email_score})")
                                 except Exception as e:
                                     print(f"[search] Lead insert error: {e}")
 
@@ -1337,13 +1974,18 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                   ('processing', datetime.now(), batch_id))
 
         # Log API config status upfront
-        for prov in ('hunter', 'snov'):
+        provider_names = {'bing_api': 'Bing API (busca)', 'google_cse': 'Google CSE (busca)',
+                         'hunter': 'Hunter.io (emails)', 'snov': 'Snov.io (emails)'}
+        for prov in ('bing_api', 'google_cse', 'hunter', 'snov'):
             cfg = get_api_config(c, user_id, prov)
             credits = get_api_credits_remaining(c, user_id, prov) if cfg else 0
+            prov_label = provider_names.get(prov, prov)
             status = f"ativa, {credits} creditos restantes" if cfg else "NAO configurada"
-            print(f"[JOB] API {prov}: {status}")
+            print(f"[JOB] {prov_label}: {status}")
             log_search(c, search_jobs_data[0]['search_job_id'], 'config_check',
-                      message=f'API {prov}: {status}')
+                      message=f'{prov_label}: {status}')
+        log_search(c, search_jobs_data[0]['search_job_id'], 'config_check',
+                  message=f'Diretorios BR (GuiaMais, TeleListas, Apontador): sempre ativo, sem limites!')
 
         session = http_requests.Session()
         total_leads_found = 0
@@ -1368,13 +2010,71 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
             safety = SafetyTracker()
 
             try:
-                # ─── Phase 1: Domain Discovery via Web Search ───
+                job_leads = 0
+                job_source = 'scraping'
+
+                # ─── Phase 0: Directory Scraping (GuiaMais, TeleListas, Apontador) ───
+                log_search(c, search_job_id, 'phase0',
+                          message=f'FASE 0: Vasculhando diretorios BR (GuiaMais, TeleListas, Apontador) para "{niche}" em {city}/{state}...')
+                print(f"\n[FASE 0] Scraping de diretorios BR para {niche} em {city}/{state}")
+
+                dir_start = time.time()
+                dir_leads, dir_domains = scrape_all_directories(niche, city, state, session)
+                dir_duration = int((time.time() - dir_start) * 1000)
+
+                dir_saved = 0
+                if dir_leads:
+                    now = datetime.now()
+                    for dl in dir_leads:
+                        # Save directory leads (they may not have email but have phone/company)
+                        email = normalize_email(dl.get('email', '')) if dl.get('email') else None
+                        phone = dl.get('phone') or None
+                        company = dl.get('company_name') or ''
+                        website = dl.get('website') or None
+                        if not email and not phone:
+                            continue
+
+                        # For leads without email, create a placeholder using phone as dedup
+                        dedup_email = email or f"phone_{re.sub(r'[^0-9]', '', phone or '')}@directory.local"
+                        lead_data = {'email': email or '', 'phone': phone or '', 'company_name': company,
+                                    'whatsapp': phone}
+                        quality = calculate_quality_score(lead_data)
+                        try:
+                            c.execute(
+                                '''INSERT INTO leads
+                                   (batch_id, company_name, email, phone, website, source_url, source,
+                                    address, city, state, category, quality_score, extracted_at)
+                                   VALUES (%s, %s, %s, %s, %s, %s, %s,
+                                           %s, %s, %s, %s, %s, %s)
+                                   ON CONFLICT (batch_id, email) DO NOTHING''',
+                                (batch_id, company, dedup_email, phone, website,
+                                 website or '', f'diretorio_{dl.get("source", "br")}',
+                                 dl.get('address'), city, state, niche, quality, now)
+                            )
+                            dir_saved += 1
+                            job_leads += 1
+                        except Exception as e:
+                            print(f"[SAVE] Erro salvando lead de diretorio: {e}")
+
+                log_search(c, search_job_id, 'dir_done',
+                          message=f'Diretorios BR: {len(dir_leads)} empresas encontradas, {dir_saved} salvas, {len(dir_domains)} dominios descobertos ({dir_duration}ms)',
+                          duration_ms=dir_duration)
+                print(f"[FASE 0] Diretorios: {len(dir_leads)} empresas, {dir_saved} salvas, {len(dir_domains)} dominios")
+
+                # ─── Phase 1: Domain Discovery via Web Search (multi-source) ───
                 log_search(c, search_job_id, 'phase1',
-                          message=f'FASE 1: Cacando dominios no DuckDuckGo/Bing para "{query}"...')
+                          message=f'FASE 1: Cacando mais dominios via Bing API/Google CSE/DDG/Bing para "{query}"...')
 
                 start_time = time.time()
-                results, engine_used = search_with_fallback(query, max_pages, safety)
+                results, engine_used = search_with_fallback(query, max_pages, safety,
+                                                            cursor=c, user_id=user_id, search_job_id=search_job_id)
                 search_duration = int((time.time() - start_time) * 1000)
+
+                # Merge directory domains into search results
+                for dd in dir_domains:
+                    already_has = any(dd in (urlparse(r['url']).hostname or '').replace('www.', '') for r in results)
+                    if not already_has:
+                        results.append({'url': f'https://{dd}', 'title': f'(diretorio: {dd})'})
 
                 c.execute('UPDATE search_jobs SET engine = %s, total_results = %s WHERE id = %s',
                           (engine_used, len(results), search_job_id))
@@ -1382,28 +2082,27 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                 if results:
                     domains_found = [urlparse(r['url']).hostname for r in results if urlparse(r['url']).hostname]
                     log_search(c, search_job_id, 'search_ok',
-                              message=f'Boa! {engine_used} achou {len(results)} dominios em {search_duration}ms: {", ".join(domains_found[:5])}{"..." if len(domains_found) > 5 else ""}',
+                              message=f'Boa! {engine_used} + diretorios = {len(results)} dominios em {search_duration}ms: {", ".join(domains_found[:5])}{"..." if len(domains_found) > 5 else ""}',
                               duration_ms=search_duration)
-                    print(f"[BUSCA] {engine_used} retornou {len(results)} resultados em {search_duration}ms")
+                    print(f"[BUSCA] {engine_used} + diretorios = {len(results)} resultados em {search_duration}ms")
                     for r in results[:5]:
                         print(f"[BUSCA]   -> {r['url']}")
                 else:
-                    log_search(c, search_job_id, 'search_blocked',
-                              message=f'Bloqueado! {engine_used} retornou 0 resultados em {search_duration}ms (CAPTCHA/IP bloqueado). Sem dominios para enriquecer via API.',
-                              duration_ms=search_duration)
-                    print(f"[BUSCA] BLOQUEADO! {engine_used} = 0 resultados. DDG e Bing com CAPTCHA.")
-
-                    # Log skip reason - no candidate domain generation
-                    log_search(c, search_job_id, 'search_skip',
-                              message=f'Sem dominios reais encontrados. APIs precisam de dominios reais para buscar emails. Pulando {city}.')
+                    if dir_saved > 0:
+                        log_search(c, search_job_id, 'search_partial',
+                                  message=f'Busca web retornou 0, mas diretorios ja salvaram {dir_saved} leads! Continuando...',
+                                  duration_ms=search_duration)
+                    else:
+                        log_search(c, search_job_id, 'search_blocked',
+                                  message=f'Todas as fontes falharam para {city}! Busca web: 0 resultados, diretorios: 0 empresas.',
+                                  duration_ms=search_duration)
+                    print(f"[BUSCA] Sem dominios encontrados.")
 
                 # ─── Phase 2: Enrich via API (Hunter/Snov) + Scraping Fallback ───
                 if results:
                     log_search(c, search_job_id, 'phase2',
                               message=f'FASE 2: Enriquecendo {len(results)} dominios via Hunter.io / Snov.io...')
 
-                job_leads = 0
-                job_source = 'scraping'
                 for i, result in enumerate(results):
                     result_url = result['url']
                     domain = urlparse(result_url).hostname
@@ -1497,6 +2196,15 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                                 if emails_found:
                                     for email in emails_found:
                                         try:
+                                            # Calcular quality score baseado no email
+                                            email_score, _, _ = calculate_email_quality_score(email)
+                                            if email_score >= 70:
+                                                quality = 'premium'
+                                            elif email_score >= 50:
+                                                quality = 'medio'
+                                            else:
+                                                quality = 'basico'
+
                                             c.execute(
                                                 '''INSERT INTO leads
                                                    (batch_id, company_name, email, phone, website, source_url, source,
@@ -1550,11 +2258,22 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                 c.execute('UPDATE search_jobs SET status = %s, total_leads = %s, finished_at = %s, enrichment_source = %s WHERE id = %s',
                           ('completed', job_leads, datetime.now(), job_source, search_job_id))
 
-                summary_msg = f'Fim! {city}/{state}: {job_leads} leads encontrados via {job_source}'
-                if job_leads == 0 and not results:
-                    summary_msg = f'Fim! {city}/{state}: 0 leads (busca web bloqueada, sem dominios para APIs)'
+                sources_used = []
+                if dir_saved > 0:
+                    sources_used.append(f'diretorios({dir_saved})')
+                if job_source != 'scraping':
+                    sources_used.append(job_source)
+                if not sources_used:
+                    sources_used.append('scraping')
+                source_str = ' + '.join(sources_used)
+
+                summary_msg = f'Fim! {city}/{state}: {job_leads} leads via {source_str}'
+                if job_leads == 0 and not results and dir_saved == 0:
+                    summary_msg = f'Fim! {city}/{state}: 0 leads (todas as fontes falharam - configure Bing API ou Google CSE!)'
                 elif job_leads == 0 and results:
                     summary_msg = f'Fim! {city}/{state}: 0 leads ({len(results)} dominios testados, nenhum tinha emails)'
+                elif job_leads > 0:
+                    summary_msg = f'Fim! {city}/{state}: {job_leads} leads encontrados! Fontes: {source_str}'
                 log_search(c, search_job_id, 'complete', message=summary_msg)
                 print(f"[FIM] {summary_msg}")
 
@@ -2329,6 +3048,221 @@ def search_logs(batch_id):
     })
 
 
+# ============= Advanced Scraping API Routes =============
+
+@app.route('/api/scrape/google-maps', methods=['POST'])
+@limiter.limit("5/hour")
+def scrape_google_maps_endpoint():
+    """Scrape Google Maps para buscar empresas locais."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json()
+    niche = (data.get('niche') or '').strip()
+    city = (data.get('city') or '').strip()
+    state = (data.get('state') or '').strip()
+    max_results = min(50, max(10, int(data.get('max_results', 20))))
+
+    if not niche or not city or not state:
+        return jsonify({'error': 'Nicho, cidade e estado são obrigatórios'}), 400
+
+    # Criar batch
+    with get_db() as conn:
+        c = conn.cursor()
+        batch_name = f"Google Maps: {niche} em {city}, {state}"
+        c.execute(
+            '''INSERT INTO batches (user_id, name, status, total_urls, processed_urls, total_leads, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+            (user_id, batch_name, 'processing', max_results, 0, 0, datetime.now())
+        )
+        batch_id = c.fetchone()[0]
+
+    # Executar scraping em thread
+    def run_google_maps_scraping():
+        with get_db() as conn:
+            c = conn.cursor()
+            try:
+                leads = scrape_google_maps(niche, city, state, max_results)
+
+                # Salvar leads
+                for lead in leads:
+                    try:
+                        email = lead.get('email')
+                        if email:
+                            email_score, is_valid, _ = calculate_email_quality_score(email)
+                            if not is_valid or email_score < 40:
+                                continue
+
+                        c.execute(
+                            '''INSERT INTO leads (batch_id, company_name, email, phone, website, address,
+                                                  city, state, source, source_url, quality_score, extracted_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               ON CONFLICT (batch_id, email) DO NOTHING''',
+                            (batch_id, lead.get('company_name'), lead.get('email'), lead.get('phone'),
+                             lead.get('website'), lead.get('address'), city, state,
+                             'google_maps', lead.get('website') or f"maps:{lead.get('company_name')}",
+                             lead.get('rating') or 'medio', datetime.now())
+                        )
+                    except Exception as e:
+                        print(f"[GoogleMaps] Erro ao inserir lead: {e}")
+
+                # Atualizar batch
+                c.execute(
+                    '''UPDATE batches SET status = %s, processed_urls = %s, total_leads = %s
+                       WHERE id = %s''',
+                    ('completed', max_results, len(leads), batch_id)
+                )
+
+            except Exception as e:
+                print(f"[GoogleMaps] Erro no scraping: {e}")
+                c.execute('UPDATE batches SET status = %s WHERE id = %s', ('failed', batch_id))
+
+    thread = threading.Thread(target=run_google_maps_scraping, daemon=True)
+    thread.start()
+
+    return jsonify({'batch_id': batch_id, 'message': 'Google Maps scraping iniciado'})
+
+
+@app.route('/api/scrape/instagram', methods=['POST'])
+@limiter.limit("3/hour")
+def scrape_instagram_endpoint():
+    """Scrape Instagram para buscar perfis de negócios."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json()
+    niche = (data.get('niche') or '').strip()
+    city = (data.get('city') or '').strip()
+    state = (data.get('state') or '').strip()
+    max_results = min(100, max(20, int(data.get('max_results', 50))))
+
+    if not niche or not city or not state:
+        return jsonify({'error': 'Nicho, cidade e estado são obrigatórios'}), 400
+
+    # Criar batch
+    with get_db() as conn:
+        c = conn.cursor()
+        batch_name = f"Instagram: {niche} em {city}, {state}"
+        c.execute(
+            '''INSERT INTO batches (user_id, name, status, total_urls, processed_urls, total_leads, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+            (user_id, batch_name, 'processing', max_results, 0, 0, datetime.now())
+        )
+        batch_id = c.fetchone()[0]
+
+    # Executar scraping em thread
+    def run_instagram_scraping():
+        with get_db() as conn:
+            c = conn.cursor()
+            try:
+                leads = scrape_instagram_business(niche, city, state, max_results)
+
+                # Salvar leads
+                for lead in leads:
+                    try:
+                        email = lead.get('email')
+                        if email:
+                            email_score, is_valid, _ = calculate_email_quality_score(email)
+                            if not is_valid or email_score < 40:
+                                email = None  # Não bloquear lead, apenas limpar email inválido
+
+                        c.execute(
+                            '''INSERT INTO leads (batch_id, company_name, email, phone, website, instagram,
+                                                  city, state, source, source_url, quality_score, extracted_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               ON CONFLICT (batch_id, email) DO NOTHING''',
+                            (batch_id, lead.get('company_name'), email, lead.get('phone'),
+                             lead.get('website'), lead.get('instagram'), city, state,
+                             'instagram', lead.get('instagram'), 'medio', datetime.now())
+                        )
+                    except Exception as e:
+                        print(f"[Instagram] Erro ao inserir lead: {e}")
+
+                # Atualizar batch
+                c.execute(
+                    '''UPDATE batches SET status = %s, processed_urls = %s, total_leads = %s
+                       WHERE id = %s''',
+                    ('completed', max_results, len(leads), batch_id)
+                )
+
+            except Exception as e:
+                print(f"[Instagram] Erro no scraping: {e}")
+                c.execute('UPDATE batches SET status = %s WHERE id = %s', ('failed', batch_id))
+
+    thread = threading.Thread(target=run_instagram_scraping, daemon=True)
+    thread.start()
+
+    return jsonify({'batch_id': batch_id, 'message': 'Instagram scraping iniciado'})
+
+
+@app.route('/api/scrape/linkedin', methods=['POST'])
+@limiter.limit("2/hour")
+def scrape_linkedin_endpoint():
+    """Scrape LinkedIn para buscar empresas (uso com cuidado - anti-scraping forte)."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json()
+    niche = (data.get('niche') or '').strip()
+    city = (data.get('city') or '').strip()
+    state = (data.get('state') or '').strip()
+    max_results = min(50, max(10, int(data.get('max_results', 30))))
+
+    if not niche or not city or not state:
+        return jsonify({'error': 'Nicho, cidade e estado são obrigatórios'}), 400
+
+    # Criar batch
+    with get_db() as conn:
+        c = conn.cursor()
+        batch_name = f"LinkedIn: {niche} em {city}, {state}"
+        c.execute(
+            '''INSERT INTO batches (user_id, name, status, total_urls, processed_urls, total_leads, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+            (user_id, batch_name, 'processing', max_results, 0, 0, datetime.now())
+        )
+        batch_id = c.fetchone()[0]
+
+    # Executar scraping em thread
+    def run_linkedin_scraping():
+        with get_db() as conn:
+            c = conn.cursor()
+            try:
+                leads = scrape_linkedin_companies(niche, city, state, max_results)
+
+                # Salvar leads
+                for lead in leads:
+                    try:
+                        c.execute(
+                            '''INSERT INTO leads (batch_id, company_name, linkedin, address,
+                                                  city, state, source, source_url, quality_score, extracted_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               ON CONFLICT (batch_id, email) DO NOTHING''',
+                            (batch_id, lead.get('company_name'), lead.get('linkedin'), lead.get('address'),
+                             city, state, 'linkedin', lead.get('linkedin'), 'premium', datetime.now())
+                        )
+                    except Exception as e:
+                        print(f"[LinkedIn] Erro ao inserir lead: {e}")
+
+                # Atualizar batch
+                c.execute(
+                    '''UPDATE batches SET status = %s, processed_urls = %s, total_leads = %s
+                       WHERE id = %s''',
+                    ('completed', max_results, len(leads), batch_id)
+                )
+
+            except Exception as e:
+                print(f"[LinkedIn] Erro no scraping: {e}")
+                c.execute('UPDATE batches SET status = %s WHERE id = %s', ('failed', batch_id))
+
+    thread = threading.Thread(target=run_linkedin_scraping, daemon=True)
+    thread.start()
+
+    return jsonify({'batch_id': batch_id, 'message': 'LinkedIn scraping iniciado (pode demorar)', 'warning': 'LinkedIn tem proteção anti-scraping forte'})
+
+
 # ============= API Config & Search Endpoints =============
 
 @app.route('/api/api-config', methods=['POST'])
@@ -2344,12 +3278,14 @@ def save_api_config_endpoint():
     api_key = (data.get('api_key') or '').strip()
     api_secret = (data.get('api_secret') or '').strip()
 
-    if provider not in ('hunter', 'snov'):
-        return jsonify({'error': 'Provider invalido (hunter ou snov)'}), 400
+    if provider not in ('hunter', 'snov', 'bing_api', 'google_cse'):
+        return jsonify({'error': 'Provider invalido (hunter, snov, bing_api ou google_cse)'}), 400
     if not api_key:
         return jsonify({'error': 'API key obrigatoria'}), 400
     if provider == 'snov' and not api_secret:
         return jsonify({'error': 'Client Secret obrigatorio para Snov.io'}), 400
+    if provider == 'google_cse' and not api_secret:
+        return jsonify({'error': 'Search Engine ID (cx) obrigatorio para Google Custom Search'}), 400
 
     # Validate key
     valid = False
@@ -2362,6 +3298,22 @@ def save_api_config_endpoint():
     elif provider == 'snov':
         token = get_snov_access_token(api_key, api_secret)
         valid = token is not None
+    elif provider == 'bing_api':
+        try:
+            resp = http_requests.get('https://api.bing.microsoft.com/v7.0/search',
+                                     headers={'Ocp-Apim-Subscription-Key': api_key},
+                                     params={'q': 'test', 'count': 1}, timeout=10)
+            valid = resp.status_code == 200
+        except Exception:
+            pass
+    elif provider == 'google_cse':
+        try:
+            resp = http_requests.get('https://www.googleapis.com/customsearch/v1',
+                                     params={'key': api_key, 'cx': api_secret, 'q': 'test', 'num': 1},
+                                     timeout=10)
+            valid = resp.status_code == 200
+        except Exception:
+            pass
 
     if not valid:
         return jsonify({'error': f'Chave de API invalida para {provider}. Verifique as credenciais.'}), 400
@@ -2387,12 +3339,16 @@ def get_api_configs_endpoint():
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
 
-    month_year = datetime.now().strftime('%Y-%m')
-
     with get_db() as conn:
         c = conn.cursor()
         configs = []
-        for provider in ('hunter', 'snov'):
+        for provider in ('hunter', 'snov', 'bing_api', 'google_cse'):
+            # Use daily period for google_cse, monthly for others
+            if provider == 'google_cse':
+                period = datetime.now().strftime('%Y-%m-%d')
+            else:
+                period = datetime.now().strftime('%Y-%m')
+
             c.execute(
                 'SELECT api_key, api_secret, is_active, updated_at FROM api_configs WHERE user_id = %s AND provider = %s',
                 (user_id, provider)
@@ -2401,7 +3357,7 @@ def get_api_configs_endpoint():
 
             c.execute(
                 'SELECT credits_used, credits_limit FROM api_usage WHERE user_id = %s AND provider = %s AND month_year = %s',
-                (user_id, provider, month_year)
+                (user_id, provider, period)
             )
             usage_row = c.fetchone()
 
@@ -2415,7 +3371,8 @@ def get_api_configs_endpoint():
                 'credits_used': usage_row[0] if usage_row else 0,
                 'credits_limit': usage_row[1] if usage_row else limit,
                 'credits_remaining': max(0, (usage_row[1] if usage_row else limit) - (usage_row[0] if usage_row else 0)),
-                'month': month_year,
+                'period': period,
+                'period_type': 'daily' if provider == 'google_cse' else 'monthly',
             })
 
     return jsonify({'configs': configs})
@@ -2429,7 +3386,7 @@ def delete_api_config_endpoint(provider):
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
 
-    if provider not in ('hunter', 'snov'):
+    if provider not in ('hunter', 'snov', 'bing_api', 'google_cse'):
         return jsonify({'error': 'Provider invalido'}), 400
 
     with get_db() as conn:
@@ -2471,15 +3428,16 @@ def start_api_search():
     else:
         return jsonify({'error': 'Selecione uma regiao ou informe cidade/estado'}), 400
 
-    # Check if user has any API configured
+    # Check which APIs are configured
     has_apis = False
+    api_status = {}
     with get_db() as conn:
         c = conn.cursor()
-        for provider in ('hunter', 'snov'):
+        for provider in ('bing_api', 'google_cse', 'hunter', 'snov'):
             config = get_api_config(c, user_id, provider)
             if config and get_api_credits_remaining(c, user_id, provider) > 0:
                 has_apis = True
-                break
+                api_status[provider] = True
 
     batch_name = f'Busca API: {niche}'
     if region_id and region_id in SEARCH_REGIONS:
@@ -2714,6 +3672,10 @@ def update_lead(lead_id):
             updates.append('contact_name = %s')
             params.append(data['contact_name'][:255])
 
+        if 'company_name' in data:
+            updates.append('company_name = %s')
+            params.append(data['company_name'][:255])
+
         if not updates:
             return jsonify({'error': 'No fields to update'}), 400
 
@@ -2803,9 +3765,361 @@ def bulk_add_tag():
 
     return jsonify({'message': f'Tag "{tag}" added to {len(lead_ids)} leads'})
 
+@app.route('/api/leads/<int:lead_id>', methods=['DELETE'])
+@limiter.limit("30/minute")
+def delete_lead(lead_id):
+    """Delete a single lead."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        c = conn.cursor()
+        # Verify ownership and delete
+        c.execute(
+            '''DELETE FROM leads
+               WHERE id = %s
+               AND batch_id IN (SELECT id FROM batches WHERE user_id = %s)''',
+            (lead_id, user_id)
+        )
+        deleted = c.rowcount
+
+    if deleted == 0:
+        return jsonify({'error': 'Lead not found or unauthorized'}), 404
+
+    return jsonify({'message': 'Lead deleted', 'lead_id': lead_id})
+
+@app.route('/api/leads/bulk-delete', methods=['POST'])
+@limiter.limit("10/minute")
+def bulk_delete_leads():
+    """Bulk delete leads."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'JSON body required'}), 400
+
+    lead_ids = data.get('lead_ids', [])
+
+    if not lead_ids or not isinstance(lead_ids, list):
+        return jsonify({'error': 'lead_ids array required'}), 400
+    if len(lead_ids) > 500:
+        return jsonify({'error': 'Maximum 500 leads per bulk delete'}), 400
+
+    with get_db() as conn:
+        c = conn.cursor()
+        placeholders = ','.join(['%s'] * len(lead_ids))
+        c.execute(
+            f'''DELETE FROM leads
+                WHERE id IN ({placeholders})
+                AND batch_id IN (SELECT id FROM batches WHERE user_id = %s)''',
+            lead_ids + [user_id]
+        )
+        deleted = c.rowcount
+
+    return jsonify({'message': f'{deleted} leads deleted', 'deleted': deleted})
+
+# ============= Advanced Scraping Methods =============
+
+# Credenciais para scrapers autenticados
+INSTAGRAM_USERNAME = "vaganagringa.dev"
+INSTAGRAM_PASSWORD = "1982Xandeq1982#"
+LINKEDIN_USERNAME = "acq2002@hotmail.com"
+LINKEDIN_PASSWORD = "1982Xandeq1982#"
+
+def scrape_google_maps(query, city, state, max_results=20):
+    """
+    Scrape Google Maps para buscar empresas locais.
+    Retorna lista de leads com nome, endereço, telefone, website, avaliações.
+    """
+    from playwright.sync_api import sync_playwright
+
+    leads = []
+    search_query = f"{query} em {city}, {state}, Brasil"
+
+    print(f"[GoogleMaps] Iniciando busca: {search_query}")
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent=random.choice(USER_AGENTS)
+            )
+            page = context.new_page()
+
+            # Buscar no Google Maps
+            maps_url = f"https://www.google.com/maps/search/{requests_quote(search_query)}"
+            page.goto(maps_url, timeout=30000)
+            time.sleep(3)
+
+            # Scroll para carregar mais resultados
+            for _ in range(3):
+                page.keyboard.press('PageDown')
+                time.sleep(1)
+
+            # Extrair resultados
+            results = page.query_selector_all('[role="article"]')
+            print(f"[GoogleMaps] {len(results)} resultados encontrados")
+
+            for idx, result in enumerate(results[:max_results]):
+                try:
+                    # Clicar no resultado para abrir detalhes
+                    result.click()
+                    time.sleep(2)
+
+                    # Extrair dados
+                    company_name = None
+                    address = None
+                    phone = None
+                    website = None
+                    rating = None
+
+                    # Nome da empresa
+                    name_elem = page.query_selector('h1')
+                    if name_elem:
+                        company_name = name_elem.inner_text().strip()
+
+                    # Telefone
+                    phone_button = page.query_selector('[data-item-id*="phone"]')
+                    if phone_button:
+                        phone_text = phone_button.inner_text()
+                        phone_match = re.search(r'[\d\s\(\)\-]+', phone_text)
+                        if phone_match:
+                            phone = phone_match.group().strip()
+
+                    # Website
+                    website_button = page.query_selector('[data-item-id*="authority"]')
+                    if website_button:
+                        website_text = website_button.inner_text()
+                        if website_text and not website_text.startswith('http'):
+                            website = f"https://{website_text}"
+                        else:
+                            website = website_text
+
+                    # Endereço
+                    address_button = page.query_selector('[data-item-id*="address"]')
+                    if address_button:
+                        address = address_button.inner_text().strip()
+
+                    # Avaliação
+                    rating_elem = page.query_selector('[role="img"][aria-label*="estrelas"]')
+                    if rating_elem:
+                        rating_text = rating_elem.get_attribute('aria-label')
+                        rating_match = re.search(r'([\d,\.]+)\s*estrelas', rating_text)
+                        if rating_match:
+                            rating = rating_match.group(1)
+
+                    if company_name:
+                        lead = {
+                            'company_name': company_name,
+                            'phone': phone,
+                            'website': website,
+                            'address': address,
+                            'city': city,
+                            'state': state,
+                            'rating': rating,
+                            'source': 'google_maps'
+                        }
+                        leads.append(lead)
+                        print(f"[GoogleMaps] Lead {idx+1}: {company_name}")
+
+                except Exception as e:
+                    print(f"[GoogleMaps] Erro ao processar resultado {idx+1}: {e}")
+                    continue
+
+            browser.close()
+
+    except Exception as e:
+        print(f"[GoogleMaps] Erro geral: {e}")
+
+    print(f"[GoogleMaps] Total de {len(leads)} leads extraídos")
+    return leads
+
+
+def scrape_instagram_business(niche, city, state, max_results=50):
+    """
+    Scrape Instagram para buscar perfis de negócios locais.
+    Usa hashtags e localização para encontrar empresas.
+    """
+    import instaloader
+
+    leads = []
+    L = instaloader.Instaloader()
+
+    print(f"[Instagram] Fazendo login como {INSTAGRAM_USERNAME}...")
+
+    try:
+        # Login
+        L.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+
+        # Buscar por hashtags relacionadas ao nicho + cidade
+        hashtags = [
+            f"{niche.replace(' ', '').lower()}{city.lower()}",
+            f"{niche.replace(' ', '').lower()}{state.lower()}",
+            f"{city.lower()}{niche.replace(' ', '').lower()}"
+        ]
+
+        for hashtag in hashtags[:2]:  # Limitar a 2 hashtags para não demorar muito
+            print(f"[Instagram] Buscando #{hashtag}...")
+
+            try:
+                posts = instaloader.Hashtag.from_name(L.context, hashtag).get_posts()
+
+                processed = 0
+                for post in posts:
+                    if processed >= max_results // 2:
+                        break
+
+                    try:
+                        profile = post.owner_profile
+
+                        # Apenas perfis de negócios
+                        if profile.is_business_account:
+                            email = profile.business_email if hasattr(profile, 'business_email') else None
+                            phone = profile.business_phone_number if hasattr(profile, 'business_phone_number') else None
+
+                            lead = {
+                                'company_name': profile.full_name or profile.username,
+                                'instagram': f"https://instagram.com/{profile.username}",
+                                'email': email,
+                                'phone': phone,
+                                'website': profile.external_url,
+                                'city': city,
+                                'state': state,
+                                'bio': profile.biography[:200] if profile.biography else None,
+                                'followers': profile.followers,
+                                'source': 'instagram'
+                            }
+
+                            leads.append(lead)
+                            print(f"[Instagram] Lead: @{profile.username} - {profile.full_name}")
+                            processed += 1
+
+                            time.sleep(2)  # Rate limiting
+
+                    except Exception as e:
+                        print(f"[Instagram] Erro ao processar post: {e}")
+                        continue
+
+            except Exception as e:
+                print(f"[Instagram] Erro na hashtag #{hashtag}: {e}")
+                continue
+
+    except Exception as e:
+        print(f"[Instagram] Erro geral: {e}")
+
+    print(f"[Instagram] Total de {len(leads)} leads extraídos")
+    return leads
+
+
+def scrape_linkedin_companies(niche, city, state, max_results=30):
+    """
+    Scrape LinkedIn para buscar empresas.
+    ATENÇÃO: LinkedIn tem proteção anti-scraping muito forte.
+    Usar com cuidado e delays longos.
+    """
+    from playwright.sync_api import sync_playwright
+
+    leads = []
+    search_query = f"{niche} {city} {state}"
+
+    print(f"[LinkedIn] Iniciando busca: {search_query}")
+    print(f"[LinkedIn] ⚠️  ATENÇÃO: LinkedIn pode bloquear. Usando delays longos...")
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)  # headless=False para evitar detecção
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent=random.choice(USER_AGENTS)
+            )
+            page = context.new_page()
+
+            # Login no LinkedIn
+            print(f"[LinkedIn] Fazendo login...")
+            page.goto('https://www.linkedin.com/login', timeout=30000)
+            time.sleep(2)
+
+            page.fill('input[name="session_key"]', LINKEDIN_USERNAME)
+            page.fill('input[name="session_password"]', LINKEDIN_PASSWORD)
+            page.click('button[type="submit"]')
+            time.sleep(5)
+
+            # Verificar se login funcionou
+            if 'feed' not in page.url and 'checkpoint' in page.url:
+                print("[LinkedIn] ⚠️  CAPTCHA ou verificação detectada. Abortando...")
+                browser.close()
+                return leads
+
+            print(f"[LinkedIn] Login OK. Buscando empresas...")
+
+            # Buscar empresas
+            search_url = f"https://www.linkedin.com/search/results/companies/?keywords={requests_quote(search_query)}"
+            page.goto(search_url, timeout=30000)
+            time.sleep(5)
+
+            # Scroll para carregar resultados
+            for _ in range(3):
+                page.keyboard.press('PageDown')
+                time.sleep(2)
+
+            # Extrair resultados
+            company_cards = page.query_selector_all('.entity-result')
+            print(f"[LinkedIn] {len(company_cards)} empresas encontradas")
+
+            for idx, card in enumerate(company_cards[:max_results]):
+                try:
+                    # Nome da empresa
+                    name_elem = card.query_selector('.entity-result__title-text a')
+                    if not name_elem:
+                        continue
+
+                    company_name = name_elem.inner_text().strip()
+                    company_url = name_elem.get_attribute('href')
+
+                    # Localização
+                    location_elem = card.query_selector('.entity-result__secondary-subtitle')
+                    location = location_elem.inner_text().strip() if location_elem else None
+
+                    # Descrição
+                    desc_elem = card.query_selector('.entity-result__summary')
+                    description = desc_elem.inner_text().strip() if desc_elem else None
+
+                    lead = {
+                        'company_name': company_name,
+                        'linkedin': company_url,
+                        'city': city,
+                        'state': state,
+                        'address': location,
+                        'description': description[:200] if description else None,
+                        'source': 'linkedin'
+                    }
+
+                    leads.append(lead)
+                    print(f"[LinkedIn] Lead {idx+1}: {company_name}")
+
+                    time.sleep(random.uniform(3, 6))  # Delay longo para evitar bloqueio
+
+                except Exception as e:
+                    print(f"[LinkedIn] Erro ao processar empresa {idx+1}: {e}")
+                    continue
+
+            browser.close()
+
+    except Exception as e:
+        print(f"[LinkedIn] Erro geral: {e}")
+
+    print(f"[LinkedIn] Total de {len(leads)} leads extraídos")
+    return leads
+
 # ============= API Enrichment Functions =============
 
-API_CREDIT_LIMITS = {'hunter': 25, 'snov': 50}
+API_CREDIT_LIMITS = {'hunter': 25, 'snov': 50, 'bing_api': 1000, 'google_cse': 100}
 
 def get_api_config(cursor, user_id, provider):
     """Get active API config for a user and provider."""
@@ -2820,11 +4134,14 @@ def get_api_config(cursor, user_id, provider):
 
 
 def get_api_credits_remaining(cursor, user_id, provider):
-    """Get remaining API credits for current month."""
-    month_year = datetime.now().strftime('%Y-%m')
+    """Get remaining API credits for current period (daily for google_cse, monthly for others)."""
+    if provider == 'google_cse':
+        period = datetime.now().strftime('%Y-%m-%d')  # Daily limit
+    else:
+        period = datetime.now().strftime('%Y-%m')  # Monthly limit
     cursor.execute(
         'SELECT credits_used, credits_limit FROM api_usage WHERE user_id = %s AND provider = %s AND month_year = %s',
-        (user_id, provider, month_year)
+        (user_id, provider, period)
     )
     row = cursor.fetchone()
     if not row:
@@ -2833,15 +4150,18 @@ def get_api_credits_remaining(cursor, user_id, provider):
 
 
 def record_api_usage(cursor, user_id, provider, cost=1):
-    """Record API credit usage for current month (upsert)."""
-    month_year = datetime.now().strftime('%Y-%m')
+    """Record API credit usage for current period (upsert)."""
+    if provider == 'google_cse':
+        period = datetime.now().strftime('%Y-%m-%d')  # Daily limit
+    else:
+        period = datetime.now().strftime('%Y-%m')  # Monthly limit
     limit = API_CREDIT_LIMITS.get(provider, 0)
     cursor.execute(
         '''INSERT INTO api_usage (user_id, provider, month_year, credits_used, credits_limit)
            VALUES (%s, %s, %s, %s, %s)
            ON CONFLICT (user_id, provider, month_year)
            DO UPDATE SET credits_used = api_usage.credits_used + %s''',
-        (user_id, provider, month_year, cost, limit, cost)
+        (user_id, provider, period, cost, limit, cost)
     )
 
 

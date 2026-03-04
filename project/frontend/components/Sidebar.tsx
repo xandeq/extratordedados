@@ -10,12 +10,14 @@ import {
   X,
   Moon,
   Sun,
+  Zap,
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 
 const navItems = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/scrape', label: 'Nova Extracao', icon: Search },
+  { href: '/massive-search', label: 'Busca Massiva', icon: Zap },
   { href: '/leads', label: 'Leads', icon: Database },
 ]
 
