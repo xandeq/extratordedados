@@ -406,17 +406,25 @@ export default function BatchResults() {
                     {searchLogs.map((log) => {
                       const icon =
                         log.type === 'start' || log.type === 'phase1' || log.type === 'phase2' ? '🚀' :
+                        log.type === 'phase0' ? '📂' :
                         log.type === 'config_check' ? '🔑' :
                         log.type === 'search_ok' ? '🔍' :
                         log.type === 'search_blocked' ? '🚫' :
                         log.type === 'search_skip' ? '⏭️' :
-                        log.type === 'domain_start' ? '🌐' :
+                        log.type === 'search_partial' ? '🔎' :
+                        log.type === 'search_attempt' ? '🌐' :
+                        log.type === 'search_complete' ? '✅' :
+                        log.type === 'dir_done' ? '📋' :
+                        log.type === 'domain_start' || log.type === 'crawl_start' ? '🌐' :
+                        log.type === 'crawl_complete' ? '🕸️' :
+                        log.type === 'crawl_error' ? '💥' :
                         log.type === 'api_hunter_ok' || log.type === 'api_snov_ok' ? '🎯' :
                         log.type === 'api_hunter_empty' || log.type === 'api_snov_empty' ? '😐' :
                         log.type === 'api_cache' ? '💾' :
                         log.type === 'api_skip' ? '⏩' :
                         log.type === 'api_error' ? '❌' :
                         log.type === 'leads_saved' ? '✅' :
+                        log.type === 'dir_leads' ? '📇' :
                         log.type === 'scrape_fallback' ? '🔧' :
                         log.type === 'scrape_done' ? '🕷️' :
                         log.type === 'scrape_error' ? '💥' :
@@ -427,11 +435,13 @@ export default function BatchResults() {
 
                       const bgColor =
                         log.type.includes('error') || log.type === 'search_blocked' ? 'bg-red-50' :
-                        log.type.includes('_ok') || log.type === 'leads_saved' ? 'bg-green-50' :
+                        log.type.includes('_ok') || log.type === 'leads_saved' || log.type === 'dir_leads' ? 'bg-green-50' :
                         log.type === 'complete' ? 'bg-blue-50' :
                         log.type === 'start' || log.type.startsWith('phase') ? 'bg-indigo-50' :
+                        log.type === 'dir_done' ? 'bg-teal-50' :
                         log.type === 'api_skip' || log.type === 'search_skip' ? 'bg-gray-50' :
                         log.type.includes('empty') ? 'bg-amber-50' :
+                        log.type === 'search_partial' || log.type === 'search_attempt' ? 'bg-sky-50' :
                         ''
 
                       return (

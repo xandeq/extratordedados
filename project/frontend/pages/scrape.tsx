@@ -86,6 +86,9 @@ export default function Scrape() {
   const [hunterKey, setHunterKey] = useState('')
   const [snovClientId, setSnovClientId] = useState('')
   const [snovSecret, setSnovSecret] = useState('')
+  const [bingApiKey, setBingApiKey] = useState('')
+  const [googleCseKey, setGoogleCseKey] = useState('')
+  const [googleCseCx, setGoogleCseCx] = useState('')
   const [savingApiConfig, setSavingApiConfig] = useState<string | null>(null)
   const [apiSearchNiche, setApiSearchNiche] = useState('')
   const [apiSearchRegion, setApiSearchRegion] = useState('')
@@ -125,12 +128,23 @@ export default function Scrape() {
         if (!snovClientId.trim() || !snovSecret.trim()) { setError('Informe o Client ID e Secret do Snov.io'); setSavingApiConfig(null); return }
         payload.api_key = snovClientId.trim()
         payload.api_secret = snovSecret.trim()
+      } else if (provider === 'bing_api') {
+        if (!bingApiKey.trim()) { setError('Informe a API key do Bing Web Search'); setSavingApiConfig(null); return }
+        payload.api_key = bingApiKey.trim()
+      } else if (provider === 'google_cse') {
+        if (!googleCseKey.trim() || !googleCseCx.trim()) { setError('Informe a API Key e o Search Engine ID do Google CSE'); setSavingApiConfig(null); return }
+        payload.api_key = googleCseKey.trim()
+        payload.api_secret = googleCseCx.trim()
       }
       await api.post('/api/api-config', payload)
-      addToast(`API ${provider === 'hunter' ? 'Hunter.io' : 'Snov.io'} configurada com sucesso!`, 'success')
+      const providerNames: Record<string, string> = { hunter: 'Hunter.io', snov: 'Snov.io', bing_api: 'Bing Web Search', google_cse: 'Google Custom Search' }
+      addToast(`API ${providerNames[provider] || provider} configurada com sucesso!`, 'success')
       setHunterKey('')
       setSnovClientId('')
       setSnovSecret('')
+      setBingApiKey('')
+      setGoogleCseKey('')
+      setGoogleCseCx('')
       await loadApiConfigs()
     } catch (err: any) {
       setError(err.response?.data?.error || `Erro ao salvar config ${provider}`)
@@ -142,7 +156,8 @@ export default function Scrape() {
   const handleDeleteApiConfig = async (provider: string) => {
     try {
       await api.delete(`/api/api-config/${provider}`)
-      addToast(`API ${provider === 'hunter' ? 'Hunter.io' : 'Snov.io'} removida`, 'success')
+      const providerNames: Record<string, string> = { hunter: 'Hunter.io', snov: 'Snov.io', bing_api: 'Bing Web Search', google_cse: 'Google Custom Search' }
+      addToast(`API ${providerNames[provider] || provider} removida`, 'success')
       await loadApiConfigs()
     } catch (err: any) {
       setError(err.response?.data?.error || 'Erro ao remover config')
@@ -157,12 +172,6 @@ export default function Scrape() {
     if (apiSearchMode === 'region' && !apiSearchRegion) { setError('Selecione uma regiao'); return }
     if (apiSearchMode === 'manual' && (!apiSearchCity.trim() || !apiSearchState.trim())) {
       setError('Informe cidade e estado'); return
-    }
-
-    const hasActiveApi = apiConfigs.some(c => c.is_active && c.credits_remaining > 0)
-    if (!hasActiveApi) {
-      setError('Configure ao menos uma API (Hunter.io ou Snov.io) com creditos disponiveis')
-      return
     }
 
     setLoading(true)
@@ -808,54 +817,44 @@ export default function Scrape() {
           <div className="bg-white rounded-xl border border-gray-200 p-5">
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-base font-semibold text-gray-900">Busca via API</h2>
-              <div className="flex gap-2">
+              <div className="flex gap-1.5 flex-wrap">
                 {apiConfigsLoading ? (
                   <Loader2 className="w-4 h-4 animate-spin text-gray-400" />
                 ) : (
                   <>
-                    {(() => {
-                      const hunter = getApiConfig('hunter')
-                      return hunter && hunter.is_active ? (
-                        <span className={`px-2.5 py-1 rounded-lg text-xs font-semibold border ${
-                          hunter.credits_remaining > 5
+                    {[
+                      { key: 'bing_api', label: 'Bing', threshold: 100 },
+                      { key: 'google_cse', label: 'Google', threshold: 20 },
+                      { key: 'hunter', label: 'Hunter', threshold: 5 },
+                      { key: 'snov', label: 'Snov', threshold: 10 },
+                    ].map(({ key, label, threshold }) => {
+                      const cfg = getApiConfig(key)
+                      return cfg && cfg.is_active ? (
+                        <span key={key} className={`px-2 py-0.5 rounded-lg text-[11px] font-semibold border ${
+                          cfg.credits_remaining > threshold
                             ? 'bg-green-50 text-green-700 border-green-200'
-                            : hunter.credits_remaining > 0
+                            : cfg.credits_remaining > 0
                             ? 'bg-amber-50 text-amber-700 border-amber-200'
                             : 'bg-red-50 text-red-700 border-red-200'
                         }`}>
-                          Hunter: {hunter.credits_remaining}/{hunter.credits_limit}
+                          {label}: {cfg.credits_remaining}/{cfg.credits_limit}
                         </span>
                       ) : (
-                        <span className="px-2.5 py-1 rounded-lg text-xs font-medium bg-gray-100 text-gray-400 border border-gray-200">
-                          Hunter: -
+                        <span key={key} className="px-2 py-0.5 rounded-lg text-[11px] font-medium bg-gray-100 text-gray-400 border border-gray-200">
+                          {label}: -
                         </span>
                       )
-                    })()}
-                    {(() => {
-                      const snov = getApiConfig('snov')
-                      return snov && snov.is_active ? (
-                        <span className={`px-2.5 py-1 rounded-lg text-xs font-semibold border ${
-                          snov.credits_remaining > 10
-                            ? 'bg-green-50 text-green-700 border-green-200'
-                            : snov.credits_remaining > 0
-                            ? 'bg-amber-50 text-amber-700 border-amber-200'
-                            : 'bg-red-50 text-red-700 border-red-200'
-                        }`}>
-                          Snov: {snov.credits_remaining}/{snov.credits_limit}
-                        </span>
-                      ) : (
-                        <span className="px-2.5 py-1 rounded-lg text-xs font-medium bg-gray-100 text-gray-400 border border-gray-200">
-                          Snov: -
-                        </span>
-                      )
-                    })()}
+                    })}
+                    <span className="px-2 py-0.5 rounded-lg text-[11px] font-semibold bg-teal-50 text-teal-700 border border-teal-200">
+                      Diretorios: ilimitado
+                    </span>
                   </>
                 )}
               </div>
             </div>
             <p className="text-sm text-gray-500">
-              Busca dominios via DuckDuckGo/Bing e enriquece com APIs de email (Hunter.io + Snov.io).
-              Fallback automatico para scraping quando APIs nao retornam resultados.
+              Multi-fonte: Diretorios BR (GuiaMais, TeleListas, Apontador) + Bing API + Google CSE + scraping.
+              Enriquecimento de emails via Hunter.io + Snov.io. Nenhuma API obrigatoria - diretorios sempre funcionam!
             </p>
           </div>
 
@@ -873,6 +872,105 @@ export default function Scrape() {
             </button>
             {showApiSettings && (
               <div className="border-t border-gray-200 p-5 space-y-5">
+                {/* Section: Search APIs */}
+                <div className="pb-2 border-b border-gray-100">
+                  <p className="text-xs font-bold text-gray-500 uppercase tracking-wider">APIs de Busca (encontrar dominios)</p>
+                </div>
+
+                {/* Bing Web Search API */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm font-semibold text-gray-800">Bing Web Search API</label>
+                    {getApiConfig('bing_api')?.is_active ? (
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
+                        <span className="text-xs text-green-600 font-medium">Configurada</span>
+                        <button
+                          onClick={() => handleDeleteApiConfig('bing_api')}
+                          className="text-xs text-red-400 hover:text-red-600 ml-1"
+                        >
+                          Remover
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-gray-400">Nao configurada</span>
+                    )}
+                  </div>
+                  {!getApiConfig('bing_api')?.is_active && (
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={bingApiKey}
+                        onChange={(e) => setBingApiKey(e.target.value)}
+                        placeholder="Bing API Key (Ocp-Apim-Subscription-Key)"
+                        className="flex-1 px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all text-sm"
+                      />
+                      <button
+                        onClick={() => handleSaveApiConfig('bing_api')}
+                        disabled={savingApiConfig === 'bing_api'}
+                        className="px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white rounded-xl text-sm font-medium transition-colors disabled:opacity-60 whitespace-nowrap"
+                      >
+                        {savingApiConfig === 'bing_api' ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Salvar'}
+                      </button>
+                    </div>
+                  )}
+                  <p className="text-xs text-gray-400">1.000 buscas/mes gratis, sem CAPTCHA. Azure Portal &gt; Bing Search v7</p>
+                </div>
+
+                {/* Google Custom Search API */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm font-semibold text-gray-800">Google Custom Search API</label>
+                    {getApiConfig('google_cse')?.is_active ? (
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
+                        <span className="text-xs text-green-600 font-medium">Configurada</span>
+                        <button
+                          onClick={() => handleDeleteApiConfig('google_cse')}
+                          className="text-xs text-red-400 hover:text-red-600 ml-1"
+                        >
+                          Remover
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-gray-400">Nao configurada</span>
+                    )}
+                  </div>
+                  {!getApiConfig('google_cse')?.is_active && (
+                    <div className="space-y-2">
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          value={googleCseKey}
+                          onChange={(e) => setGoogleCseKey(e.target.value)}
+                          placeholder="API Key (Google Cloud Console)"
+                          className="flex-1 px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all text-sm"
+                        />
+                        <input
+                          type="text"
+                          value={googleCseCx}
+                          onChange={(e) => setGoogleCseCx(e.target.value)}
+                          placeholder="Search Engine ID (cx)"
+                          className="flex-1 px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all text-sm"
+                        />
+                      </div>
+                      <button
+                        onClick={() => handleSaveApiConfig('google_cse')}
+                        disabled={savingApiConfig === 'google_cse'}
+                        className="px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white rounded-xl text-sm font-medium transition-colors disabled:opacity-60"
+                      >
+                        {savingApiConfig === 'google_cse' ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Validar e Salvar'}
+                      </button>
+                    </div>
+                  )}
+                  <p className="text-xs text-gray-400">100 buscas/dia gratis. Google Cloud Console + Programmable Search Engine</p>
+                </div>
+
+                {/* Section: Email Enrichment APIs */}
+                <div className="pt-2 pb-2 border-b border-gray-100">
+                  <p className="text-xs font-bold text-gray-500 uppercase tracking-wider">APIs de Enriquecimento (buscar emails por dominio)</p>
+                </div>
+
                 {/* Hunter.io */}
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
@@ -967,10 +1065,9 @@ export default function Scrape() {
 
           {/* API Search Form */}
           <div className="bg-white rounded-xl border border-gray-200 p-6">
-            <h2 className="text-base font-semibold text-gray-900 mb-1">Buscar Leads por Nicho + Cidade (via API)</h2>
+            <h2 className="text-base font-semibold text-gray-900 mb-1">Buscar Leads por Nicho + Cidade (Multi-Fonte)</h2>
             <p className="text-sm text-gray-500 mb-5">
-              Busca dominios em motores de busca e enriquece cada um via Hunter.io/Snov.io.
-              Se a API nao encontrar dados, faz scraping automatico como fallback.
+              Combina diretorios BR + APIs oficiais + scraping. Quanto mais APIs configuradas, mais leads!
             </p>
 
             <form onSubmit={handleApiSearchSubmit} className="space-y-4">
@@ -1100,14 +1197,13 @@ export default function Scrape() {
 
               {/* Info box */}
               <div className="px-4 py-3 bg-purple-50 border border-purple-200 rounded-xl text-purple-700 text-sm space-y-1">
-                <p className="font-semibold">Fluxo de enriquecimento:</p>
+                <p className="font-semibold">Fluxo multi-fonte:</p>
                 <ol className="list-decimal list-inside text-xs space-y-0.5">
-                  <li>Busca dominios via DuckDuckGo/Bing</li>
-                  <li>Para cada dominio: verifica cache (30 dias)</li>
-                  <li>Se nao tem cache: tenta Hunter.io (se houver creditos)</li>
-                  <li>Se Hunter nao retornou: tenta Snov.io (se houver creditos)</li>
-                  <li>Se nenhuma API retornou: faz scraping tradicional como fallback</li>
+                  <li><strong>Fase 0:</strong> Scraping de diretorios BR (GuiaMais, TeleListas, Apontador) - sempre funciona!</li>
+                  <li><strong>Fase 1:</strong> Busca dominios: Bing API &rarr; Google CSE &rarr; DDG scraping &rarr; Bing scraping</li>
+                  <li><strong>Fase 2:</strong> Para cada dominio: Hunter.io &rarr; Snov.io &rarr; scraping como fallback</li>
                 </ol>
+                <p className="text-[11px] text-purple-500 mt-1">Nenhuma API e obrigatoria. Diretorios + scraping funcionam sem nenhuma chave configurada.</p>
               </div>
 
               <button

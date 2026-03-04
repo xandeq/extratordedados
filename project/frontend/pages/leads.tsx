@@ -5,7 +5,7 @@ import {
   Search, Database, ChevronLeft, ChevronRight, Check,
   Tag, Filter, Mail, Phone, Building2, MessageCircle,
   Instagram, Facebook, Linkedin, ExternalLink, MoreHorizontal,
-  Users, ArrowUpDown, Download
+  Users, ArrowUpDown, Download, Trash2
 } from 'lucide-react'
 import api from '../lib/api'
 import { useToast } from '../components/Toast'
@@ -92,6 +92,9 @@ export default function Leads() {
   // Tag input modal (replaces prompt())
   const [showTagInput, setShowTagInput] = useState(false)
   const [tagInputValue, setTagInputValue] = useState('')
+
+  // Delete confirmation modal
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
 
   const tagInputRef = useRef<HTMLInputElement>(null)
 
@@ -202,6 +205,26 @@ export default function Leads() {
       fetchLeads()
     } catch {
       addToast('Erro ao adicionar tag', 'error')
+    }
+  }
+
+  const handleBulkDelete = () => {
+    if (selected.size === 0) return
+    setShowDeleteConfirm(true)
+  }
+
+  const confirmBulkDelete = async () => {
+    if (selected.size === 0) return
+    try {
+      await api.post('/api/leads/bulk-delete', {
+        lead_ids: Array.from(selected),
+      })
+      addToast(`${selected.size} lead${selected.size > 1 ? 's' : ''} deletado${selected.size > 1 ? 's' : ''}`, 'success')
+      setSelected(new Set())
+      setShowDeleteConfirm(false)
+      fetchLeads()
+    } catch {
+      addToast('Erro ao deletar leads', 'error')
     }
   }
 
@@ -334,6 +357,13 @@ export default function Leads() {
             >
               <Download className="w-3.5 h-3.5" />
               Exportar
+            </button>
+            <button
+              onClick={handleBulkDelete}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-50 border border-red-200 rounded-lg text-xs font-medium text-red-700 hover:bg-red-100"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Deletar
             </button>
             <button
               onClick={() => setSelected(new Set())}
@@ -580,6 +610,46 @@ export default function Leads() {
                   className="flex-1 px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white rounded-xl font-semibold text-sm transition-colors disabled:opacity-50"
                 >
                   Adicionar
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {showDeleteConfirm && (
+        <>
+          <div className="fixed inset-0 bg-black/30 z-40" onClick={() => setShowDeleteConfirm(false)} />
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md p-6 animate-fade-in">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-12 h-12 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center">
+                  <Trash2 className="w-6 h-6 text-red-600 dark:text-red-400" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-gray-900 dark:text-gray-100">Confirmar Exclusão</h3>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">Esta ação não pode ser desfeita</p>
+                </div>
+              </div>
+              <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-4 mb-4">
+                <p className="text-sm text-red-800 dark:text-red-300">
+                  Você está prestes a deletar <strong>{selected.size} lead{selected.size > 1 ? 's' : ''}</strong>.
+                  Os dados serão permanentemente removidos do sistema.
+                </p>
+              </div>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setShowDeleteConfirm(false)}
+                  className="flex-1 px-4 py-2.5 border border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-xl font-medium text-sm hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  onClick={confirmBulkDelete}
+                  className="flex-1 px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-xl font-semibold text-sm transition-colors"
+                >
+                  Deletar {selected.size} Lead{selected.size > 1 ? 's' : ''}
                 </button>
               </div>
             </div>
