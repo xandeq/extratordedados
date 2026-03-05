@@ -44,7 +44,7 @@ print(f"\n=== Testing POST /api/login with test client ===")
 with app.test_client() as client:
     for i in range(8):
         resp = client.post('/api/login',
-            json={'username': 'admin', 'password': '1982Xandeq1982#'},
+            json={'username': 'admin', 'password': 'REDACTED_PASSWORD'},
             headers={'X-Forwarded-For': '1.2.3.4'}
         )
         all_headers = dict(resp.headers)

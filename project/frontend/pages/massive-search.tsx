@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'react';
-import Layout from '../components/Layout';
-import { Search, Target, Zap, MapPin, Database, Globe, Instagram, Linkedin, CheckCircle2, XCircle, Loader2, TrendingUp } from 'lucide-react';
-import api from '../lib/api';
+import { CheckCircle2, Database, Instagram, Linkedin, Loader2, MapPin, Search, TrendingUp, XCircle, Zap } from 'lucide-react';
 import { useRouter } from 'next/router';
+import { useState } from 'react';
+import Layout from '../components/Layout';
+import api from '../lib/api';
 
 interface SearchMethod {
   id: string;
@@ -33,17 +33,17 @@ const PREDEFINED_NICHES: Niche[] = [
 ];
 
 const REGIONS = [
-  { id: 'grande-vitoria-es', name: 'Grande Vitória-ES', cities: ['Vitória', 'Vila Velha', 'Serra', 'Cariacica', 'Viana', 'Guarapari', 'Fundão'] },
-  { id: 'grande-sp', name: 'Grande São Paulo-SP', cities: ['São Paulo', 'Guarulhos', 'Osasco', 'Santo André'] },
-  { id: 'grande-rj', name: 'Grande Rio de Janeiro-RJ', cities: ['Rio de Janeiro', 'Niterói', 'Duque de Caxias'] },
-  { id: 'grande-bh', name: 'Grande Belo Horizonte-MG', cities: ['Belo Horizonte', 'Contagem', 'Betim'] },
+  { id: 'grande_vitoria_es', name: 'Grande Vitória-ES', cities: ['Vitória', 'Vila Velha', 'Serra', 'Cariacica', 'Viana', 'Guarapari', 'Fundão'] },
+  { id: 'grande_sp', name: 'Grande São Paulo-SP', cities: ['São Paulo', 'Guarulhos', 'Osasco', 'Santo André'] },
+  { id: 'grande_rj', name: 'Grande Rio de Janeiro-RJ', cities: ['Rio de Janeiro', 'Niterói', 'Duque de Caxias'] },
+  { id: 'grande_bh', name: 'Grande Belo Horizonte-MG', cities: ['Belo Horizonte', 'Contagem', 'Betim'] },
 ];
 
 export default function MassiveSearch() {
   const router = useRouter();
   const [niches, setNiches] = useState<Niche[]>(PREDEFINED_NICHES);
   const [customNiche, setCustomNiche] = useState('');
-  const [selectedRegion, setSelectedRegion] = useState('grande-vitoria-es');
+  const [selectedRegion, setSelectedRegion] = useState('grande_vitoria_es');
   const [maxPages, setMaxPages] = useState(2);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');

@@ -1,0 +1,21 @@
+﻿Logging in...
+Testing massive search API at https://api.extratordedados.com.br/api/search/massive...
+Status Code: 200
+Response: {"batch_id":25,"message":"Busca massiva iniciada com 28 jobs em 4 m\u00e9todos","methods":{"api_enrichment":2,"google_maps":4,"search_engines":0},"name":"Busca Massiva - grande_vitoria_es (2 nichos)","status":"processing","total_jobs":28}
+
+
+Batch ID: 25
+
+Checking progress...
+
+--- Progress Check 1 ---
+Status Code: 200
+Progress Data: {'processed_urls': 0, 'status': 'processing', 'total_leads': 0, 'total_urls': 28}
+
+--- Progress Check 2 ---
+Status Code: 200
+Progress Data: {'processed_urls': 0, 'status': 'processing', 'total_leads': 0, 'total_urls': 28}
+
+--- Progress Check 3 ---
+Status Code: 200
+Progress Data: {'processed_urls': 0, 'status': 'processing', 'total_leads': 0, 'total_urls': 28}

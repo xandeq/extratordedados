@@ -5,7 +5,7 @@ import io
 
 FTP_HOST = "ftp.alexandrequeiroz.com.br"
 FTP_USER = "contato@extratordedados.com.br"
-FTP_PASS = "1982Xandeq1982#"
+FTP_PASS = "REDACTED_PASSWORD"
 
 def main():
     print(f"Conectando a {FTP_HOST}...")

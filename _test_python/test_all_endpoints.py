@@ -16,7 +16,7 @@ print(f"  Body: {r.text}")
 print("\n=== 2. Login ===")
 r = requests.post(f'{BASE}/api/login', json={
     'username': 'admin',
-    'password': '1982Xandeq1982#'
+    'password': 'REDACTED_PASSWORD'
 }, timeout=15)
 print(f"  Status: {r.status_code}")
 data = r.json()

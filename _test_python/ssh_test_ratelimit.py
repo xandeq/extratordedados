@@ -22,7 +22,7 @@ cmd = '''
 for i in $(seq 1 8); do
   RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:8000/api/login \
     -H "Content-Type: application/json" \
-    -d '{"username":"admin","password":"1982Xandeq1982#"}')
+    -d '{"username":"admin","password":"REDACTED_PASSWORD"}')
   echo "Request $i: HTTP $RESP"
 done
 '''
@@ -56,7 +56,7 @@ print("\n=== Test with full response headers ===")
 cmd = '''
 curl -s -D - -X POST http://127.0.0.1:8000/api/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"1982Xandeq1982#"}' 2>&1 | head -20
+  -d '{"username":"admin","password":"REDACTED_PASSWORD"}' 2>&1 | head -20
 '''
 out, err = run(cmd)
 print(out)

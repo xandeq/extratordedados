@@ -20,7 +20,7 @@ commands = [
     # Test login endpoint
     'echo ""',
     'echo "=== LOGIN TEST ==="',
-    'curl -sk -X POST https://api.extratordedados.com.br/api/login -H "Content-Type: application/json" -d \'{"username":"admin","password":"1982Xandeq1982#"}\'',
+    'curl -sk -X POST https://api.extratordedados.com.br/api/login -H "Content-Type: application/json" -d \'{"username":"admin","password":"REDACTED_PASSWORD"}\'',
 
     # Check Traefik ACME logs
     'echo ""',

@@ -14,7 +14,7 @@ print("=== Rate Limit Test: POST /api/login (limit: 5/minute) ===\n")
 
 for i in range(8):
     conn = http.client.HTTPSConnection(API_HOST, 443, timeout=10, context=context)
-    body = json.dumps({'username': 'admin', 'password': '1982Xandeq1982#'})
+    body = json.dumps({'username': 'admin', 'password': 'REDACTED_PASSWORD'})
     conn.request('POST', '/api/login', body=body, headers={
         'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0',

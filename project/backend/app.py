@@ -181,6 +181,15 @@ EMAIL_LOW_QUALITY_PATTERNS = [
     r'^(root|admin|administrator|system|daemon)@',
     r'^(info|contact|contato|atendimento|suporte|support|sales|vendas)@',
     r'^(newsletter|news|noticias|updates|marketing)@',
+    r'^(financeiro|rh|recursos-humanos|fiscal|comercial|recepcao|portaria)@',
+    r'^(contabilidade|vendas|sac|ouvidoria|diretoria|gestao)@',
+]
+
+# Sufixos empresariais comuns para limpeza de nomes
+CORPORATE_SUFFIXES = [
+    ' LTDA', ' S/A', ' SA', ' EIRELI', ' ME', ' EPP', ' MEI',
+    ' LIMITADA', ' SERVICOS', ' SERVICE', ' SOLUTIONS', ' CONSULTORIA',
+    ' ASSESSORIA', ' EMPREENDIMENTOS', ' PARTICIPACOES',
 ]
 
 # TLDs de países irrelevantes (quando busca é Brasil)
@@ -2141,6 +2150,11 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                             ])).strip()
                             phone = api_lead.get('phone', '') or ''
                             company = org_name or derive_company_name(email)
+
+                            # Intelligent contact name extraction
+                            if not contact_name:
+                                contact_name = derive_contact_name(email)
+
                             lead_data = {'email': email, 'phone': phone, 'company_name': company}
                             quality = calculate_quality_score(lead_data)
                             try:
@@ -3485,6 +3499,10 @@ def start_api_search():
     )
     thread.start()
 
+    # AUTO-SYNC: Start background thread to sync leads
+    sync_thread = threading.Thread(target=auto_sync_new_leads_background, args=(batch_id,), daemon=True)
+    sync_thread.start()
+
     return jsonify({
         'batch_id': batch_id,
         'name': batch_name,
@@ -4472,30 +4490,65 @@ GENERIC_EMAIL_PROVIDERS = {
 }
 
 def derive_company_name(email):
-    """Derive a company/contact name from an email address.
-    For business domains: uses the domain name (e.g., contato@acme.com.br -> Acme)
-    For generic providers: uses the local part (e.g., joao.silva@gmail.com -> Joao Silva)
+    """Derive a company name from an email address domain.
+    Aggressively cleans common corporate suffixes and symbols.
     """
     if not email or '@' not in email:
         return ''
-    local_part, domain = email.lower().split('@', 1)
-    if not domain:
+    _, domain = email.lower().split('@', 1)
+    if not domain or domain in GENERIC_EMAIL_PROVIDERS:
         return ''
 
-    def normalize(raw):
-        import re as _re
-        name = _re.sub(r'\d+$', '', raw)           # remove trailing numbers
-        name = _re.sub(r'[._\-]+', ' ', name)      # dots/underscores/hyphens -> spaces
-        name = _re.sub(r'\s+', ' ', name).strip()   # collapse spaces
-        if not name:
-            return ''
-        return ' '.join(w.capitalize() for w in name.split())
+    # Get main domain part (e.g. acme.com.br -> acme)
+    name = domain.split('.')[0]
 
-    if domain in GENERIC_EMAIL_PROVIDERS:
-        return normalize(local_part)
-    else:
-        domain_name = domain.split('.')[0]
-        return normalize(domain_name)
+    import re as _re
+    name = _re.sub(r'\d+$', '', name)           # remove trailing numbers
+    name = _re.sub(r'[._\-]+', ' ', name)      # dots/underscores/hyphens -> spaces
+    name = name.upper()
+
+    # Advanced cleaning: Remove corporate suffixes
+    for suffix in CORPORATE_SUFFIXES:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)].strip()
+            break
+
+    name = _re.sub(r'\s+', ' ', name).strip()   # collapse spaces
+    if not name or len(name) < 2:
+        return ''
+
+    return ' '.join(w.capitalize() for w in name.split())
+
+def derive_contact_name(email):
+    """Derive a human contact name from the local part of an email.
+    Example: joao.silva@gmail.com -> Joao Silva
+    Returns empty string if it looks like a generic/department email.
+    """
+    if not email or '@' not in email:
+        return ''
+    local_part, _ = email.lower().split('@', 1)
+
+    # Skip department/generic prefixes
+    import re as _re
+    for pattern in EMAIL_LOW_QUALITY_PATTERNS:
+        if _re.search(pattern, local_part + '@'):
+            return ''
+
+    # Basic cleaning
+    name = _re.sub(r'\d+$', '', local_part)
+    name = _re.sub(r'[._\-]+', ' ', name)
+    name = _re.sub(r'\s+', ' ', name).strip()
+
+    if not name or len(name) < 3:
+        return ''
+
+    # Heuristic: human names usually have at least one space if they use dots/underscores
+    # or follow common baptismal name lengths.
+    words = name.split()
+    if len(words) == 1 and len(words[0]) < 4: # too short for a name
+        return ''
+
+    return ' '.join(w.capitalize() for w in words)
 
 
 # ============= Import Leads from Text Extraction =============
@@ -4539,6 +4592,10 @@ def import_leads():
             whatsapp = (c.get('whatsapp') or phone or '').strip()
             contact_name = (c.get('contact_name') or '').strip()
 
+            # Intelligent contact name extraction
+            if not contact_name and email:
+                contact_name = derive_contact_name(email)
+
             if not email and not phone:
                 skipped += 1
                 continue
@@ -4564,6 +4621,10 @@ def import_leads():
         # Update batch count
         cur.execute("UPDATE batches SET total_urls = %s WHERE id = %s", (imported, batch_id))
         conn.commit()
+
+        # AUTO-SYNC: Start background thread to sync leads
+        sync_thread = threading.Thread(target=auto_sync_new_leads_background, args=(batch_id,), daemon=True)
+        sync_thread.start()
 
         return jsonify({
             'batch_id': batch_id,
@@ -5002,7 +5063,7 @@ Endpoint para busca massiva usando TODOS os métodos disponíveis
 # Add this after line ~3400 (after /api/search-api endpoint)
 
 @app.route('/api/search/massive', methods=['POST'])
-@limiter.limit("1/hour")  # Limit massivo é menor
+@limiter.limit("10/hour")  # 10 buscas massivas por hora
 def start_massive_search():
     """
     Start a massive search using ALL available methods:

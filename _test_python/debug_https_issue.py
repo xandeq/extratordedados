@@ -95,7 +95,7 @@ for origin in ['https://extratordedados.com.br', 'http://extratordedados.com.br'
     try:
         context = ssl.create_default_context()
         conn = http.client.HTTPSConnection('api.extratordedados.com.br', 443, timeout=10, context=context)
-        body = json.dumps({'username': 'admin', 'password': '1982Xandeq1982#'})
+        body = json.dumps({'username': 'admin', 'password': 'REDACTED_PASSWORD'})
         headers = {
             'Content-Type': 'application/json',
             'Origin': origin,

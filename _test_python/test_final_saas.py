@@ -45,7 +45,7 @@ check("Database is PostgreSQL", data.get('db') == 'postgresql', f"got: {data.get
 
 # 2. Login
 print("\n2. AUTHENTICATION")
-status, body, _ = api('POST', '/api/login', {'username': 'admin', 'password': '1982Xandeq1982#'})
+status, body, _ = api('POST', '/api/login', {'username': 'admin', 'password': 'REDACTED_PASSWORD'})
 data = json.loads(body)
 token = data.get('token')
 check("Login returns 200", status == 200)
