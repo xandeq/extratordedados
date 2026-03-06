@@ -2,10 +2,11 @@
 Instala Playwright e browsers no VPS via SSH
 """
 import paramiko
+from _secrets import vps_host, vps_user, vps_pass
 
-VPS_HOST = "185.173.110.180"
-VPS_USER = "root"
-VPS_PASSWORD = "1982X@ndeq1982#"
+VPS_HOST = vps_host()
+VPS_USER = vps_user()
+VPS_PASSWORD = vps_pass()
 
 print("Conectando ao VPS...")
 ssh = paramiko.SSHClient()

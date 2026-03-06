@@ -1,3 +1,4 @@
+import os
 """
 TESTE END-TO-END COMPLETO
 Busca massiva de restaurantes em Vila Velha-ES + Auto-sync para alexandrequeiroz.com.br
@@ -24,7 +25,7 @@ print()
 print('STEP 1: Login no extratordedados.com.br...')
 r = requests.post(f'{API_EXTRATOR}/api/login', json={
     'username': 'admin',
-    'password': '1982Xandeq1982#'
+    'password': os.environ.get('ADMIN_PASSWORD', '')
 })
 
 if r.status_code != 200:
@@ -167,7 +168,7 @@ print('STEP 7: Verificando leads sincronizados em alexandrequeiroz.com.br...')
 # Login
 r = requests.post(f'{API_ALEXANDRE}/api/v1/auth/login', json={
     'email': 'admin@alexandrequeiroz.com.br',
-    'password': '1982Xandeq1982#'
+    'password': os.environ.get('ADMIN_PASSWORD', '')
 })
 
 if r.status_code != 200:

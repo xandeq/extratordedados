@@ -88,7 +88,7 @@ else:
 
     # 6. Check tables
     print("\n6. Checking tables...")
-    db_pass_cmd = DB_PASS if DB_PASS else 'Extr4t0r_S3cur3_2026!'
+    db_pass_cmd = DB_PASS
     out, err = run(f"""PGPASSWORD='{db_pass_cmd}' psql -h 127.0.0.1 -U extrator -d extrator -c "SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name;" """)
     print(f"   {out}")
 

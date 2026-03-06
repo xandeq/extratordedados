@@ -1,3 +1,4 @@
+import os
 """Test SSH connection to VPS"""
 import paramiko
 import sys
@@ -6,7 +7,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 VPS_HOST = '185.173.110.180'
 VPS_USER = 'root'
-VPS_PASS = '1982X@ndeq1982#'
+VPS_PASS = os.environ.get('VPS_PASS', '')
 
 print(f"Testing SSH connection to {VPS_HOST}...")
 print(f"User: {VPS_USER}")

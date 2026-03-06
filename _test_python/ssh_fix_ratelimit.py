@@ -1,3 +1,4 @@
+import os
 """Debug and fix Flask-Limiter on VPS"""
 import paramiko
 import sys
@@ -6,7 +7,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect('185.173.110.180', username='root', password='1982X@ndeq1982#', timeout=15)
+ssh.connect('185.173.110.180', username='root', password=os.environ.get('VPS_PASS', ''), timeout=15)
 
 def run(cmd, timeout=30):
     stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)

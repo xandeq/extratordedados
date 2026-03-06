@@ -58,11 +58,11 @@ DB_CONFIG = {
     'port': int(os.environ.get('DB_PORT', 5432)),
     'dbname': os.environ.get('DB_NAME', 'extrator'),
     'user': os.environ.get('DB_USER', 'extrator'),
-    'password': os.environ.get('DB_PASSWORD', 'Extr4t0r_S3cur3_2026!'),
+    'password': os.environ.get('DB_PASSWORD', ''),
 }
 
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD_HASH = hashlib.sha256("1982Xandeq1982#".encode()).hexdigest()
+ADMIN_PASSWORD_HASH = hashlib.sha256(os.environ.get('ADMIN_PASSWORD', '').encode()).hexdigest()
 
 # ============= Anti-Blocking =============
 
@@ -3860,10 +3860,10 @@ def bulk_delete_leads():
 # ============= Advanced Scraping Methods =============
 
 # Credenciais para scrapers autenticados
-INSTAGRAM_USERNAME = "vaganagringa.dev"
-INSTAGRAM_PASSWORD = "1982Xandeq1982#"
-LINKEDIN_USERNAME = "acq2002@hotmail.com"
-LINKEDIN_PASSWORD = "1982Xandeq1982#"
+INSTAGRAM_USERNAME = os.environ.get('INSTAGRAM_USER', '')
+INSTAGRAM_PASSWORD = os.environ.get('INSTAGRAM_PASS', '')
+LINKEDIN_USERNAME = os.environ.get('LINKEDIN_USER', '')
+LINKEDIN_PASSWORD = os.environ.get('LINKEDIN_PASS', '')
 
 def scrape_google_maps(query, city, state, max_results=20):
     """
@@ -5514,8 +5514,8 @@ Add this code to app.py after line ~300 (after DB connection pool setup)
 # ============= Alexandre Queiroz API Sync =============
 
 ALEXANDREQUEIROZ_API = 'https://api.alexandrequeiroz.com.br'
-ALEXANDREQUEIROZ_EMAIL = 'admin@alexandrequeiroz.com.br'
-ALEXANDREQUEIROZ_PASSWORD = '1982Xandeq1982#'
+ALEXANDREQUEIROZ_EMAIL = os.environ.get('CRM_EMAIL', 'admin@alexandrequeiroz.com.br')
+ALEXANDREQUEIROZ_PASSWORD = os.environ.get('CRM_PASS', '')
 
 # Global token cache (expires in 6 hours)
 _alexandrequeiroz_token = None

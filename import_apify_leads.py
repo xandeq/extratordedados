@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -23,7 +24,7 @@ def login():
 
     # Credenciais fornecidas
     username = "admin"
-    password = "1982Xandeq1982#"
+    password = os.environ.get('ADMIN_PASSWORD', '')
 
     response = requests.post(f"{API_URL}/login", json={
         "username": username,

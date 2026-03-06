@@ -3,12 +3,13 @@ import paramiko
 import sys
 import os
 import time
+from _secrets import vps_host, vps_user, vps_pass
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-VPS_HOST = "185.173.110.180"
-VPS_USER = "root"
-VPS_PASSWORD = "1982X@ndeq1982#"
+VPS_HOST = vps_host()
+VPS_USER = vps_user()
+VPS_PASSWORD = vps_pass()
 
 print("Conectando ao VPS...")
 ssh = paramiko.SSHClient()

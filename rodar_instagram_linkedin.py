@@ -1,8 +1,9 @@
+import os
 import requests,json,sys,io,time
 if sys.platform=='win32':sys.stdout=io.TextIOWrapper(sys.stdout.buffer,encoding='utf-8')
 
 API="https://api.extratordedados.com.br"
-r=requests.post(f"{API}/api/login",json={"username":"admin","password":"1982Xandeq1982#"})
+r=requests.post(f"{API}/api/login",json={"username":"admin","password":os.environ.get("ADMIN_PASSWORD","")})
 token=r.json().get('token')
 h={"Authorization":f"Bearer {token}"}
 

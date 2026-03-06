@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -53,7 +54,7 @@ print()
 print("🔐 Fazendo login como admin@alexandrequeiroz.com.br...")
 response = requests.post(f"{API_BASE_URL}/api/v1/auth/login", json={
     "email": "admin@alexandrequeiroz.com.br",
-    "password": "1982Xandeq1982#"
+    "password": os.environ.get("ADMIN_PASSWORD", "")
 })
 
 if response.status_code != 200:

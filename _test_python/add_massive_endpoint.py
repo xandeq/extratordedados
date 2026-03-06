@@ -6,14 +6,15 @@ Adicionar endpoint de busca massiva ao app.py via SSH
 import paramiko
 import sys
 import io
+from _secrets import vps_host, vps_user, vps_pass
 
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-VPS_HOST = "185.173.110.180"
-VPS_USER = "root"
+VPS_HOST = vps_host()
+VPS_USER = vps_user()
 VPS_PORT = 22
-VPS_PASSWORD = "1982X@ndeq1982#"  # Senha SSH correta
+VPS_PASSWORD = vps_pass()
 
 print("="*80)
 print("🚀 ADICIONANDO ENDPOINT DE BUSCA MASSIVA")

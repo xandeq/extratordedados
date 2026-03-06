@@ -1,3 +1,4 @@
+import os
 import requests
 import json
 import re
@@ -5,7 +6,7 @@ import re
 # Login
 resp = requests.post('https://api.extratordedados.com.br/api/login', json={
     'username': 'admin',
-    'password': '1982Xandeq1982#'
+    'password': os.environ.get('ADMIN_PASSWORD', '')
 })
 token = resp.json()['token']
 

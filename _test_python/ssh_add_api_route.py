@@ -1,11 +1,12 @@
 import paramiko
 import sys
+from _secrets import vps_host, vps_user, vps_pass
 
 sys.stdout.reconfigure(encoding='utf-8')
 
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect('185.173.110.180', username='root', password='1982X@ndeq1982#', timeout=15)
+ssh.connect(vps_host(), username=vps_user(), password=vps_pass(), timeout=15)
 
 # First, find the host IP that Docker containers can reach
 commands_check = [

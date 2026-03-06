@@ -2,10 +2,11 @@
 import ftplib
 import os
 import io
+from _secrets import ftp_host, ftp_user, get
 
-FTP_HOST = "ftp.alexandrequeiroz.com.br"
-FTP_USER = "contato@extratordedados.com.br"
-FTP_PASS = "REDACTED_PASSWORD"
+FTP_HOST = ftp_host()
+FTP_USER = ftp_user()
+FTP_PASS = get('FTP_PASS', '')
 
 def main():
     print(f"Conectando a {FTP_HOST}...")

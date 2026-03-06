@@ -1,12 +1,13 @@
 """Debug rate limiting with the actual app module"""
 import paramiko
 import sys
+from _secrets import vps_host, vps_user, vps_pass, db_password
 
 sys.stdout.reconfigure(encoding='utf-8')
 
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect('185.173.110.180', username='root', password='1982X@ndeq1982#', timeout=15)
+ssh.connect(vps_host(), username=vps_user(), password=vps_pass(), timeout=15)
 
 def run(cmd, timeout=30):
     stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
@@ -25,7 +26,7 @@ os.environ['DB_HOST'] = '127.0.0.1'
 os.environ['DB_PORT'] = '5432'
 os.environ['DB_NAME'] = 'extrator'
 os.environ['DB_USER'] = 'extrator'
-os.environ['DB_PASSWORD'] = 'Extr4t0r_S3cur3_2026!'
+os.environ['DB_PASSWORD'] = os.environ.get('DB_PASSWORD', '')
 
 from app import app, limiter
 
