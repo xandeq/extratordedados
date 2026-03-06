@@ -7,7 +7,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 VPS_HOST = '185.173.110.180'
 VPS_USER = 'root'
-VPS_PASS = os.environ.get('VPS_PASS', '1982X@ndeq1982#')
+VPS_PASS = os.environ.get('VPS_PASS', '1982Xandeq1982#')
 
 LOCAL_APP = os.path.join(os.path.dirname(__file__), '..', 'project', 'backend', 'app.py')
 LOCAL_REQ = os.path.join(os.path.dirname(__file__), '..', 'project', 'backend', 'requirements.txt')
