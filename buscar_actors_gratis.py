@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -13,7 +14,7 @@ import json
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-client = ApifyClient("apify_api_dOvao4PhSMHPSNSIaUIarXpW1N736q2e3QDm")
+client = ApifyClient(os.environ.get('APIFY_TOKEN', ''))
 
 print("="*80)
 print("BUSCANDO ACTORS GRATUITOS PARA EXTRAÇÃO DE EMAILS")

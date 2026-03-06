@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -15,7 +16,7 @@ if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 # Inicializar cliente Apify
-client = ApifyClient("apify_api_dOvao4PhSMHPSNSIaUIarXpW1N736q2e3QDm")
+client = ApifyClient(os.environ.get('APIFY_TOKEN', ''))
 
 # Cidades da Grande Vitória - ES (conforme CLAUDE.md)
 CIDADES_GRANDE_VITORIA = [

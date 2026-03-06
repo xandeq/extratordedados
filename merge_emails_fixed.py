@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -67,7 +68,7 @@ except FileNotFoundError:
     print("   Tentando extrair emails novamente da última run da Apify...")
     from apify_client import ApifyClient
 
-    client = ApifyClient("apify_api_dOvao4PhSMHPSNSIaUIarXpW1N736q2e3QDm")
+    client = ApifyClient(os.environ.get('APIFY_TOKEN', ''))
 
     # Pegar última run (você pode substituir pelo dataset_id específico se souber)
     print("   Checando últimas runs...")

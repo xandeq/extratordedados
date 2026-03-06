@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -14,7 +15,7 @@ if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 # Inicializar cliente Apify
-client = ApifyClient("apify_api_dOvao4PhSMHPSNSIaUIarXpW1N736q2e3QDm")
+client = ApifyClient(os.environ.get('APIFY_TOKEN', ''))
 
 # Configurar input para buscar leads em Vitória-ES
 run_input = {
