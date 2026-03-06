@@ -1808,12 +1808,20 @@ def process_search_job(batch_id, search_jobs_data, user_id):
         for job_idx, job_data in enumerate(search_jobs_data):
             search_job_id = job_data['search_job_id']
             niche = job_data['niche']
-            city = job_data['city']
-            state = job_data['state']
+            city = job_data.get('city') or ''
+            state = job_data.get('state') or ''
+            region = job_data.get('region') or ''
             max_pages = job_data.get('max_pages', 2)
 
             # Update search job status
-            query = f'{niche} {city} {state}'
+            query_parts = [niche]
+            if city:
+                query_parts.append(city)
+            if state:
+                query_parts.append(state)
+            if not city and not state and region and region in SEARCH_REGIONS:
+                query_parts.append(SEARCH_REGIONS[region]['name'])
+            query = ' '.join(query_parts)
             c.execute('UPDATE search_jobs SET status = %s, started_at = %s, query = %s WHERE id = %s',
                       ('processing', datetime.now(), query, search_job_id))
 
@@ -5172,6 +5180,8 @@ def start_massive_search():
                 search_engine_jobs.append({
                     'search_job_id': search_job_id,
                     'niche': niche,
+                    'city': None,
+                    'state': None,
                     'region': region_id,
                     'max_pages': max_pages,
                 })
@@ -5275,9 +5285,9 @@ def process_google_maps_massive(batch_id, jobs_data, user_id, token):
                 if results and len(results) > 0:
                     # Inserir leads no batch
                     for result in results:
-                        email = result.get('email', '')
-                        phone = result.get('phone', '')
-                        website = result.get('website', '')
+                        email = result.get('email') or None
+                        phone = result.get('phone') or None
+                        website = result.get('website') or None
 
                         if email or phone or website:
                             c.execute(
