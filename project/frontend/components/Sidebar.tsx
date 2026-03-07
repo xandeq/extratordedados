@@ -11,6 +11,7 @@ import {
   Moon,
   Sun,
   Zap,
+  ScrollText,
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 
@@ -19,6 +20,7 @@ const navItems = [
   { href: '/scrape', label: 'Nova Extracao', icon: Search },
   { href: '/massive-search', label: 'Busca Massiva', icon: Zap },
   { href: '/leads', label: 'Leads', icon: Database },
+  { href: '/app-logs', label: 'App Logs', icon: ScrollText },
 ]
 
 export default function Sidebar() {
