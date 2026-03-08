@@ -1,8 +1,10 @@
-import { CheckCircle2, Database, Instagram, Linkedin, Loader2, MapPin, Search, TrendingUp, XCircle, Zap } from 'lucide-react';
+import { Building2, CheckCircle2, Database, Instagram, Linkedin, Loader2, MapPin, Search, TrendingUp, XCircle, Zap } from 'lucide-react';
 import { useRouter } from 'next/router';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Layout from '../components/Layout';
 import api from '../lib/api';
+import InfoBox from '../components/InfoBox';
+import Tooltip from '../components/Tooltip';
 
 interface SearchMethod {
   id: string;
@@ -43,6 +45,23 @@ export default function MassiveSearch() {
   const router = useRouter();
   const [niches, setNiches] = useState<Niche[]>(PREDEFINED_NICHES);
   const [customNiche, setCustomNiche] = useState('');
+
+  // Load custom niches from DB on mount and merge with predefined ones
+  useEffect(() => {
+    api.get('/api/niches/custom')
+      .then(res => {
+        const saved: { id: number; name: string }[] = res.data?.niches || [];
+        if (saved.length === 0) return;
+        setNiches(prev => {
+          const existingIds = new Set(prev.map(n => n.name.toLowerCase()));
+          const newOnes: Niche[] = saved
+            .filter(s => !existingIds.has(s.name.toLowerCase()))
+            .map(s => ({ id: `custom_db_${s.id}`, name: s.name, selected: false }));
+          return newOnes.length > 0 ? [...prev, ...newOnes] : prev;
+        });
+      })
+      .catch(() => {}); // silently fail if not authenticated
+  }, []);
   const [selectedRegion, setSelectedRegion] = useState('grande_vitoria_es');
   const [maxPages, setMaxPages] = useState(2);
   const [loading, setLoading] = useState(false);
@@ -90,21 +109,33 @@ export default function MassiveSearch() {
       rateLimit: '2 empresas/hora',
       enabled: false,
     },
+    {
+      id: 'local_business_data',
+      name: 'Local Business Data',
+      icon: Building2,
+      description: 'Google Maps via API (RapidAPI) — sem browser, dados estruturados',
+      rateLimit: '500 leads/mês (free)',
+      enabled: true,
+    },
   ]);
 
   const toggleNiche = (id: string) => {
     setNiches(niches.map(n => n.id === id ? { ...n, selected: !n.selected } : n));
   };
 
-  const addCustomNiche = () => {
-    if (customNiche.trim()) {
-      const newNiche: Niche = {
-        id: `custom_${Date.now()}`,
-        name: customNiche.trim(),
-        selected: true,
-      };
-      setNiches([...niches, newNiche]);
-      setCustomNiche('');
+  const addCustomNiche = async () => {
+    const name = customNiche.trim();
+    if (!name) return;
+
+    const newNiche: Niche = { id: `custom_${Date.now()}`, name, selected: true };
+    setNiches(prev => [...prev, newNiche]);
+    setCustomNiche('');
+
+    // Persist to DB (fire-and-forget; UI already updated)
+    try {
+      await api.post('/api/niches/custom', { name });
+    } catch {
+      // silently ignore if save fails
     }
   };
 
@@ -181,6 +212,21 @@ export default function MassiveSearch() {
           </div>
         </div>
 
+        {/* InfoBox */}
+        <div className="mb-6">
+          <InfoBox
+            storageKey="massive_search"
+            title="Busca Massiva — Como funciona?"
+            description="Esta ferramenta dispara varios metodos de extracao ao mesmo tempo para varios nichos e cidades simultaneamente. E a forma mais rapida de capturar muitos leads de uma vez."
+            steps={[
+              'Passo 1: Escolha os tipos de negocio que deseja prospectar',
+              'Passo 2: Selecione a regiao (conjunto de cidades)',
+              'Passo 3: Marque quais metodos de busca ativar (DuckDuckGo, Google Maps, etc.)',
+              'Clique em Iniciar — voce sera redirecionado para o progresso em tempo real',
+            ]}
+          />
+        </div>
+
         {/* Alert Messages */}
         {error && (
           <div className="mb-6 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg flex items-start gap-3">
@@ -206,6 +252,7 @@ export default function MassiveSearch() {
                   1
                 </div>
                 <h2 className="text-xl font-bold text-gray-900 dark:text-white">Selecione os Nichos</h2>
+                <Tooltip text="Nicho = tipo de negocio. Escolha um ou mais. Voce pode adicionar um nicho personalizado se o seu segmento nao estiver na lista." position="right" />
               </div>
 
               <div className="grid grid-cols-2 gap-3 mb-4">
@@ -253,6 +300,7 @@ export default function MassiveSearch() {
                   2
                 </div>
                 <h2 className="text-xl font-bold text-gray-900 dark:text-white">Selecione a Região</h2>
+                <Tooltip text="A regiao define quais cidades serao pesquisadas. O sistema busca cada nicho em cada cidade da regiao selecionada." position="right" />
               </div>
 
               <div className="space-y-3">
@@ -292,6 +340,7 @@ export default function MassiveSearch() {
                   3
                 </div>
                 <h2 className="text-xl font-bold text-gray-900 dark:text-white">Métodos de Extração</h2>
+                <Tooltip text="Cada metodo usa uma fonte diferente. Ative todos para capturar mais leads. Desative metodos que nao deseja usar (ex: Instagram requer conta configurada)." position="right" />
               </div>
 
               <div className="space-y-3">
@@ -335,8 +384,9 @@ export default function MassiveSearch() {
               <h2 className="text-lg font-bold text-gray-900 dark:text-white mb-4">Opções Avançadas</h2>
 
               <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                <label className="flex items-center gap-1.5 text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                   Páginas por Busca: {maxPages}
+                  <Tooltip text="Quantas paginas de resultados visitar por nicho+cidade. 1 = mais rapido, menos leads. 3 = mais lento, mais leads." />
                 </label>
                 <input
                   type="range"
@@ -381,7 +431,12 @@ export default function MassiveSearch() {
                 </div>
 
                 <div className="pt-4 border-t border-blue-400/30">
-                  <p className="text-blue-100 text-sm mb-1">Jobs Estimados</p>
+                  <p className="flex items-center gap-1 text-blue-100 text-sm mb-1">
+                    Jobs Estimados
+                    <span className="inline-flex">
+                      <Tooltip text="Total de combinacoes: nichos x metodos x cidades. Cada job e executado em paralelo." position="left" />
+                    </span>
+                  </p>
                   <p className="text-3xl font-bold">{estimatedJobs}</p>
                 </div>
 

@@ -14,6 +14,8 @@ import EmptyState from '../components/EmptyState'
 import LeadsTrendChart from '../components/charts/LeadsTrendChart'
 import TopBatchesChart from '../components/charts/TopBatchesChart'
 import DataQualityPie from '../components/charts/DataQualityPie'
+import InfoBox from '../components/InfoBox'
+import Tooltip from '../components/Tooltip'
 
 interface Job {
   id: number
@@ -86,7 +88,7 @@ export default function Dashboard() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Dashboard</h1>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Dashboard</h1>
           <p className="text-sm text-gray-500 mt-0.5">Visao geral das suas extracoes</p>
         </div>
         <Link href="/scrape">
@@ -97,6 +99,18 @@ export default function Dashboard() {
         </Link>
       </div>
 
+      {/* InfoBox */}
+      <InfoBox
+        storageKey="dashboard"
+        title="Bem-vindo ao Dashboard"
+        description="Aqui voce acompanha em tempo real todos os seus resultados: total de leads capturados, taxa de sucesso das extracoes e evolucao ao longo do tempo."
+        steps={[
+          'Clique em "Nova Extracao" para capturar leads de um site ou busca',
+          'Use "Busca Massiva" no menu lateral para buscar por nicho e cidade',
+          'Acesse "Leads" para visualizar, filtrar e exportar seus contatos',
+        ]}
+      />
+
       {error && (
         <div className="px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-red-700 text-sm">
           {error}
@@ -106,34 +120,54 @@ export default function Dashboard() {
       {/* Stats Row */}
       {analytics && (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <StatCard
-            label="Total de Leads"
-            value={formatNumber(analytics.total_leads)}
-            icon={Users}
-            color="blue"
-            subtitle={`${formatNumber(analytics.unique_emails)} emails unicos`}
-          />
-          <StatCard
-            label="Esta Semana"
-            value={formatNumber(analytics.leads_this_week)}
-            icon={TrendingUp}
-            color="green"
-            subtitle={`${formatNumber(analytics.leads_this_month)} este mes`}
-          />
-          <StatCard
-            label="Lotes"
-            value={analytics.total_batches}
-            icon={Layers}
-            color="purple"
-            subtitle={`${analytics.completed_batches} completos`}
-          />
-          <StatCard
-            label="Taxa de Sucesso"
-            value={`${analytics.success_rate}%`}
-            icon={CheckCircle2}
-            color="amber"
-            subtitle={`${analytics.failed_batches} falha${analytics.failed_batches !== 1 ? 's' : ''}`}
-          />
+          <div className="relative">
+            <div className="absolute top-3 right-3 z-10">
+              <Tooltip text="Total de contatos (emails, telefones, WhatsApp) extraidos de todos os lotes e jobs." position="bottom" />
+            </div>
+            <StatCard
+              label="Total de Leads"
+              value={formatNumber(analytics.total_leads)}
+              icon={Users}
+              color="blue"
+              subtitle={`${formatNumber(analytics.unique_emails)} emails unicos`}
+            />
+          </div>
+          <div className="relative">
+            <div className="absolute top-3 right-3 z-10">
+              <Tooltip text="Leads capturados nos ultimos 7 dias e no mes atual. Indica o ritmo de crescimento da sua base." position="bottom" />
+            </div>
+            <StatCard
+              label="Esta Semana"
+              value={formatNumber(analytics.leads_this_week)}
+              icon={TrendingUp}
+              color="green"
+              subtitle={`${formatNumber(analytics.leads_this_month)} este mes`}
+            />
+          </div>
+          <div className="relative">
+            <div className="absolute top-3 right-3 z-10">
+              <Tooltip text="Lotes sao grupos de URLs ou buscas processadas em conjunto. Cada busca massiva cria um lote." position="bottom" />
+            </div>
+            <StatCard
+              label="Lotes"
+              value={analytics.total_batches}
+              icon={Layers}
+              color="purple"
+              subtitle={`${analytics.completed_batches} completos`}
+            />
+          </div>
+          <div className="relative">
+            <div className="absolute top-3 right-3 z-10">
+              <Tooltip text="Percentual de lotes que terminaram sem erros graves. Abaixo de 70% pode indicar bloqueios ou sites inacessiveis." position="bottom" />
+            </div>
+            <StatCard
+              label="Taxa de Sucesso"
+              value={`${analytics.success_rate}%`}
+              icon={CheckCircle2}
+              color="amber"
+              subtitle={`${analytics.failed_batches} falha${analytics.failed_batches !== 1 ? 's' : ''}`}
+            />
+          </div>
         </div>
       )}
 

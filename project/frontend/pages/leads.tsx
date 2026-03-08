@@ -5,7 +5,8 @@ import {
   Search, Database, ChevronLeft, ChevronRight, Check,
   Tag, Filter, Mail, Phone, Building2, MessageCircle,
   Instagram, Facebook, Linkedin, ExternalLink, MoreHorizontal,
-  Users, ArrowUpDown, Download, Trash2
+  Users, ArrowUpDown, Download, Trash2, Sparkles, CheckCircle2,
+  AlertCircle, XCircle, Copy, BadgeCheck, RefreshCw
 } from 'lucide-react'
 import api from '../lib/api'
 import { useToast } from '../components/Toast'
@@ -14,6 +15,8 @@ import LoadingSkeleton from '../components/LoadingSkeleton'
 import EmptyState from '../components/EmptyState'
 import LeadDrawer from '../components/LeadDrawer'
 import ExportModal from '../components/ExportModal'
+import InfoBox from '../components/InfoBox'
+import Tooltip from '../components/Tooltip'
 
 interface Lead {
   id: number
@@ -93,15 +96,43 @@ export default function Leads() {
   const [showTagInput, setShowTagInput] = useState(false)
   const [tagInputValue, setTagInputValue] = useState('')
 
-  // Delete confirmation modal
+  // Delete confirmation modal (bulk selected)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
 
+  // Delete ALL modal
+  const [showDeleteAllConfirm, setShowDeleteAllConfirm] = useState(false)
+  const [deleteAllConfirmText, setDeleteAllConfirmText] = useState('')
+  const [deletingAll, setDeletingAll] = useState(false)
+
+  // Sync + Delete modal
+  const [showSyncDeleteConfirm, setShowSyncDeleteConfirm] = useState(false)
+  const [syncDeleteConfirmText, setSyncDeleteConfirmText] = useState('')
+  const [syncingAndDeleting, setSyncingAndDeleting] = useState(false)
+  const [syncDeleteResult, setSyncDeleteResult] = useState<{
+    synced: number; skipped: number; errors: number; deleted: number
+  } | null>(null)
+
+  // Sanitize
+  const [sanitizing, setSanitizing] = useState(false)
+  const [sanitizeReport, setSanitizeReport] = useState<{
+    analyzed: number
+    invalid_emails: number
+    encoding_corrected: number
+    spam_detected: number
+    duplicates_removed: number
+    quality_updated: number
+    ids_deleted: number
+  } | null>(null)
+
   const tagInputRef = useRef<HTMLInputElement>(null)
+  const abortControllerRef = useRef<AbortController | null>(null)
 
   // Listen for global Esc (close modal event from Layout shortcuts)
   useEffect(() => {
     const handler = () => {
       if (showTagInput) { setShowTagInput(false); return }
+      if (showDeleteAllConfirm) { setShowDeleteAllConfirm(false); setDeleteAllConfirmText(''); return }
+      if (showSyncDeleteConfirm) { setShowSyncDeleteConfirm(false); setSyncDeleteConfirmText(''); setSyncDeleteResult(null); return }
       if (showExport) { setShowExport(false); return }
       if (drawerLead) { setDrawerLead(null); return }
     }
@@ -124,6 +155,10 @@ export default function Leads() {
   }, [search])
 
   const fetchLeads = useCallback(async () => {
+    abortControllerRef.current?.abort()
+    const controller = new AbortController()
+    abortControllerRef.current = controller
+
     const token = localStorage.getItem('token')
     if (!token) { router.push('/login'); return }
 
@@ -137,16 +172,17 @@ export default function Leads() {
       if (statusFilter) params.append('status', statusFilter)
       if (tagFilter) params.append('tag', tagFilter)
 
-      const res = await api.get(`/api/leads?${params.toString()}`)
+      const res = await api.get(`/api/leads?${params.toString()}`, { signal: controller.signal })
       setLeads(res.data.leads)
       setTotal(res.data.total)
       setTotalPages(res.data.total_pages)
       setStatusCounts(res.data.status_counts || {})
       setAllTags(res.data.all_tags || [])
     } catch (err: any) {
+      if (err.name === 'CanceledError' || err.code === 'ERR_CANCELED') return
       if (err.response?.status === 401) router.push('/login')
     } finally {
-      setLoading(false)
+      if (!controller.signal.aborted) setLoading(false)
     }
   }, [page, sort, searchDebounced, statusFilter, tagFilter])
 
@@ -228,6 +264,64 @@ export default function Leads() {
     }
   }
 
+  const handleSyncAndDelete = () => {
+    setSyncDeleteConfirmText('')
+    setSyncDeleteResult(null)
+    setShowSyncDeleteConfirm(true)
+  }
+
+  const confirmSyncAndDelete = async () => {
+    if (syncDeleteConfirmText !== 'CONFIRMAR') return
+    setSyncingAndDeleting(true)
+    try {
+      const res = await api.post('/api/leads/sync-and-delete', { confirm: true })
+      setSyncDeleteResult(res.data)
+      setSelected(new Set())
+      fetchLeads()
+    } catch {
+      addToast('Erro ao sincronizar e deletar leads', 'error')
+      setShowSyncDeleteConfirm(false)
+    } finally {
+      setSyncingAndDeleting(false)
+    }
+  }
+
+  const handleDeleteAll = () => {
+    setDeleteAllConfirmText('')
+    setShowDeleteAllConfirm(true)
+  }
+
+  const confirmDeleteAll = async () => {
+    if (deleteAllConfirmText !== 'CONFIRMAR') return
+    setDeletingAll(true)
+    try {
+      const res = await api.post('/api/leads/delete-all', { confirm: true })
+      addToast(`${res.data.deleted} leads deletados com sucesso`, 'success')
+      setShowDeleteAllConfirm(false)
+      setDeleteAllConfirmText('')
+      setSelected(new Set())
+      fetchLeads()
+    } catch {
+      addToast('Erro ao deletar todos os leads', 'error')
+    } finally {
+      setDeletingAll(false)
+    }
+  }
+
+  const handleSanitize = async () => {
+    setSanitizing(true)
+    try {
+      const payload = selected.size > 0 ? { lead_ids: Array.from(selected) } : {}
+      const res = await api.post('/api/leads/sanitize', payload)
+      setSanitizeReport(res.data.report)
+      fetchLeads()
+    } catch {
+      addToast('Erro ao sanitizar leads', 'error')
+    } finally {
+      setSanitizing(false)
+    }
+  }
+
   const handleDrawerUpdate = (updatedLead: Lead) => {
     setLeads(prev => prev.map(l => l.id === updatedLead.id ? updatedLead : l))
     setDrawerLead(updatedLead)
@@ -242,22 +336,75 @@ export default function Leads() {
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Leads CRM</h1>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Leads CRM</h1>
           <p className="text-sm text-gray-500 mt-0.5">{total} leads encontrados</p>
         </div>
         {total > 0 && (
-          <button
-            onClick={() => setShowExport(true)}
-            className="inline-flex items-center gap-2 px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white text-sm font-semibold rounded-xl shadow-sm transition-colors"
-          >
-            <Download className="w-4 h-4" />
-            Exportar
-          </button>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={handleSanitize}
+                disabled={sanitizing}
+                title={selected.size > 0 ? `Sanitizar ${selected.size} leads selecionados` : 'Sanitizar todos os leads'}
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white text-sm font-semibold rounded-xl shadow-sm transition-colors"
+              >
+                <Sparkles className="w-4 h-4" />
+                {sanitizing ? 'Sanitizando...' : selected.size > 0 ? `Sanitizar (${selected.size})` : 'Sanitizar Leads'}
+              </button>
+              <Tooltip
+                text="Corrige nomes com caracteres errados (ex: Caf?? → Café), padroniza maiusculas/minusculas e extrai o nome correto do dominio. Seguro de usar a qualquer momento."
+                position="bottom"
+              />
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setShowExport(true)}
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white text-sm font-semibold rounded-xl shadow-sm transition-colors"
+              >
+                <Download className="w-4 h-4" />
+                Exportar
+              </button>
+              <Tooltip
+                text="Baixe sua lista em CSV, JSON ou formato pronto para WhatsApp, email marketing e telemarketing."
+                position="bottom"
+              />
+            </div>
+            <button
+              onClick={handleSyncAndDelete}
+              className="inline-flex items-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold rounded-xl shadow-sm transition-colors"
+              title="Sincronizar com CRM e apagar todos os leads"
+            >
+              <RefreshCw className="w-4 h-4" />
+              Sync + Apagar
+            </button>
+            <button
+              onClick={handleDeleteAll}
+              className="inline-flex items-center gap-2 px-4 py-2.5 border border-red-300 text-red-600 hover:bg-red-50 text-sm font-semibold rounded-xl shadow-sm transition-colors"
+              title="Apagar todos os leads permanentemente"
+            >
+              <Trash2 className="w-4 h-4" />
+              Apagar Todos
+            </button>
+          </div>
         )}
       </div>
 
+      {/* InfoBox */}
+      <InfoBox
+        storageKey="leads"
+        title="Seus Leads — CRM Basico"
+        description="Aqui ficam todos os contatos extraidos. Voce pode filtrar por status, tag, cidade ou lote, atualizar o status de cada lead no funil de vendas e exportar para sua ferramenta favorita."
+        steps={[
+          'Use os filtros de status (Novo, Contatado...) para organizar seu funil',
+          'Clique em um lead para abrir o painel lateral e adicionar notas e tags',
+          'Selecione varios leads e use Acoes em Massa para atualizar status ou deletar',
+          'Clique em Exportar para baixar a lista em CSV ou formato de disparo',
+        ]}
+      />
+
       {/* Status pills */}
       <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+        <Tooltip text="Filtre por etapa do funil de vendas. 'Novo' = ainda nao contatado. 'Cliente' = convertido." position="right" />
         {CRM_STATUSES.map((s) => {
           const count = s.value ? (statusCounts[s.value] || 0) : totalAll
           const active = statusFilter === s.value
@@ -297,24 +444,30 @@ export default function Leads() {
 
         {/* Tag filter */}
         {allTags.length > 0 && (
-          <select
-            value={tagFilter}
-            onChange={(e) => { setTagFilter(e.target.value); setPage(1) }}
-            className="px-3 py-2.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500/30"
-          >
-            <option value="">Todas as tags</option>
-            {allTags.map(t => <option key={t} value={t}>{t}</option>)}
-          </select>
+          <div className="flex items-center gap-1">
+            <select
+              value={tagFilter}
+              onChange={(e) => { setTagFilter(e.target.value); setPage(1) }}
+              className="px-3 py-2.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500/30"
+            >
+              <option value="">Todas as tags</option>
+              {allTags.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+            <Tooltip text="Tags sao etiquetas que voce adiciona manualmente ou o sistema cria automaticamente por segmento (ex: saude, beleza, educacao)." />
+          </div>
         )}
 
         {/* Sort */}
-        <select
-          value={sort}
-          onChange={(e) => { setSort(e.target.value); setPage(1) }}
-          className="px-3 py-2.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500/30"
-        >
-          {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-        </select>
+        <div className="flex items-center gap-1">
+          <select
+            value={sort}
+            onChange={(e) => { setSort(e.target.value); setPage(1) }}
+            className="px-3 py-2.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500/30"
+          >
+            {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+          <Tooltip text="Ordene a lista por data de extracao, nome da empresa ou status do funil." />
+        </div>
       </div>
 
       {/* Bulk actions */}
@@ -617,6 +770,80 @@ export default function Leads() {
         </>
       )}
 
+      {/* Sanitize Report Modal */}
+      {sanitizeReport && (
+        <>
+          <div className="fixed inset-0 bg-black/30 z-40" onClick={() => setSanitizeReport(null)} />
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md p-6 animate-fade-in">
+              <div className="flex items-center gap-3 mb-5">
+                <div className="w-12 h-12 rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center">
+                  <BadgeCheck className="w-6 h-6 text-emerald-600 dark:text-emerald-400" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-gray-900 dark:text-gray-100">Sanitização Concluída</h3>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">{sanitizeReport.analyzed} leads analisados</p>
+                </div>
+              </div>
+
+              <div className="space-y-2 mb-5">
+                <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
+                  <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-500" />
+                    Encoding / acentuação corrigidos
+                  </div>
+                  <span className="font-bold text-emerald-600 dark:text-emerald-400">{sanitizeReport.encoding_corrected}</span>
+                </div>
+                <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
+                  <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                    <XCircle className="w-4 h-4 text-red-500" />
+                    E-mails inválidos detectados
+                  </div>
+                  <span className="font-bold text-red-600 dark:text-red-400">{sanitizeReport.invalid_emails}</span>
+                </div>
+                <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
+                  <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                    <AlertCircle className="w-4 h-4 text-orange-500" />
+                    Domínios de spam detectados
+                  </div>
+                  <span className="font-bold text-orange-600 dark:text-orange-400">{sanitizeReport.spam_detected}</span>
+                </div>
+                <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
+                  <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                    <Copy className="w-4 h-4 text-blue-500" />
+                    Duplicatas removidas
+                  </div>
+                  <span className="font-bold text-blue-600 dark:text-blue-400">{sanitizeReport.duplicates_removed}</span>
+                </div>
+                <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
+                  <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                    <Sparkles className="w-4 h-4 text-purple-500" />
+                    Quality score atualizado
+                  </div>
+                  <span className="font-bold text-purple-600 dark:text-purple-400">{sanitizeReport.quality_updated}</span>
+                </div>
+                {sanitizeReport.ids_deleted > 0 && (
+                  <div className="flex items-center justify-between p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl">
+                    <div className="flex items-center gap-2 text-sm text-red-700 dark:text-red-300">
+                      <Trash2 className="w-4 h-4" />
+                      Leads removidos (inválidos/duplicatas)
+                    </div>
+                    <span className="font-bold text-red-600 dark:text-red-400">{sanitizeReport.ids_deleted}</span>
+                  </div>
+                )}
+              </div>
+
+              <button
+                onClick={() => setSanitizeReport(null)}
+                className="w-full px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-semibold text-sm transition-colors"
+              >
+                Fechar
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
       {/* Delete Confirmation Modal */}
       {showDeleteConfirm && (
         <>
@@ -650,6 +877,173 @@ export default function Leads() {
                   className="flex-1 px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-xl font-semibold text-sm transition-colors"
                 >
                   Deletar {selected.size} Lead{selected.size > 1 ? 's' : ''}
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Sync + Delete Modal */}
+      {showSyncDeleteConfirm && (
+        <>
+          <div className="fixed inset-0 bg-black/50 z-40" onClick={() => { if (!syncingAndDeleting) { setShowSyncDeleteConfirm(false); setSyncDeleteConfirmText(''); setSyncDeleteResult(null) } }} />
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md p-6 animate-fade-in">
+
+              {/* Header */}
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-12 h-12 rounded-full bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center">
+                  <RefreshCw className={`w-6 h-6 text-amber-600 dark:text-amber-400 ${syncingAndDeleting ? 'animate-spin' : ''}`} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-gray-900 dark:text-gray-100">Sync + Apagar</h3>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                    {syncingAndDeleting ? 'Sincronizando com CRM...' : syncDeleteResult ? 'Concluído' : 'Sincronizar e limpar base'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Resultado final */}
+              {syncDeleteResult ? (
+                <>
+                  <div className="space-y-2 mb-5">
+                    <div className="flex items-center justify-between p-3 bg-green-50 dark:bg-green-900/20 rounded-xl">
+                      <div className="flex items-center gap-2 text-sm text-green-800 dark:text-green-300">
+                        <CheckCircle2 className="w-4 h-4 text-green-500" />
+                        Sincronizados com CRM
+                      </div>
+                      <span className="font-bold text-green-600 dark:text-green-400">{syncDeleteResult.synced}</span>
+                    </div>
+                    <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
+                      <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                        <Copy className="w-4 h-4 text-gray-400" />
+                        Já existiam no CRM
+                      </div>
+                      <span className="font-bold text-gray-500">{syncDeleteResult.skipped}</span>
+                    </div>
+                    {syncDeleteResult.errors > 0 && (
+                      <div className="flex items-center justify-between p-3 bg-orange-50 dark:bg-orange-900/20 rounded-xl">
+                        <div className="flex items-center gap-2 text-sm text-orange-700 dark:text-orange-300">
+                          <AlertCircle className="w-4 h-4 text-orange-500" />
+                          Erros de sync
+                        </div>
+                        <span className="font-bold text-orange-600">{syncDeleteResult.errors}</span>
+                      </div>
+                    )}
+                    <div className="flex items-center justify-between p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl">
+                      <div className="flex items-center gap-2 text-sm text-red-700 dark:text-red-300">
+                        <Trash2 className="w-4 h-4" />
+                        Leads deletados do extrator
+                      </div>
+                      <span className="font-bold text-red-600 dark:text-red-400">{syncDeleteResult.deleted}</span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => { setShowSyncDeleteConfirm(false); setSyncDeleteConfirmText(''); setSyncDeleteResult(null) }}
+                    className="w-full px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-semibold text-sm transition-colors"
+                  >
+                    Fechar
+                  </button>
+                </>
+              ) : syncingAndDeleting ? (
+                /* Loading state */
+                <div className="py-8 flex flex-col items-center gap-3 text-gray-500 dark:text-gray-400">
+                  <RefreshCw className="w-8 h-8 animate-spin text-amber-500" />
+                  <p className="text-sm font-medium">Sincronizando {total} leads com o CRM...</p>
+                  <p className="text-xs text-gray-400">Aguarde, isso pode levar alguns segundos</p>
+                </div>
+              ) : (
+                /* Confirm state */
+                <>
+                  <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl p-4 mb-4">
+                    <p className="text-sm text-amber-800 dark:text-amber-300">
+                      Isso irá <strong>sincronizar todos os {total} leads</strong> para <strong>api.alexandrequeiroz.com.br</strong> e depois <strong>apagar tudo</strong> do extrator. Ação irreversível.
+                    </p>
+                  </div>
+                  <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">
+                    Digite <strong className="text-amber-600 dark:text-amber-400 font-mono">CONFIRMAR</strong> para continuar:
+                  </p>
+                  <input
+                    type="text"
+                    value={syncDeleteConfirmText}
+                    onChange={(e) => setSyncDeleteConfirmText(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && syncDeleteConfirmText === 'CONFIRMAR') confirmSyncAndDelete() }}
+                    placeholder="CONFIRMAR"
+                    autoFocus
+                    className="w-full px-4 py-3 bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-xl text-sm font-mono text-gray-900 dark:text-gray-100 placeholder-gray-300 focus:outline-none focus:ring-2 focus:ring-amber-500/30 focus:border-amber-400 transition-all mb-4"
+                  />
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => { setShowSyncDeleteConfirm(false); setSyncDeleteConfirmText('') }}
+                      className="flex-1 px-4 py-2.5 border border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-xl font-medium text-sm hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                    >
+                      Cancelar
+                    </button>
+                    <button
+                      onClick={confirmSyncAndDelete}
+                      disabled={syncDeleteConfirmText !== 'CONFIRMAR'}
+                      className="flex-1 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl font-semibold text-sm transition-colors"
+                    >
+                      Sync + Apagar {total} Leads
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Delete ALL Confirmation Modal */}
+      {showDeleteAllConfirm && (
+        <>
+          <div className="fixed inset-0 bg-black/50 z-40" onClick={() => { setShowDeleteAllConfirm(false); setDeleteAllConfirmText('') }} />
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md p-6 animate-fade-in">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-12 h-12 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center">
+                  <Trash2 className="w-7 h-7 text-red-600 dark:text-red-400" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-gray-900 dark:text-gray-100">Apagar TODOS os Leads</h3>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">Ação irreversível</p>
+                </div>
+              </div>
+
+              <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-4 mb-5">
+                <p className="text-sm text-red-800 dark:text-red-300">
+                  Isso irá deletar <strong>todos os {total} leads</strong> da sua conta permanentemente.
+                  Esta ação <strong>não pode ser desfeita</strong>.
+                </p>
+              </div>
+
+              <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">
+                Digite <strong className="text-red-600 dark:text-red-400 font-mono">CONFIRMAR</strong> para continuar:
+              </p>
+              <input
+                type="text"
+                value={deleteAllConfirmText}
+                onChange={(e) => setDeleteAllConfirmText(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && deleteAllConfirmText === 'CONFIRMAR') confirmDeleteAll() }}
+                placeholder="CONFIRMAR"
+                autoFocus
+                className="w-full px-4 py-3 bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-xl text-sm font-mono text-gray-900 dark:text-gray-100 placeholder-gray-300 focus:outline-none focus:ring-2 focus:ring-red-500/30 focus:border-red-400 transition-all mb-4"
+              />
+
+              <div className="flex gap-3">
+                <button
+                  onClick={() => { setShowDeleteAllConfirm(false); setDeleteAllConfirmText('') }}
+                  className="flex-1 px-4 py-2.5 border border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-xl font-medium text-sm hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  onClick={confirmDeleteAll}
+                  disabled={deleteAllConfirmText !== 'CONFIRMAR' || deletingAll}
+                  className="flex-1 px-4 py-2.5 bg-red-600 hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl font-semibold text-sm transition-colors"
+                >
+                  {deletingAll ? 'Deletando...' : `Apagar ${total} Leads`}
                 </button>
               </div>
             </div>
