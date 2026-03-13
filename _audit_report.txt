@@ -1,0 +1,126 @@
+======================================================================
+  RELATÓRIO DE AUDITORIA — extratordedados.com.br
+  Data: 2026-03-09 06:38:18
+======================================================================
+
+  RESUMO: 29 OK | 0 FALHAS | 6 AVISOS | 35 testes
+
+----------------------------------------------------------------------
+  TESTES EXECUTADOS
+----------------------------------------------------------------------
+  [OK]   Login — formulário visível
+         Campos username e password encontrados
+  [OK]   Login — autenticação
+         Redirecionado para https://extratordedados.com.br/dashboard/
+  [OK]   Dashboard — carregamento
+         Página carregada
+  [OK]   Dashboard — elementos visuais
+         1 cards de estatística, 116 gráficos encontrados
+  [OK]   Leads — carregamento
+         Página carregada
+  [OK]   Leads — listagem
+         8 leads na tabela
+  [OK]   Leads — filtro busca
+         Campo de busca funcional
+ [WARN]  Leads — paginação
+         Sem paginação visível (pode ter poucos leads)
+ [WARN]  Leads — botão exportar
+         Botão de exportação não encontrado
+  [OK]   Leads — drawer/detalhe
+         Drawer de lead abriu ao clicar
+  [OK]   Leads — botão sanitizar
+         Botão sanitizar presente
+  [OK]   Scrape — carregamento
+         Página carregada
+ [WARN]  Scrape — tabs
+         0 tabs de método encontradas
+ [WARN]  Scrape — campo URL
+         Campo de URL não encontrado
+  [OK]   Busca Massiva — carregamento
+         Página carregada
+  [OK]   Busca Massiva — nichos pré-definidos
+         6 nichos pré-definidos encontrados
+  [OK]   Busca Massiva — adicionar nicho custom
+         'Auditoria Teste' adicionado com sucesso
+  [OK]   Busca Massiva — persistência nicho custom
+         Nicho persistiu após reload
+  [OK]   Busca Massiva — regiões
+         5 regiões encontradas
+  [OK]   Busca Massiva — métodos de busca
+         3 métodos encontrados
+  [OK]   Busca Massiva — card resumo
+         Card de resumo presente
+  [OK]   Busca Massiva — botão iniciar
+         Botão presente (disabled=True — correto se nenhum nicho selecionado)
+  [OK]   Busca Massiva — estimativa jobs
+         Contador de jobs atualiza ao selecionar nicho
+  [OK]   App Logs — carregamento
+         Página carregada
+  [OK]   API Health — status
+         Backend respondendo OK
+  [OK]   API GET /api/analytics
+         200 em 282ms
+  [OK]   API GET /api/leads?page=1&per_page=5
+         200 em 130ms
+  [OK]   API GET /api/regions
+         200 em 104ms
+  [OK]   API GET /api/crm/status
+         200 em 1344ms
+  [OK]   API GET /api/niches/custom
+         200 em 132ms
+  [OK]   API GET /api/admin/daily-job/status
+         200 em 132ms
+  [OK]   API GET /api/admin/logs?page=1&per_page=5
+         200 em 130ms
+ [WARN]  Dark Mode — toggle
+         Botão de dark mode não encontrado automaticamente
+ [WARN]  Responsivo — menu mobile
+         Sem hamburger visível — sidebar pode sobrepor conteúdo
+  [OK]   Responsivo — massive search mobile
+         Página carregada em viewport mobile
+
+----------------------------------------------------------------------
+  NETWORK SUMMARY
+----------------------------------------------------------------------
+  Total requests capturados: 208
+  Requests para API: 19
+  Requests falhados: 0
+  Requests lentos (>3s): 0
+
+----------------------------------------------------------------------
+  AVISOS (PRIORIDADE MÉDIA/BAIXA)
+----------------------------------------------------------------------
+  1. Leads — paginação
+     Sem paginação visível (pode ter poucos leads)
+  2. Leads — botão exportar
+     Botão de exportação não encontrado
+  3. Scrape — tabs
+     0 tabs de método encontradas
+  4. Scrape — campo URL
+     Campo de URL não encontrado
+  5. Dark Mode — toggle
+     Botão de dark mode não encontrado automaticamente
+  6. Responsivo — menu mobile
+     Sem hamburger visível — sidebar pode sobrepor conteúdo
+
+----------------------------------------------------------------------
+  SCREENSHOTS
+----------------------------------------------------------------------
+  Diretório: C:\Users\acq20\Desktop\Trabalho\Alexandre Queiroz Marketing Digital\DIAX\extrator-de-dados\_audit_screenshots
+  - 01_login_page.png
+  - 02_after_login.png
+  - 03_dashboard.png
+  - 04_leads.png
+  - 04b_lead_detail.png
+  - 05_scrape.png
+  - 06_massive_search.png
+  - 06b_custom_niche_added.png
+  - 06c_after_reload.png
+  - 07_app_logs.png
+  - 08_api_health.png
+  - 10_mobile_dashboard.png
+  - 10b_mobile_massive_search.png
+
+======================================================================
+  FIM DO RELATÓRIO
+======================================================================

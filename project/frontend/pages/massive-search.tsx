@@ -1,4 +1,4 @@
-import { Building2, CheckCircle2, Database, Instagram, Linkedin, Loader2, MapPin, Search, TrendingUp, XCircle, Zap } from 'lucide-react';
+import { Building2, CheckCircle2, Database, Globe, Hash, Instagram, Linkedin, Loader2, Mail, MapPin, Search, TrendingUp, XCircle, Zap } from 'lucide-react';
 import { useRouter } from 'next/router';
 import { useEffect, useState } from 'react';
 import Layout from '../components/Layout';
@@ -34,6 +34,27 @@ const PREDEFINED_NICHES: Niche[] = [
   { id: 'restaurante', name: 'Restaurante', selected: false },
 ];
 
+const LS_KEY_CUSTOM_NICHES = 'massive_search_custom_niches';
+
+function loadLocalNiches(): string[] {
+  try {
+    const raw = localStorage.getItem(LS_KEY_CUSTOM_NICHES);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+function saveLocalNiches(names: string[]) {
+  try { localStorage.setItem(LS_KEY_CUSTOM_NICHES, JSON.stringify(names)); } catch {}
+}
+
+function mergeCustomNiches(base: Niche[], customNames: string[]): Niche[] {
+  const existing = new Set(base.map(n => n.name.toLowerCase()));
+  const newOnes: Niche[] = customNames
+    .filter(name => !existing.has(name.toLowerCase()))
+    .map((name, i) => ({ id: `custom_${i}_${name}`, name, selected: false }));
+  return newOnes.length > 0 ? [...base, ...newOnes] : base;
+}
+
 const REGIONS = [
   { id: 'grande_vitoria_es', name: 'Grande Vitória-ES', cities: ['Vitória', 'Vila Velha', 'Serra', 'Cariacica', 'Viana', 'Guarapari', 'Fundão'] },
   { id: 'grande_sp', name: 'Grande São Paulo-SP', cities: ['São Paulo', 'Guarulhos', 'Osasco', 'Santo André'] },
@@ -43,24 +64,26 @@ const REGIONS = [
 
 export default function MassiveSearch() {
   const router = useRouter();
-  const [niches, setNiches] = useState<Niche[]>(PREDEFINED_NICHES);
+  // Initialize with predefined + localStorage (instant, no network)
+  const [niches, setNiches] = useState<Niche[]>(() =>
+    mergeCustomNiches(PREDEFINED_NICHES, loadLocalNiches())
+  );
   const [customNiche, setCustomNiche] = useState('');
 
-  // Load custom niches from DB on mount and merge with predefined ones
+  // Also load from DB and merge (in case localStorage is incomplete)
   useEffect(() => {
     api.get('/api/niches/custom')
       .then(res => {
         const saved: { id: number; name: string }[] = res.data?.niches || [];
         if (saved.length === 0) return;
-        setNiches(prev => {
-          const existingIds = new Set(prev.map(n => n.name.toLowerCase()));
-          const newOnes: Niche[] = saved
-            .filter(s => !existingIds.has(s.name.toLowerCase()))
-            .map(s => ({ id: `custom_db_${s.id}`, name: s.name, selected: false }));
-          return newOnes.length > 0 ? [...prev, ...newOnes] : prev;
-        });
+        const dbNames = saved.map(s => s.name);
+        // Sync DB niches to localStorage too
+        const localNames = loadLocalNiches();
+        const allNames = Array.from(new Set([...localNames, ...dbNames]));
+        saveLocalNiches(allNames);
+        setNiches(prev => mergeCustomNiches(prev, dbNames));
       })
-      .catch(() => {}); // silently fail if not authenticated
+      .catch(() => {});
   }, []);
   const [selectedRegion, setSelectedRegion] = useState('grande_vitoria_es');
   const [maxPages, setMaxPages] = useState(2);
@@ -117,6 +140,46 @@ export default function MassiveSearch() {
       rateLimit: '500 leads/mês (free)',
       enabled: true,
     },
+    {
+      id: 'google_email_harvest',
+      name: 'Google Email Harvest',
+      icon: Mail,
+      description: 'Busca emails no Google com dorks + visita os top sites para extrair contatos',
+      rateLimit: '3 nichos × 3 cidades',
+      enabled: true,
+    },
+    {
+      id: 'website_email_crawler',
+      name: 'Website Email Crawler',
+      icon: Globe,
+      description: 'Busca sites via DuckDuckGo e faz deep crawl em /contato, /sobre para extrair emails',
+      rateLimit: '5 nichos × 5 cidades',
+      enabled: true,
+    },
+    {
+      id: 'cnpj_open',
+      name: 'CNPJ Open (Receita Federal)',
+      icon: Hash,
+      description: 'Busca CNPJs em diretórios e enriquece via API OpenCNPJ — email e telefone oficiais',
+      rateLimit: 'Grátis (50 req/s)',
+      enabled: true,
+    },
+    {
+      id: 'serper_google',
+      name: 'Serper Google API',
+      icon: Search,
+      description: 'Google Search API (Serper.dev) — resultados estruturados com emails nos snippets',
+      rateLimit: '2500 buscas/mês (free)',
+      enabled: false,
+    },
+    {
+      id: 'apify_maps',
+      name: 'Apify Google Maps',
+      icon: MapPin,
+      description: 'Apify actor para Google Maps com extração automática de emails dos sites',
+      rateLimit: '~1250 leads/mês ($5 free)',
+      enabled: false,
+    },
   ]);
 
   const toggleNiche = (id: string) => {
@@ -126,17 +189,41 @@ export default function MassiveSearch() {
   const addCustomNiche = async () => {
     const name = customNiche.trim();
     if (!name) return;
+    // Prevent duplicates
+    if (niches.some(n => n.name.toLowerCase() === name.toLowerCase())) {
+      setNiches(prev => prev.map(n =>
+        n.name.toLowerCase() === name.toLowerCase() ? { ...n, selected: true } : n
+      ));
+      setCustomNiche('');
+      return;
+    }
 
     const newNiche: Niche = { id: `custom_${Date.now()}`, name, selected: true };
     setNiches(prev => [...prev, newNiche]);
     setCustomNiche('');
 
-    // Persist to DB (fire-and-forget; UI already updated)
+    // Save to localStorage (always works)
+    const localNames = loadLocalNiches();
+    if (!localNames.some(n => n.toLowerCase() === name.toLowerCase())) {
+      saveLocalNiches([...localNames, name]);
+    }
+
+    // Also persist to DB
     try {
       await api.post('/api/niches/custom', { name });
     } catch {
-      // silently ignore if save fails
+      // localStorage already saved — niche persists regardless
     }
+  };
+
+  const removeCustomNiche = (id: string, name: string) => {
+    // Only allow removing custom niches, not predefined ones
+    if (PREDEFINED_NICHES.some(n => n.id === id)) return;
+    setNiches(prev => prev.filter(n => n.id !== id));
+    const localNames = loadLocalNiches().filter(n => n.toLowerCase() !== name.toLowerCase());
+    saveLocalNiches(localNames);
+    // Also remove from DB (fire-and-forget)
+    api.delete(`/api/niches/custom/${encodeURIComponent(name)}`).catch(() => {});
   };
 
   const toggleMethod = (id: string) => {
@@ -256,22 +343,40 @@ export default function MassiveSearch() {
               </div>
 
               <div className="grid grid-cols-2 gap-3 mb-4">
-                {niches.map((niche) => (
-                  <button
-                    key={niche.id}
-                    onClick={() => toggleNiche(niche.id)}
-                    className={`p-3 rounded-lg border-2 transition-all ${
-                      niche.selected
-                        ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300'
-                        : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600 text-gray-700 dark:text-gray-300'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2">
-                      {niche.selected && <CheckCircle2 className="h-4 w-4 flex-shrink-0" />}
-                      <span className="text-sm font-medium">{niche.name}</span>
+                {niches.map((niche) => {
+                  const isCustom = !PREDEFINED_NICHES.some(p => p.id === niche.id);
+                  return (
+                    <div key={niche.id} className="relative group">
+                      <button
+                        onClick={() => toggleNiche(niche.id)}
+                        className={`w-full p-3 rounded-lg border-2 transition-all ${
+                          niche.selected
+                            ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300'
+                            : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600 text-gray-700 dark:text-gray-300'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          {niche.selected && <CheckCircle2 className="h-4 w-4 flex-shrink-0" />}
+                          <span className="text-sm font-medium">{niche.name}</span>
+                          {isCustom && (
+                            <span className="ml-auto text-xs px-1.5 py-0.5 bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 rounded">
+                              custom
+                            </span>
+                          )}
+                        </div>
+                      </button>
+                      {isCustom && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); removeCustomNiche(niche.id, niche.name); }}
+                          className="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+                          title="Remover nicho"
+                        >
+                          &times;
+                        </button>
+                      )}
                     </div>
-                  </button>
-                ))}
+                  );
+                })}
               </div>
 
               {/* Custom Niche Input */}

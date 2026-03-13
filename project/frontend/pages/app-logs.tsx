@@ -38,6 +38,7 @@ import {
   Wrench,
   Sparkles,
   ChevronRight,
+  Trash2,
 } from 'lucide-react'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -87,6 +88,8 @@ const ERROR_TYPE_CONFIG: Record<string, { label: string; color: string; bg: stri
   provider_unavailable: { label: 'Unavailable',      color: 'text-gray-600 dark:text-gray-400',     bg: 'bg-gray-100 dark:bg-gray-800',    icon: AlertTriangle },
   auth_error:           { label: 'Auth Error',       color: 'text-amber-700 dark:text-amber-300',   bg: 'bg-amber-100 dark:bg-amber-900/40', icon: Shield },
   duplicate_error:      { label: 'Duplicate',        color: 'text-cyan-600 dark:text-cyan-400',     bg: 'bg-cyan-50 dark:bg-cyan-950',     icon: Layers },
+  no_results:           { label: 'Sem Resultados',   color: 'text-slate-600 dark:text-slate-400',   bg: 'bg-slate-50 dark:bg-slate-950',   icon: Search },
+  retry_exhausted:      { label: 'Retries Esgotados', color: 'text-orange-700 dark:text-orange-300', bg: 'bg-orange-100 dark:bg-orange-900/40', icon: RefreshCw },
   unknown:              { label: 'Unknown',          color: 'text-gray-500 dark:text-gray-400',     bg: 'bg-gray-50 dark:bg-gray-900',     icon: Hash },
 }
 
@@ -581,6 +584,8 @@ export default function AppLogs() {
   const [page, setPage] = useState(1)
   const [autoRefresh, setAutoRefresh] = useState(false)
   const [showDistribution, setShowDistribution] = useState(true)
+  const [deleting, setDeleting] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(false)
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -637,6 +642,21 @@ export default function AppLogs() {
     setDateFrom('')
     setDateTo('')
     setPage(1)
+  }
+
+  const deleteAllLogs = async () => {
+    setDeleting(true)
+    try {
+      await api.delete('/api/admin/logs')
+      setConfirmDelete(false)
+      setPage(1)
+      fetchLogs()
+    } catch (err: any) {
+      if (err.response?.status === 401) router.push('/login')
+      else setError('Erro ao excluir logs.')
+    } finally {
+      setDeleting(false)
+    }
   }
 
   const hasFilters = levelFilter || providerFilter || errorTypeFilter || search || dateFrom || dateTo
@@ -701,6 +721,34 @@ export default function AppLogs() {
               <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
               Atualizar
             </button>
+
+            {/* Delete all logs */}
+            {!confirmDelete ? (
+              <button
+                onClick={() => setConfirmDelete(true)}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium bg-white dark:bg-gray-800 border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-all duration-200"
+              >
+                <Trash2 className="w-4 h-4" />
+                Excluir Todos
+              </button>
+            ) : (
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={deleteAllLogs}
+                  disabled={deleting}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-bold bg-red-600 dark:bg-red-700 border border-red-700 dark:border-red-600 text-white hover:bg-red-700 dark:hover:bg-red-800 transition-all duration-200 disabled:opacity-50"
+                >
+                  <Trash2 className={`w-4 h-4 ${deleting ? 'animate-pulse' : ''}`} />
+                  {deleting ? 'Excluindo...' : 'Confirmar'}
+                </button>
+                <button
+                  onClick={() => setConfirmDelete(false)}
+                  className="flex items-center gap-1 px-2 py-2 rounded-lg text-sm text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
           </div>
         </div>
 

@@ -80,7 +80,14 @@ export default function Leads() {
   const [searchDebounced, setSearchDebounced] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
   const [tagFilter, setTagFilter] = useState('')
+  const [cityFilter, setCityFilter] = useState('')
+  const [stateFilter, setStateFilter] = useState('')
   const [sort, setSort] = useState('newest')
+
+  // Location options
+  const [availableCities, setAvailableCities] = useState<string[]>([])
+  const [availableStates, setAvailableStates] = useState<string[]>([])
+  const [loadingLocations, setLoadingLocations] = useState(false)
 
   // Selection
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -99,18 +106,22 @@ export default function Leads() {
   // Delete confirmation modal (bulk selected)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
 
-  // Delete ALL modal
+  // Sync + Delete
+  const [showSyncDeleteConfirm, setShowSyncDeleteConfirm] = useState(false)
+  const [syncingAndDeleting, setSyncingAndDeleting] = useState(false)
+  const [syncDeleteConfirmText, setSyncDeleteConfirmText] = useState('')
+  const [syncDeleteResult, setSyncDeleteResult] = useState<{
+    synced: number
+    skipped: number
+    errors: number
+    deleted: number
+  } | null>(null)
+
+  // Delete All
   const [showDeleteAllConfirm, setShowDeleteAllConfirm] = useState(false)
   const [deleteAllConfirmText, setDeleteAllConfirmText] = useState('')
   const [deletingAll, setDeletingAll] = useState(false)
 
-  // Sync + Delete modal
-  const [showSyncDeleteConfirm, setShowSyncDeleteConfirm] = useState(false)
-  const [syncDeleteConfirmText, setSyncDeleteConfirmText] = useState('')
-  const [syncingAndDeleting, setSyncingAndDeleting] = useState(false)
-  const [syncDeleteResult, setSyncDeleteResult] = useState<{
-    synced: number; skipped: number; errors: number; deleted: number
-  } | null>(null)
 
   // Sanitize
   const [sanitizing, setSanitizing] = useState(false)
@@ -120,6 +131,7 @@ export default function Leads() {
     encoding_corrected: number
     spam_detected: number
     duplicates_removed: number
+    no_contact_removed: number
     quality_updated: number
     ids_deleted: number
   } | null>(null)
@@ -131,8 +143,6 @@ export default function Leads() {
   useEffect(() => {
     const handler = () => {
       if (showTagInput) { setShowTagInput(false); return }
-      if (showDeleteAllConfirm) { setShowDeleteAllConfirm(false); setDeleteAllConfirmText(''); return }
-      if (showSyncDeleteConfirm) { setShowSyncDeleteConfirm(false); setSyncDeleteConfirmText(''); setSyncDeleteResult(null); return }
       if (showExport) { setShowExport(false); return }
       if (drawerLead) { setDrawerLead(null); return }
     }
@@ -154,6 +164,25 @@ export default function Leads() {
     return () => clearTimeout(timer)
   }, [search])
 
+  // Fetch available locations
+  useEffect(() => {
+    const fetchLocations = async () => {
+      const token = localStorage.getItem('token')
+      if (!token) return
+      try {
+        setLoadingLocations(true)
+        const res = await api.get('/api/leads/locations/available')
+        setAvailableCities(res.data.cities || [])
+        setAvailableStates(res.data.states || [])
+      } catch (err) {
+        // silently fail
+      } finally {
+        setLoadingLocations(false)
+      }
+    }
+    fetchLocations()
+  }, [])
+
   const fetchLeads = useCallback(async () => {
     abortControllerRef.current?.abort()
     const controller = new AbortController()
@@ -171,6 +200,8 @@ export default function Leads() {
       if (searchDebounced) params.append('search', searchDebounced)
       if (statusFilter) params.append('status', statusFilter)
       if (tagFilter) params.append('tag', tagFilter)
+      if (cityFilter) params.append('city', cityFilter)
+      if (stateFilter) params.append('state', stateFilter)
 
       const res = await api.get(`/api/leads?${params.toString()}`, { signal: controller.signal })
       setLeads(res.data.leads)
@@ -184,7 +215,7 @@ export default function Leads() {
     } finally {
       if (!controller.signal.aborted) setLoading(false)
     }
-  }, [page, sort, searchDebounced, statusFilter, tagFilter])
+  }, [page, sort, searchDebounced, statusFilter, tagFilter, cityFilter, stateFilter])
 
   useEffect(() => { fetchLeads() }, [fetchLeads])
 
@@ -264,49 +295,6 @@ export default function Leads() {
     }
   }
 
-  const handleSyncAndDelete = () => {
-    setSyncDeleteConfirmText('')
-    setSyncDeleteResult(null)
-    setShowSyncDeleteConfirm(true)
-  }
-
-  const confirmSyncAndDelete = async () => {
-    if (syncDeleteConfirmText !== 'CONFIRMAR') return
-    setSyncingAndDeleting(true)
-    try {
-      const res = await api.post('/api/leads/sync-and-delete', { confirm: true })
-      setSyncDeleteResult(res.data)
-      setSelected(new Set())
-      fetchLeads()
-    } catch {
-      addToast('Erro ao sincronizar e deletar leads', 'error')
-      setShowSyncDeleteConfirm(false)
-    } finally {
-      setSyncingAndDeleting(false)
-    }
-  }
-
-  const handleDeleteAll = () => {
-    setDeleteAllConfirmText('')
-    setShowDeleteAllConfirm(true)
-  }
-
-  const confirmDeleteAll = async () => {
-    if (deleteAllConfirmText !== 'CONFIRMAR') return
-    setDeletingAll(true)
-    try {
-      const res = await api.post('/api/leads/delete-all', { confirm: true })
-      addToast(`${res.data.deleted} leads deletados com sucesso`, 'success')
-      setShowDeleteAllConfirm(false)
-      setDeleteAllConfirmText('')
-      setSelected(new Set())
-      fetchLeads()
-    } catch {
-      addToast('Erro ao deletar todos os leads', 'error')
-    } finally {
-      setDeletingAll(false)
-    }
-  }
 
   const handleSanitize = async () => {
     setSanitizing(true)
@@ -325,6 +313,35 @@ export default function Leads() {
   const handleDrawerUpdate = (updatedLead: Lead) => {
     setLeads(prev => prev.map(l => l.id === updatedLead.id ? updatedLead : l))
     setDrawerLead(updatedLead)
+  }
+
+  const confirmSyncAndDelete = async () => {
+    setSyncingAndDeleting(true)
+    try {
+      const res = await api.post('/api/crm/sync-and-delete-all')
+      setSyncDeleteResult(res.data.result)
+    } catch {
+      addToast('Erro ao sincronizar e deletar leads', 'error')
+      setShowSyncDeleteConfirm(false)
+      setSyncDeleteConfirmText('')
+    } finally {
+      setSyncingAndDeleting(false)
+    }
+  }
+
+  const confirmDeleteAll = async () => {
+    setDeletingAll(true)
+    try {
+      await api.post('/api/leads/delete-all')
+      addToast('Todos os leads foram deletados', 'success')
+      setShowDeleteAllConfirm(false)
+      setDeleteAllConfirmText('')
+      fetchLeads()
+    } catch {
+      addToast('Erro ao deletar todos os leads', 'error')
+    } finally {
+      setDeletingAll(false)
+    }
   }
 
   const totalAll = Object.values(statusCounts).reduce((a, b) => a + b, 0)
@@ -369,22 +386,6 @@ export default function Leads() {
                 position="bottom"
               />
             </div>
-            <button
-              onClick={handleSyncAndDelete}
-              className="inline-flex items-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold rounded-xl shadow-sm transition-colors"
-              title="Sincronizar com CRM e apagar todos os leads"
-            >
-              <RefreshCw className="w-4 h-4" />
-              Sync + Apagar
-            </button>
-            <button
-              onClick={handleDeleteAll}
-              className="inline-flex items-center gap-2 px-4 py-2.5 border border-red-300 text-red-600 hover:bg-red-50 text-sm font-semibold rounded-xl shadow-sm transition-colors"
-              title="Apagar todos os leads permanentemente"
-            >
-              <Trash2 className="w-4 h-4" />
-              Apagar Todos
-            </button>
           </div>
         )}
       </div>
@@ -429,19 +430,61 @@ export default function Leads() {
         })}
       </div>
 
-      {/* Search + Filters bar */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <div className="relative flex-1 min-w-[240px]">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Buscar empresa, email, telefone, CNPJ..."
-            className="w-full pl-10 pr-4 py-2.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all"
-          />
-        </div>
+      {/* Search Bar */}
+      <div className="relative">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Buscar empresa, email, telefone, CNPJ..."
+          className="w-full pl-10 pr-4 py-2.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 focus:border-primary-400 transition-all"
+        />
+      </div>
 
+      {/* Location Filters Section */}
+      <div className="bg-white border border-gray-200 rounded-xl p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <Filter className="w-4 h-4 text-primary-600" />
+          <h3 className="text-sm font-semibold text-gray-900">Filtros de Localização</h3>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          {/* City Filter */}
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1.5">Cidade</label>
+            <select
+              value={cityFilter}
+              onChange={(e) => { setCityFilter(e.target.value); setPage(1) }}
+              disabled={loadingLocations}
+              className="w-full px-3 py-2.5 bg-white border border-gray-200 rounded-lg text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500/30 disabled:opacity-50"
+            >
+              <option value="">Todas as cidades</option>
+              {availableCities.map(city => (
+                <option key={city} value={city}>{city}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* State Filter */}
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1.5">Estado</label>
+            <select
+              value={stateFilter}
+              onChange={(e) => { setStateFilter(e.target.value); setPage(1) }}
+              disabled={loadingLocations}
+              className="w-full px-3 py-2.5 bg-white border border-gray-200 rounded-lg text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500/30 disabled:opacity-50"
+            >
+              <option value="">Todos os estados</option>
+              {availableStates.map(state => (
+                <option key={state} value={state}>{state}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* Other Filters Section */}
+      <div className="flex items-center gap-3 flex-wrap">
         {/* Tag filter */}
         {allTags.length > 0 && (
           <div className="flex items-center gap-1">
@@ -815,6 +858,15 @@ export default function Leads() {
                   </div>
                   <span className="font-bold text-blue-600 dark:text-blue-400">{sanitizeReport.duplicates_removed}</span>
                 </div>
+                {(sanitizeReport.no_contact_removed ?? 0) > 0 && (
+                  <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
+                    <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                      <XCircle className="w-4 h-4 text-gray-500" />
+                      Sem contato válido (removidos)
+                    </div>
+                    <span className="font-bold text-gray-600 dark:text-gray-400">{sanitizeReport.no_contact_removed}</span>
+                  </div>
+                )}
                 <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
                   <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                     <Sparkles className="w-4 h-4 text-purple-500" />
