@@ -518,6 +518,7 @@ DAILY_JOB_NICHES = [
 DAILY_JOB_REGION  = 'grande_vitoria_es'  # região padrão
 DAILY_JOB_HOUR    = 3                    # 3h da manhã, horário de Brasília
 DAILY_JOB_USER_ID = 1                   # user_id do admin que "roda" o job
+DAILY_CRM_SYNC_HOUR = 9                 # 09:00 da manhã para sync CRM automático
 
 SKIP_DOMAINS = {
     'facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'linkedin.com',
@@ -980,6 +981,22 @@ def init_db():
             leads_skipped INTEGER DEFAULT 0,
             error_message TEXT
         )''')
+
+        # CRM Sync Log — for daily automatic 09:00 sync and manual syncs
+        c.execute('''CREATE TABLE IF NOT EXISTS crm_sync_logs (
+            id SERIAL PRIMARY KEY,
+            started_at TIMESTAMP DEFAULT NOW(),
+            finished_at TIMESTAMP,
+            status VARCHAR(20) DEFAULT 'running',
+            leads_total INTEGER DEFAULT 0,
+            leads_synced INTEGER DEFAULT 0,
+            leads_skipped INTEGER DEFAULT 0,
+            leads_failed INTEGER DEFAULT 0,
+            error_message TEXT,
+            trigger VARCHAR(20) DEFAULT 'scheduled'
+        )''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_crm_sync_logs_started ON crm_sync_logs(started_at DESC)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_crm_sync_logs_status ON crm_sync_logs(status)')
 
         c.execute('''CREATE TABLE IF NOT EXISTS system_logs (
             id SERIAL PRIMARY KEY,
@@ -11123,6 +11140,202 @@ def run_daily_pipeline(daily_job_id, niches, region_id, cities_to_search):
             pass
 
 
+# ============= Daily CRM Sync (09:00 AM) =============
+
+def _run_crm_sync_batch(sync_job_id):
+    """
+    Background thread: synchronize all leads with email to alexandrequeiroz.com.br CRM.
+    Uses batch import endpoint for efficiency.
+    """
+    print(f"[CRM_SYNC] Job {sync_job_id} started")
+    conn = psycopg2.connect(**DB_CONFIG)
+    c = conn.cursor()
+
+    try:
+        # Fetch all leads with email from shared base
+        c.execute(
+            '''SELECT id, company_name, email, phone, website, city, state, contact_name, tags, notes, whatsapp
+               FROM leads l
+               JOIN batches b ON l.batch_id = b.id
+               WHERE l.email IS NOT NULL AND l.email != '' AND b.is_shared = TRUE
+               ORDER BY l.extracted_at DESC LIMIT 5000'''
+        )
+        rows = c.fetchall()
+        leads_total = len(rows)
+        print(f"[CRM_SYNC] Found {leads_total} leads to sync")
+
+        if leads_total == 0:
+            c.execute(
+                "UPDATE crm_sync_logs SET status='completed', finished_at=NOW(), leads_total=0 WHERE id=%s",
+                (sync_job_id,)
+            )
+            conn.commit()
+            return
+
+        # Deduplicate by email
+        seen_emails = {}
+        unique_leads = []
+        for row in rows:
+            email = (row[2] or '').strip().lower()
+            if email and email not in seen_emails:
+                seen_emails[email] = True
+                unique_leads.append({
+                    'id': row[0],
+                    'company_name': row[1],
+                    'email': row[2],
+                    'phone': row[3],
+                    'website': row[4],
+                    'city': row[5],
+                    'state': row[6],
+                    'contact_name': row[7],
+                    'tags': row[8],
+                    'notes': row[9],
+                    'whatsapp': row[10]
+                })
+
+        # Format for CRM import API
+        customers = []
+        for lead in unique_leads:
+            contact_name = lead.get('contact_name') or lead.get('company_name') or 'Lead'
+            email = (lead.get('email') or '').strip()
+            phone = lead.get('phone') or None
+            whatsapp = lead.get('whatsapp') or None
+            company_name = lead.get('company_name') or 'N/A'
+            tags = lead.get('tags') or ''
+            notes = lead.get('notes') or ''
+
+            combined_notes = f"{notes}{',' if notes and tags else ''}{tags}"
+
+            customer = {
+                'name': contact_name[:100],
+                'email': email,
+                'phone': phone,
+                'whatsApp': whatsapp,
+                'companyName': company_name[:100],
+                'notes': combined_notes[:500] if combined_notes else '',
+                'tags': tags
+            }
+            customers.append(customer)
+
+        # Get CRM token
+        token = get_alexandrequeiroz_token()
+        if not token:
+            raise Exception("Failed to obtain CRM authentication token")
+
+        # Prepare payload
+        payload = {
+            'customers': customers,
+            'source': 'ExtractorImport'
+        }
+
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        }
+
+        # Send to CRM API
+        crm_endpoint = f'{ALEXANDREQUEIROZ_API}/api/v1/customers/import'
+        print(f"[CRM_SYNC] Sending {len(customers)} customers to {crm_endpoint}")
+
+        response = http_requests.post(
+            crm_endpoint,
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+
+        if response.status_code in [200, 201, 202]:
+            result = response.json()
+            leads_synced = result.get('created', len(customers))
+            leads_skipped = result.get('skipped', 0)
+            leads_failed = result.get('failed', 0)
+
+            print(f"[CRM_SYNC] ✅ Success: {leads_synced} created, {leads_skipped} skipped, {leads_failed} failed")
+
+            c.execute(
+                '''UPDATE crm_sync_logs
+                   SET status='completed', finished_at=NOW(), leads_total=%s,
+                       leads_synced=%s, leads_skipped=%s, leads_failed=%s
+                   WHERE id=%s''',
+                (len(unique_leads), leads_synced, leads_skipped, leads_failed, sync_job_id)
+            )
+            conn.commit()
+        else:
+            error_msg = response.text[:200] if response.text else f'HTTP {response.status_code}'
+            print(f"[CRM_SYNC] ❌ API error: {error_msg}")
+
+            c.execute(
+                '''UPDATE crm_sync_logs
+                   SET status='failed', finished_at=NOW(), leads_total=%s,
+                       error_message=%s
+                   WHERE id=%s''',
+                (len(unique_leads), error_msg, sync_job_id)
+            )
+            conn.commit()
+
+    except Exception as e:
+        error_str = str(e)[:500]
+        print(f"[CRM_SYNC] ❌ Exception: {error_str}")
+
+        try:
+            c.execute(
+                '''UPDATE crm_sync_logs
+                   SET status='failed', finished_at=NOW(), error_message=%s
+                   WHERE id=%s''',
+                (error_str, sync_job_id)
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def trigger_daily_crm_sync(trigger='scheduled'):
+    """
+    Trigger daily CRM sync (09:00). Guard + insert + thread pattern.
+    trigger: 'scheduled' (automatic) or 'manual' (user-initiated)
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    c = conn.cursor()
+
+    try:
+        # Guard: avoid double-fire (check last 5 minutes)
+        c.execute(
+            "SELECT id FROM crm_sync_logs WHERE started_at > NOW() - INTERVAL '5 minutes' AND status='running'"
+        )
+        if c.fetchone():
+            print("[CRM_SYNC] Already running, skipping")
+            return
+
+        # Insert record
+        c.execute(
+            "INSERT INTO crm_sync_logs (trigger, status) VALUES (%s, 'running') RETURNING id",
+            (trigger,)
+        )
+        sync_job_id = c.fetchone()[0]
+        conn.commit()
+
+    except Exception as e:
+        print(f"[CRM_SYNC] Failed to start: {e}")
+        return
+
+    finally:
+        try:
+            c.close()
+            conn.close()
+        except Exception:
+            pass
+
+    # Spawn daemon thread
+    threading.Thread(target=_run_crm_sync_batch, args=(sync_job_id,), daemon=True).start()
+    print(f"[CRM_SYNC] Daily sync initiated (job {sync_job_id}, trigger={trigger})")
+
+
 def trigger_daily_pipeline(niches=None, region_id=None):
     """Cria registro daily_job e dispara run_daily_pipeline em background."""
     niches    = niches    or DAILY_JOB_NICHES
@@ -11538,6 +11751,82 @@ def crm_refine():
 
     threading.Thread(target=_run_refine, daemon=True).start()
     return jsonify({'message': 'Refinamento CRM iniciado em background', 'status': 'running'}), 202
+
+
+# ============= CRM Sync Status & Manual Trigger =============
+
+@app.route('/api/crm/sync-status', methods=['GET'])
+@limiter.limit("30/minute")
+def crm_sync_status():
+    """Get CRM sync history (last 10 executions)"""
+    user = verify_token(get_auth_header())
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('''
+                SELECT id, started_at, finished_at, status, leads_total, leads_synced,
+                       leads_skipped, leads_failed, error_message, trigger
+                FROM crm_sync_logs
+                ORDER BY started_at DESC
+                LIMIT 10
+            ''')
+            rows = c.fetchall()
+
+        syncs = []
+        for row in rows:
+            syncs.append({
+                'id': row[0],
+                'started_at': row[1].isoformat() if row[1] else None,
+                'finished_at': row[2].isoformat() if row[2] else None,
+                'status': row[3],
+                'leads_total': row[4],
+                'leads_synced': row[5],
+                'leads_skipped': row[6],
+                'leads_failed': row[7],
+                'error_message': row[8],
+                'trigger': row[9]
+            })
+
+        return jsonify({
+            'syncs': syncs,
+            'total': len(syncs),
+            'next_sync': f'{DAILY_CRM_SYNC_HOUR:02d}:00 (America/Sao_Paulo)'
+        }), 200
+
+    except Exception as e:
+        print(f'[ERROR] /api/crm/sync-status: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/crm/sync-now', methods=['POST'])
+@limiter.limit("2/hour")
+def crm_sync_now():
+    """Manually trigger CRM sync (admin only)"""
+    user = verify_token(get_auth_header())
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT is_admin FROM users WHERE id=%s', (user,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+    try:
+        trigger_daily_crm_sync(trigger='manual')
+        return jsonify({
+            'message': 'CRM sync triggered manually',
+            'status': 'running',
+            'trigger': 'manual'
+        }), 202
+
+    except Exception as e:
+        print(f'[ERROR] /api/crm/sync-now: {e}')
+        return jsonify({'error': str(e)}), 500
 
 
 # ============= SaaS: Usage Tracking & Plan Management =============
@@ -12045,8 +12334,15 @@ try:
             id='daily_pipeline',
             replace_existing=True
         )
+        _scheduler.add_job(
+            trigger_daily_crm_sync,
+            CronTrigger(hour=DAILY_CRM_SYNC_HOUR, minute=0, timezone=_tz),
+            id='daily_crm_sync',
+            replace_existing=True
+        )
         _scheduler.start()
         print(f"[SCHEDULER] Pipeline diário agendado: {DAILY_JOB_HOUR:02d}:00 America/Sao_Paulo")
+        print(f"[SCHEDULER] CRM sync diário agendado: {DAILY_CRM_SYNC_HOUR:02d}:00 America/Sao_Paulo")
     else:
         print("[SCHEDULER] APScheduler indisponível — instale: pip install APScheduler pytz")
 except Exception as _sched_err:
