@@ -778,6 +778,7 @@ def init_db():
             username VARCHAR(100) UNIQUE NOT NULL,
             password_hash VARCHAR(64) NOT NULL,
             is_admin BOOLEAN DEFAULT FALSE,
+            plan VARCHAR(20) DEFAULT 'free',
             created_at TIMESTAMP DEFAULT NOW()
         )''')
 
@@ -1024,6 +1025,60 @@ def init_db():
         except psycopg2.errors.DuplicateColumn:
             conn.rollback()
 
+        # SaaS Foundation: plan column on users
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN plan VARCHAR(20) DEFAULT 'free'")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+
+        # SaaS Foundation: usage tracking table
+        c.execute('''CREATE TABLE IF NOT EXISTS usage_tracking (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            month_year VARCHAR(7) NOT NULL,
+            leads_viewed INTEGER DEFAULT 0,
+            leads_exported INTEGER DEFAULT 0,
+            reset_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, month_year)
+        )''')
+
+        # SaaS Foundation: plan limits configuration
+        c.execute('''CREATE TABLE IF NOT EXISTS plan_limits (
+            id SERIAL PRIMARY KEY,
+            plan_name VARCHAR(20) UNIQUE NOT NULL,
+            leads_per_month INTEGER NOT NULL,
+            exports_per_month INTEGER NOT NULL,
+            price_monthly DECIMAL(10, 2) DEFAULT 0,
+            features JSONB,
+            created_at TIMESTAMP DEFAULT NOW()
+        )''')
+
+        # Initialize plan limits if not exists
+        c.execute('SELECT COUNT(*) FROM plan_limits')
+        if c.fetchone()[0] == 0:
+            c.execute('''INSERT INTO plan_limits (plan_name, leads_per_month, exports_per_month, price_monthly, features)
+                VALUES
+                    ('free', 100, 1, 0, '{"leads_view": true, "export_csv": true, "filters": ["email", "phone", "city", "state"], "saved_filters": false}'::jsonb),
+                    ('pro', 5000, 20, 99, '{"leads_view": true, "export_csv": true, "export_json": true, "filters": ["email", "phone", "city", "state", "category", "crm_status"], "saved_filters": true, "bulk_actions": true}'::jsonb),
+                    ('enterprise', 999999, 999999, 0, '{"leads_view": true, "export_csv": true, "export_json": true, "export_whatsapp": true, "filters": ["*"], "saved_filters": true, "bulk_actions": true, "api_access": true}'::jsonb)
+            ''')
+
+        # Saved filters (Semana 2)
+        c.execute('''CREATE TABLE IF NOT EXISTS saved_filters (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            name VARCHAR(100) NOT NULL,
+            filters JSONB NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, name)
+        )''')
+
+        # Indexes
+        c.execute('CREATE INDEX IF NOT EXISTS idx_usage_tracking_user_month ON usage_tracking(user_id, month_year)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_usage_tracking_month ON usage_tracking(month_year)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_users_plan ON users(plan)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_saved_filters_user ON saved_filters(user_id)')
+
         # Indexes
         c.execute('CREATE INDEX IF NOT EXISTS idx_emails_job_id ON emails(job_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id)')
@@ -1038,6 +1093,15 @@ def init_db():
         c.execute('CREATE INDEX IF NOT EXISTS idx_api_usage_user_month ON api_usage(user_id, month_year)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_api_cache_domain ON api_cache(domain, provider)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_api_cache_expires ON api_cache(expires_at)')
+
+        # Semana 4: Shared lead base — mark all batches as shared by default
+        try:
+            c.execute("ALTER TABLE batches ADD COLUMN is_shared BOOLEAN DEFAULT TRUE")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+        # Backfill: ensure all existing batches are marked as shared
+        c.execute("UPDATE batches SET is_shared = TRUE WHERE is_shared IS NULL")
+        c.execute('CREATE INDEX IF NOT EXISTS idx_batches_is_shared ON batches(is_shared)')
 
         # Insert admin user if not exists
         c.execute('SELECT id FROM users WHERE username = %s', (ADMIN_USERNAME,))
@@ -4057,6 +4121,31 @@ def login():
     token = create_session(user[0])
     return jsonify({'token': token, 'user_id': user[0], 'is_admin': user[2]})
 
+@app.route('/api/me', methods=['GET'])
+@limiter.limit("60/minute")
+def get_me():
+    """Get current authenticated user info (id, username, is_admin, plan)"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT id, username, is_admin, plan FROM users WHERE id = %s', (user_id,))
+            row = c.fetchone()
+            if not row:
+                return jsonify({'error': 'User not found'}), 404
+            return jsonify({
+                'id': row[0],
+                'username': row[1],
+                'is_admin': row[2],
+                'plan': row[3]
+            }), 200
+    except Exception as e:
+        print(f'[ERROR] /api/me: {e}')
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/scrape', methods=['POST'])
 @limiter.limit("10/hour")
 def start_scrape():
@@ -5126,9 +5215,19 @@ LEADS_SELECT = '''SELECT l.id, l.company_name, l.email, l.phone, l.website, l.so
                          l.instagram, l.facebook, l.linkedin, l.twitter, l.youtube,
                          l.whatsapp, l.cnpj, l.address,
                          l.crm_status, l.tags, l.notes, l.contact_name, l.updated_at,
-                         b.name as batch_name, l.batch_id
+                         b.name as batch_name, l.batch_id, COALESCE(l.lead_score, 0) as lead_score
                   FROM leads l JOIN batches b ON l.batch_id = b.id
                   WHERE b.user_id = %s'''
+
+# Semana 4: Shared base — clients see all shared leads, not just their own
+SHARED_LEADS_SELECT = '''SELECT l.id, l.company_name, l.email, l.phone, l.website, l.source_url,
+                                l.city, l.state, l.category, l.extracted_at,
+                                l.instagram, l.facebook, l.linkedin, l.twitter, l.youtube,
+                                l.whatsapp, l.cnpj, l.address,
+                                l.crm_status, l.tags, l.notes, l.contact_name, l.updated_at,
+                                b.name as batch_name, l.batch_id, COALESCE(l.lead_score, 0) as lead_score
+                         FROM leads l JOIN batches b ON l.batch_id = b.id
+                         WHERE b.is_shared = TRUE'''
 
 def lead_row_to_dict(row):
     """Convert a lead row tuple to dict."""
@@ -5143,7 +5242,74 @@ def lead_row_to_dict(row):
         'contact_name': row[21] or '',
         'updated_at': row[22].isoformat() if row[22] else None,
         'batch_name': row[23], 'batch_id': row[24],
+        'lead_score': row[25] if row[25] is not None else 0,
     }
+
+
+# ======= Lead Scoring =======
+
+GENERIC_COMPANY_NAMES = {
+    'sem nome', 'unknown', 'n/a', 'na', 'empresa', 'company', 'test', 'teste',
+    'nome', 'name', 'business', 'negocio', 'negócio', '-', 'null', 'none'
+}
+
+def _calculate_lead_score(lead: dict) -> int:
+    """Calculate a deterministic quality score 0-100 for a lead.
+
+    Scoring rubric:
+      +30  email válido presente
+      +15  nome de empresa presente e não genérico
+      +15  nome de contato (pessoa) presente
+      +10  cidade presente
+      +10  telefone presente
+      +10  website presente
+       +5  estado presente
+       +5  categoria/segmento presente
+    Penalty:
+      -15  nome de empresa genérico ou suspeito
+    Range enforced: 0–100
+    """
+    score = 0
+
+    # Email (+30)
+    email = (lead.get('email') or '').strip()
+    if email and '@' in email and '.' in email.split('@')[-1]:
+        score += 30
+
+    # Company name (+15 or -15)
+    company = (lead.get('company_name') or '').strip()
+    company_lower = company.lower()
+    if company and company_lower not in GENERIC_COMPANY_NAMES and len(company) > 2:
+        score += 15
+    elif company_lower in GENERIC_COMPANY_NAMES:
+        score -= 15
+
+    # Contact name (+15)
+    contact = (lead.get('contact_name') or '').strip()
+    if contact and len(contact) > 2:
+        score += 15
+
+    # City (+10)
+    if (lead.get('city') or '').strip():
+        score += 10
+
+    # Phone (+10)
+    if (lead.get('phone') or '').strip():
+        score += 10
+
+    # Website (+10)
+    if (lead.get('website') or '').strip():
+        score += 10
+
+    # State (+5)
+    if (lead.get('state') or '').strip():
+        score += 5
+
+    # Category (+5)
+    if (lead.get('category') or '').strip():
+        score += 5
+
+    return max(0, min(100, score))
 
 @app.route('/api/leads', methods=['GET'])
 @limiter.limit("30/minute")
@@ -5165,8 +5331,9 @@ def list_leads():
     page = max(1, int(request.args.get('page', 1)))
     per_page = min(100, max(10, int(request.args.get('per_page', 50))))
 
-    query = LEADS_SELECT
-    params = [user_id]
+    # Semana 4: use shared base — all authenticated users see the central lead pool
+    query = SHARED_LEADS_SELECT
+    params = []
 
     # Filters
     if search:
@@ -5210,6 +5377,8 @@ def list_leads():
             query += ' ORDER BY l.company_name ASC NULLS LAST'
         elif sort == 'status':
             query += ' ORDER BY l.crm_status ASC, l.company_name ASC'
+        elif sort == 'score':
+            query += ' ORDER BY COALESCE(l.lead_score, 0) DESC'
         elif sort == 'updated':
             query += ' ORDER BY l.updated_at DESC NULLS LAST'
         else:  # newest
@@ -5223,23 +5392,32 @@ def list_leads():
         c.execute(query, params)
         rows = c.fetchall()
 
-        # Get status counts
+        # Get status counts (shared base)
         c.execute('''SELECT COALESCE(l.crm_status, 'novo') as status, COUNT(*)
                      FROM leads l JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s
-                     GROUP BY COALESCE(l.crm_status, 'novo')''', (user_id,))
+                     WHERE b.is_shared = TRUE
+                     GROUP BY COALESCE(l.crm_status, 'novo')''')
         status_counts = {row[0]: row[1] for row in c.fetchall()}
 
-        # Get all unique tags
+        # Get all unique tags (shared base)
         c.execute('''SELECT DISTINCT unnest(string_to_array(l.tags, ','))
                      FROM leads l JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s AND l.tags IS NOT NULL AND l.tags != ''
-                     ORDER BY 1''', (user_id,))
+                     WHERE b.is_shared = TRUE AND l.tags IS NOT NULL AND l.tags != ''
+                     ORDER BY 1''')
         all_tags = [row[0].strip() for row in c.fetchall() if row[0].strip()]
 
     leads = [lead_row_to_dict(row) for row in rows]
 
-    return jsonify({
+    # SaaS: Track usage and check limits
+    plan = _get_user_plan(user_id)
+    limits = _get_plan_limits(plan)
+    usage = _get_usage_stats(user_id)
+
+    # Count leads being viewed on this page
+    leads_count = len(leads)
+
+    # Check if user is approaching or exceeding limit
+    response_data = {
         'leads': leads,
         'total': total,
         'page': page,
@@ -5247,7 +5425,19 @@ def list_leads():
         'total_pages': max(1, (total + per_page - 1) // per_page),
         'status_counts': status_counts,
         'all_tags': all_tags,
-    })
+        'plan': plan,
+        'usage': {
+            'leads_viewed': usage['leads_viewed'],
+            'leads_limit': limits['leads_per_month'],
+            'usage_percent': (usage['leads_viewed'] / limits['leads_per_month'] * 100) if limits['leads_per_month'] > 0 else 0
+        }
+    }
+
+    # Increment view counter
+    if leads_count > 0:
+        _increment_usage(user_id, 'leads_viewed', leads_count)
+
+    return jsonify(response_data)
 
 @app.route('/api/leads/locations/available', methods=['GET'])
 @limiter.limit("60/minute")
@@ -5261,18 +5451,18 @@ def get_available_locations():
     with get_db() as conn:
         c = conn.cursor()
 
-        # Get unique cities
+        # Get unique cities from shared base
         c.execute('''SELECT DISTINCT TRIM(l.city) as city
                      FROM leads l JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s AND l.city IS NOT NULL AND l.city != ''
-                     ORDER BY city''', (user_id,))
+                     WHERE b.is_shared = TRUE AND l.city IS NOT NULL AND l.city != ''
+                     ORDER BY city''')
         cities = [row[0] for row in c.fetchall() if row[0]]
 
-        # Get unique states
+        # Get unique states from shared base
         c.execute('''SELECT DISTINCT TRIM(l.state) as state
                      FROM leads l JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s AND l.state IS NOT NULL AND l.state != ''
-                     ORDER BY state''', (user_id,))
+                     WHERE b.is_shared = TRUE AND l.state IS NOT NULL AND l.state != ''
+                     ORDER BY state''')
         states = [row[0] for row in c.fetchall() if row[0]]
 
     return jsonify({
@@ -5291,7 +5481,7 @@ def get_lead(lead_id):
 
     with get_db() as conn:
         c = conn.cursor()
-        c.execute(LEADS_SELECT + ' AND l.id = %s', (user_id, lead_id))
+        c.execute(SHARED_LEADS_SELECT + ' AND l.id = %s', (lead_id,))
         row = c.fetchone()
 
     if not row:
@@ -7824,6 +8014,192 @@ def import_leads():
         conn.close()
 
 
+# ============= Lead Scoring (Semana 2) =============
+
+@app.route('/api/leads/enrich-score', methods=['POST'])
+@limiter.limit("5/hour")
+def enrich_lead_score():
+    """Recalculate lead_score for all leads of the current user (admin) or a batch.
+    Admin: recalculates all leads in the system.
+    Client: recalculates their own leads.
+    """
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        data = request.json or {}
+        lead_ids = data.get('lead_ids')  # optional: limit to specific IDs
+
+        with get_db() as conn:
+            c = conn.cursor()
+
+            # Check if admin
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (user_id,))
+            row = c.fetchone()
+            is_admin = row and row[0]
+
+            # Build query to fetch leads to score
+            if lead_ids:
+                placeholders = ','.join(['%s'] * len(lead_ids))
+                if is_admin:
+                    c.execute(f'''SELECT l.id, l.company_name, l.email, l.phone, l.website,
+                                         l.city, l.state, l.category, l.contact_name, l.whatsapp
+                                  FROM leads l WHERE l.id IN ({placeholders})''', lead_ids)
+                else:
+                    c.execute(f'''SELECT l.id, l.company_name, l.email, l.phone, l.website,
+                                         l.city, l.state, l.category, l.contact_name, l.whatsapp
+                                  FROM leads l JOIN batches b ON l.batch_id = b.id
+                                  WHERE b.user_id = %s AND l.id IN ({placeholders})''',
+                              [user_id] + list(lead_ids))
+            elif is_admin:
+                c.execute('''SELECT l.id, l.company_name, l.email, l.phone, l.website,
+                                    l.city, l.state, l.category, l.contact_name, l.whatsapp
+                             FROM leads l''')
+            else:
+                c.execute('''SELECT l.id, l.company_name, l.email, l.phone, l.website,
+                                    l.city, l.state, l.category, l.contact_name, l.whatsapp
+                             FROM leads l JOIN batches b ON l.batch_id = b.id
+                             WHERE b.user_id = %s''', (user_id,))
+
+            rows = c.fetchall()
+            updated = 0
+            for row in rows:
+                lead_dict = {
+                    'id': row[0], 'company_name': row[1], 'email': row[2],
+                    'phone': row[3], 'website': row[4], 'city': row[5],
+                    'state': row[6], 'category': row[7], 'contact_name': row[8],
+                    'whatsapp': row[9]
+                }
+                score = _calculate_lead_score(lead_dict)
+                c.execute('UPDATE leads SET lead_score = %s WHERE id = %s', (score, row[0]))
+                updated += 1
+
+            conn.commit()
+            print(f'[INFO] enrich_lead_score: updated {updated} leads (user_id={user_id}, is_admin={is_admin})')
+            return jsonify({'updated': updated, 'message': f'{updated} leads com score atualizado'}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/leads/enrich-score: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ============= Saved Filters (Semana 2) =============
+
+SAVED_FILTERS_LIMIT = {'free': 0, 'pro': 5, 'enterprise': 20}
+
+@app.route('/api/leads/saved-filters', methods=['GET'])
+def list_saved_filters():
+    """List saved filters for the current user"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute(
+                'SELECT id, name, filters, created_at FROM saved_filters WHERE user_id = %s ORDER BY created_at DESC',
+                (user_id,)
+            )
+            filters = []
+            for row in c.fetchall():
+                filters.append({
+                    'id': row[0],
+                    'name': row[1],
+                    'filters': row[2],
+                    'created_at': row[3].isoformat() if row[3] else None
+                })
+            return jsonify({'filters': filters}), 200
+    except Exception as e:
+        print(f'[ERROR] GET /api/leads/saved-filters: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leads/saved-filters', methods=['POST'])
+def create_saved_filter():
+    """Save a filter combination for the current user"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        data = request.json or {}
+        name = (data.get('name') or '').strip()
+        filters = data.get('filters')
+
+        if not name:
+            return jsonify({'error': 'Filter name is required'}), 400
+        if not filters:
+            return jsonify({'error': 'Filters payload is required'}), 400
+        if len(name) > 100:
+            return jsonify({'error': 'Filter name too long (max 100 chars)'}), 400
+
+        with get_db() as conn:
+            c = conn.cursor()
+
+            # Check plan limit
+            plan = _get_user_plan(user_id, conn)
+            max_filters = SAVED_FILTERS_LIMIT.get(plan, 0)
+            if max_filters == 0:
+                return jsonify({'error': 'Seu plano não permite filtros salvos. Faça upgrade para Pro ou Enterprise.', 'upgrade_required': True}), 403
+
+            c.execute('SELECT COUNT(*) FROM saved_filters WHERE user_id = %s', (user_id,))
+            count = c.fetchone()[0]
+            if count >= max_filters:
+                return jsonify({'error': f'Limite de {max_filters} filtros salvos atingido para o plano {plan.title()}. Remova um filtro ou faça upgrade.', 'limit_reached': True}), 403
+
+            # Upsert by name
+            c.execute('''
+                INSERT INTO saved_filters (user_id, name, filters)
+                VALUES (%s, %s, %s::jsonb)
+                ON CONFLICT (user_id, name)
+                DO UPDATE SET filters = EXCLUDED.filters
+                RETURNING id, name, filters, created_at
+            ''', (user_id, name, json.dumps(filters)))
+            row = c.fetchone()
+            conn.commit()
+
+            return jsonify({
+                'filter': {
+                    'id': row[0],
+                    'name': row[1],
+                    'filters': row[2],
+                    'created_at': row[3].isoformat() if row[3] else None
+                }
+            }), 201
+    except Exception as e:
+        print(f'[ERROR] POST /api/leads/saved-filters: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leads/saved-filters/<int:filter_id>', methods=['DELETE'])
+def delete_saved_filter(filter_id):
+    """Delete a saved filter (owner only)"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute(
+                'DELETE FROM saved_filters WHERE id = %s AND user_id = %s RETURNING id',
+                (filter_id, user_id)
+            )
+            deleted = c.fetchone()
+            if not deleted:
+                return jsonify({'error': 'Filter not found'}), 404
+            conn.commit()
+            return jsonify({'deleted': True}), 200
+    except Exception as e:
+        print(f'[ERROR] DELETE /api/leads/saved-filters/{filter_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 # ============= Export for Marketing =============
 
 @app.route('/api/leads/export', methods=['GET'])
@@ -7838,6 +8214,20 @@ def export_leads():
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
 
+    # SaaS: Check export limit
+    plan = _get_user_plan(user_id)
+    limits = _get_plan_limits(plan)
+    usage = _get_usage_stats(user_id)
+
+    if usage['leads_exported'] >= limits['exports_per_month']:
+        return jsonify({
+            'error': f'Export limit reached for {plan} plan',
+            'limit': limits['exports_per_month'],
+            'used': usage['leads_exported'],
+            'plan': plan,
+            'message': f'You have reached your monthly export limit ({limits["exports_per_month"]} exports). Upgrade your plan to export more.'
+        }), 403
+
     fmt = request.args.get('format', 'csv').strip().lower()
     if fmt not in ('csv', 'mailchimp', 'whatsapp', 'whatsapp_txt', 'vcard', 'json'):
         return jsonify({'error': 'Invalid format. Use: csv, mailchimp, whatsapp, whatsapp_txt, vcard, json'}), 400
@@ -7849,8 +8239,9 @@ def export_leads():
     batch_id = request.args.get('batch_id', '').strip()
     ids = request.args.get('ids', '').strip()
 
-    query = LEADS_SELECT
-    params = [user_id]
+    # Semana 4: export from shared base
+    query = SHARED_LEADS_SELECT
+    params = []
 
     if ids:
         id_list = [int(x) for x in ids.split(',') if x.strip().isdigit()]
@@ -7888,6 +8279,9 @@ def export_leads():
 
     if not leads:
         return jsonify({'error': 'No leads to export'}), 404
+
+    # SaaS: Increment export counter
+    _increment_usage(user_id, 'leads_exported', 1)
 
     # --- Format: CSV (generic, all fields) ---
     if fmt == 'csv':
@@ -8049,10 +8443,195 @@ EMAIL;TYPE=INTERNET:{l.get('email', '')}'''
             headers={'Content-Disposition': 'attachment; filename=leads_export.json'}
         )
 
+
+# ============= Send Leads to CRM (Extrator → DIAX CRM) =============
+
+@app.route('/api/leads/send-to-crm', methods=['POST'])
+@limiter.limit("10/minute")
+def send_leads_to_crm():
+    """
+    Send selected leads or filtered leads to DIAX CRM.
+    Accepts lead_ids, filters, CRM URL and token.
+    Returns: {success, sent_count, failed_count, errors}
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    lead_ids = data.get('lead_ids', [])
+    filters = data.get('filters', {})
+    crm_api_url = data.get('crm_api_url', '').strip()
+    crm_auth_token = data.get('crm_auth_token', '').strip()
+
+    # Validation
+    if not crm_api_url or not crm_auth_token:
+        return jsonify({'success': False, 'error': 'CRM URL and token are required'}), 400
+
+    # SSRF Prevention: validate CRM URL
+    parsed = urlparse(crm_api_url)
+    hostname = parsed.hostname or ''
+    if not (hostname == 'localhost' or hostname == '127.0.0.1' or parsed.scheme == 'https'):
+        return jsonify({
+            'success': False,
+            'error': 'Invalid CRM URL. Only http://localhost, http://127.0.0.1, or https:// URLs are allowed'
+        }), 400
+
+    # Build query to fetch leads
+    query = SHARED_LEADS_SELECT
+    params = []
+
+    if lead_ids:
+        id_list = [int(x) for x in lead_ids if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
+        if id_list:
+            query += f' AND l.id IN ({",".join(["%s"] * len(id_list))})'
+            params.extend(id_list)
+    else:
+        # Apply filters if no specific lead_ids
+        search = filters.get('search', '').strip()
+        status = filters.get('status', '').strip()
+        tag = filters.get('tag', '').strip()
+        city = filters.get('city', '').strip()
+        state = filters.get('state', '').strip()
+
+        if search:
+            query += ''' AND (l.company_name ILIKE %s OR l.email ILIKE %s
+                         OR l.phone ILIKE %s OR l.website ILIKE %s
+                         OR l.contact_name ILIKE %s OR l.cnpj ILIKE %s)'''
+            like = f'%{search}%'
+            params.extend([like, like, like, like, like, like])
+
+        if status and status in CRM_STATUSES:
+            query += ' AND l.crm_status = %s'
+            params.append(status)
+
+        if tag:
+            query += ' AND l.tags ILIKE %s'
+            params.append(f'%{tag}%')
+
+        if city:
+            query += ' AND l.city ILIKE %s'
+            params.append(f'%{city}%')
+
+        if state:
+            query += ' AND l.state ILIKE %s'
+            params.append(f'%{state}%')
+
+    query += ' ORDER BY l.extracted_at DESC LIMIT 500'
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(query, params)
+        rows = c.fetchall()
+
+    if not rows:
+        return jsonify({
+            'success': False,
+            'error': 'No leads found matching criteria',
+            'sent_count': 0,
+            'failed_count': 0
+        }), 404
+
+    leads = [lead_row_to_dict(row) for row in rows]
+
+    # Deduplicate by email
+    seen_emails = {}
+    unique_leads = []
+    for lead in leads:
+        email = (lead.get('email') or '').strip().lower()
+        if email and email not in seen_emails:
+            seen_emails[email] = True
+            unique_leads.append(lead)
+
+    if not unique_leads:
+        return jsonify({
+            'success': False,
+            'error': 'No leads with valid emails found',
+            'sent_count': 0,
+            'failed_count': 0
+        }), 404
+
+    # Format leads for CRM API
+    customers = []
+    for lead in unique_leads:
+        contact_name = lead.get('contact_name') or lead.get('company_name') or 'Lead'
+        email = (lead.get('email') or '').strip()
+        phone = lead.get('phone') or None
+        whatsapp = lead.get('whatsapp') or None
+        company_name = lead.get('company_name') or 'N/A'
+        tags = lead.get('tags') or ''
+        notes = lead.get('notes') or ''
+
+        # Combine notes with tags for the CRM notes field
+        combined_notes = f"{notes}{',' if notes and tags else ''}{tags}"
+
+        customer = {
+            'name': contact_name[:100],  # Limit to 100 chars
+            'email': email,
+            'phone': phone,
+            'whatsApp': whatsapp,
+            'companyName': company_name[:100],
+            'notes': combined_notes[:500] if combined_notes else '',
+            'tags': tags
+        }
+        customers.append(customer)
+
+    # Send to CRM API
+    payload = {
+        'customers': customers,
+        'source': 'ExtractorImport'
+    }
+
+    headers = {
+        'Authorization': f'Bearer {crm_auth_token}',
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        crm_endpoint = f'{crm_api_url}/api/v1/customers/import'
+        response = http_requests.post(
+            crm_endpoint,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        if response.status_code in [200, 201, 202]:
+            result = response.json()
+            sent_count = result.get('created', len(customers))
+            failed_count = result.get('failed', 0)
+            return jsonify({
+                'success': True,
+                'sent_count': sent_count,
+                'failed_count': failed_count,
+                'total_leads': len(unique_leads),
+                'message': f'Successfully sent {sent_count} leads to CRM'
+            }), 200
+        else:
+            error_msg = response.text[:200] if response.text else f'HTTP {response.status_code}'
+            return jsonify({
+                'success': False,
+                'error': f'CRM API error: {error_msg}',
+                'sent_count': 0,
+                'failed_count': len(unique_leads)
+            }), response.status_code
+
+    except Exception as e:
+        error_str = str(e)[:200]
+        print(f"[SEND_TO_CRM] Error: {error_str}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to send leads to CRM: {error_str}',
+            'sent_count': 0,
+            'failed_count': len(unique_leads)
+        }), 500
+
+
 @app.route('/api/analytics', methods=['GET'])
 @limiter.limit("30/minute")
 def get_analytics():
-    """Dashboard analytics: stats, trends, quality metrics."""
+    """Dashboard analytics: shared base metrics for SaaS clients."""
     token = get_auth_header()
     user_id = verify_token(token)
 
@@ -8062,105 +8641,104 @@ def get_analytics():
     with get_db() as conn:
         c = conn.cursor()
 
-        # Total leads (from batches)
-        c.execute('SELECT COALESCE(SUM(total_leads), 0) FROM batches WHERE user_id = %s', (user_id,))
-        total_batch_leads = c.fetchone()[0]
-
-        # Total leads from individual jobs
-        c.execute('SELECT COALESCE(SUM(results_count), 0) FROM jobs WHERE user_id = %s', (user_id,))
-        total_job_leads = c.fetchone()[0]
-
-        total_leads = total_batch_leads + total_job_leads
-
-        # Total batches
-        c.execute('SELECT COUNT(*) FROM batches WHERE user_id = %s', (user_id,))
-        total_batches = c.fetchone()[0]
-
-        # Completed vs failed batches
-        c.execute("SELECT COUNT(*) FROM batches WHERE user_id = %s AND status = 'completed'", (user_id,))
-        completed_batches = c.fetchone()[0]
-
-        c.execute("SELECT COUNT(*) FROM batches WHERE user_id = %s AND status = 'failed'", (user_id,))
-        failed_batches = c.fetchone()[0]
-
-        # Unique emails from leads table
-        c.execute('''SELECT COUNT(DISTINCT l.email) FROM leads l
+        # Total leads in shared base
+        c.execute('''SELECT COUNT(*) FROM leads l
                      JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s''', (user_id,))
-        unique_emails = c.fetchone()[0]
+                     WHERE b.is_shared = TRUE''')
+        total_leads = c.fetchone()[0]
 
-        # Leads this week
+        # Average lead score
+        c.execute('''SELECT COALESCE(AVG(COALESCE(l.lead_score, 0)), 0) FROM leads l
+                     JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.lead_score IS NOT NULL AND l.lead_score > 0''')
+        avg_score = round(float(c.fetchone()[0]), 1)
+
+        # Total distinct cities
+        c.execute('''SELECT COUNT(DISTINCT TRIM(l.city)) FROM leads l
+                     JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.city IS NOT NULL AND l.city != '' ''')
+        total_cities = c.fetchone()[0]
+
+        # Total distinct categories
+        c.execute('''SELECT COUNT(DISTINCT TRIM(l.category)) FROM leads l
+                     JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.category IS NOT NULL AND l.category != '' ''')
+        total_categories = c.fetchone()[0]
+
+        # Leads added this week
         week_ago = datetime.now() - timedelta(days=7)
         c.execute('''SELECT COUNT(*) FROM leads l
                      JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s AND l.extracted_at >= %s''', (user_id, week_ago))
+                     WHERE b.is_shared = TRUE AND l.extracted_at >= %s''', (week_ago,))
         leads_this_week = c.fetchone()[0]
 
-        # Leads this month
-        month_ago = datetime.now() - timedelta(days=30)
-        c.execute('''SELECT COUNT(*) FROM leads l
-                     JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s AND l.extracted_at >= %s''', (user_id, month_ago))
-        leads_this_month = c.fetchone()[0]
-
-        # Leads by day (last 30 days) - for LineChart
-        c.execute('''SELECT DATE(l.extracted_at) as day, COUNT(*) as count
+        # Top cities (top 8)
+        c.execute('''SELECT TRIM(l.city) as city, COUNT(*) as cnt
                      FROM leads l JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s AND l.extracted_at >= %s
-                     GROUP BY DATE(l.extracted_at) ORDER BY day''', (user_id, month_ago))
-        leads_by_day_raw = c.fetchall()
+                     WHERE b.is_shared = TRUE AND l.city IS NOT NULL AND l.city != ''
+                     GROUP BY TRIM(l.city) ORDER BY cnt DESC LIMIT 8''')
+        top_cities = [{'name': row[0], 'count': row[1]} for row in c.fetchall()]
 
-        # Fill missing days with 0
-        leads_by_day = []
-        day_map = {row[0].isoformat(): row[1] for row in leads_by_day_raw}
-        for i in range(30, -1, -1):
-            d = (datetime.now() - timedelta(days=i)).date()
-            leads_by_day.append({'date': d.isoformat(), 'leads': day_map.get(d.isoformat(), 0)})
+        # Top states (top 8)
+        c.execute('''SELECT TRIM(l.state) as state, COUNT(*) as cnt
+                     FROM leads l JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.state IS NOT NULL AND l.state != ''
+                     GROUP BY TRIM(l.state) ORDER BY cnt DESC LIMIT 8''')
+        top_states = [{'name': row[0], 'count': row[1]} for row in c.fetchall()]
 
-        # Top batches by leads (top 10) - for BarChart
-        c.execute('''SELECT name, total_leads FROM batches
-                     WHERE user_id = %s AND total_leads > 0
-                     ORDER BY total_leads DESC LIMIT 10''', (user_id,))
-        top_batches = [{'name': row[0][:30], 'leads': row[1]} for row in c.fetchall()]
+        # Top categories (top 8)
+        c.execute('''SELECT TRIM(l.category) as cat, COUNT(*) as cnt
+                     FROM leads l JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.category IS NOT NULL AND l.category != ''
+                     GROUP BY TRIM(l.category) ORDER BY cnt DESC LIMIT 8''')
+        top_categories = [{'name': row[0], 'count': row[1]} for row in c.fetchall()]
 
-        # Data quality: leads with email only, with phone, with both
+        # Latest leads (10 most recent)
+        c.execute('''SELECT l.id, l.company_name, l.email, l.city, l.state,
+                            l.category, COALESCE(l.lead_score, 0) as lead_score, l.extracted_at
+                     FROM leads l JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE
+                     ORDER BY l.extracted_at DESC LIMIT 10''')
+        latest_rows = c.fetchall()
+        latest_leads = [
+            {
+                'id': row[0],
+                'company_name': row[1] or '',
+                'email': row[2] or '',
+                'city': row[3] or '',
+                'state': row[4] or '',
+                'category': row[5] or '',
+                'lead_score': row[6],
+                'extracted_at': row[7].isoformat() if row[7] else '',
+            }
+            for row in latest_rows
+        ]
+
+        # Score distribution
         c.execute('''SELECT
-                       COUNT(*) FILTER (WHERE l.phone IS NOT NULL AND l.phone != '') as with_phone,
-                       COUNT(*) FILTER (WHERE l.phone IS NULL OR l.phone = '') as email_only,
-                       COUNT(*) FILTER (WHERE l.whatsapp IS NOT NULL AND l.whatsapp != '') as with_whatsapp,
-                       COUNT(*) FILTER (WHERE l.cnpj IS NOT NULL AND l.cnpj != '') as with_cnpj,
-                       COUNT(*) FILTER (WHERE l.instagram IS NOT NULL AND l.instagram != ''
-                                        OR l.facebook IS NOT NULL AND l.facebook != ''
-                                        OR l.linkedin IS NOT NULL AND l.linkedin != '') as with_social
+                       COUNT(*) FILTER (WHERE COALESCE(l.lead_score, 0) >= 70) as high,
+                       COUNT(*) FILTER (WHERE COALESCE(l.lead_score, 0) >= 40 AND COALESCE(l.lead_score, 0) < 70) as medium,
+                       COUNT(*) FILTER (WHERE COALESCE(l.lead_score, 0) < 40) as low
                      FROM leads l JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s''', (user_id,))
-        quality_row = c.fetchone()
-        with_phone = quality_row[0] if quality_row else 0
-        email_only = quality_row[1] if quality_row else 0
-        with_whatsapp = quality_row[2] if quality_row else 0
-        with_cnpj = quality_row[3] if quality_row else 0
-        with_social = quality_row[4] if quality_row else 0
-
-    success_rate = round((completed_batches / total_batches * 100)) if total_batches > 0 else 0
+                     WHERE b.is_shared = TRUE''')
+        score_row = c.fetchone()
+        score_distribution = {
+            'high': score_row[0] if score_row else 0,
+            'medium': score_row[1] if score_row else 0,
+            'low': score_row[2] if score_row else 0,
+        }
 
     return jsonify({
         'total_leads': total_leads,
-        'total_batches': total_batches,
-        'unique_emails': unique_emails,
+        'avg_score': avg_score,
+        'total_cities': total_cities,
+        'total_categories': total_categories,
         'leads_this_week': leads_this_week,
-        'leads_this_month': leads_this_month,
-        'completed_batches': completed_batches,
-        'failed_batches': failed_batches,
-        'success_rate': success_rate,
-        'leads_by_day': leads_by_day,
-        'top_batches': top_batches,
-        'data_quality': {
-            'with_phone': with_phone,
-            'email_only': email_only,
-            'with_whatsapp': with_whatsapp,
-            'with_cnpj': with_cnpj,
-            'with_social': with_social,
-        },
+        'top_cities': top_cities,
+        'top_states': top_states,
+        'top_categories': top_categories,
+        'latest_leads': latest_leads,
+        'score_distribution': score_distribution,
     })
 
 @app.route('/api/batch/<int:batch_id>', methods=['DELETE'])
@@ -8275,6 +8853,8 @@ def start_massive_search():
     # Todos os métodos ativos por padrão
     methods = data.get('methods', ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin'])
     max_pages = min(3, max(1, int(data.get('max_pages', 2))))
+    # Semana 7: admin draft mode — batch starts unpublished (is_shared=FALSE)
+    is_draft = bool(data.get('is_draft', False))
 
     if not niches or len(niches) == 0:
         return jsonify({'error': 'Pelo menos um nicho é obrigatório'}), 400
@@ -8323,9 +8903,10 @@ def start_massive_search():
         if 'local_business_data' in methods:
             total_jobs += min(5, len(niches)) * min(3, len(cities_to_search))
 
+        is_shared_val = not is_draft  # draft → is_shared=FALSE; normal → TRUE
         c.execute(
-            'INSERT INTO batches (user_id, name, status, total_urls, created_at) VALUES (%s, %s, %s, %s, %s) RETURNING id',
-            (user_id, batch_name, 'pending', total_jobs, datetime.now())
+            'INSERT INTO batches (user_id, name, status, total_urls, created_at, is_shared) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id',
+            (user_id, batch_name, 'pending', total_jobs, datetime.now(), is_shared_val)
         )
         batch_id = c.fetchone()[0]
 
@@ -10957,6 +11538,497 @@ def crm_refine():
 
     threading.Thread(target=_run_refine, daemon=True).start()
     return jsonify({'message': 'Refinamento CRM iniciado em background', 'status': 'running'}), 202
+
+
+# ============= SaaS: Usage Tracking & Plan Management =============
+
+def _get_current_month_year():
+    """Return current month in 'YYYY-MM' format"""
+    return datetime.now().strftime('%Y-%m')
+
+def _reset_monthly_usage(user_id):
+    """Reset usage tracking for current month if entry doesn't exist"""
+    month_year = _get_current_month_year()
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT id FROM usage_tracking WHERE user_id = %s AND month_year = %s',
+            (user_id, month_year)
+        )
+        if not c.fetchone():
+            c.execute(
+                'INSERT INTO usage_tracking (user_id, month_year, leads_viewed, leads_exported, reset_at) VALUES (%s, %s, 0, 0, %s)',
+                (user_id, month_year, datetime.now())
+            )
+
+def _get_user_plan(user_id):
+    """Get user's current plan (free/pro/enterprise)"""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT plan FROM users WHERE id = %s', (user_id,))
+        result = c.fetchone()
+        return result[0] if result else 'free'
+
+def _get_plan_limits(plan_name):
+    """Get limits for a given plan"""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT leads_per_month, exports_per_month, price_monthly, features FROM plan_limits WHERE plan_name = %s',
+            (plan_name,)
+        )
+        result = c.fetchone()
+        if result:
+            return {
+                'leads_per_month': result[0],
+                'exports_per_month': result[1],
+                'price_monthly': float(result[2]) if result[2] else 0,
+                'features': result[3] if result[3] else {}
+            }
+        return None
+
+def _get_usage_stats(user_id):
+    """Get current month usage stats for a user"""
+    month_year = _get_current_month_year()
+    _reset_monthly_usage(user_id)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT leads_viewed, leads_exported FROM usage_tracking WHERE user_id = %s AND month_year = %s',
+            (user_id, month_year)
+        )
+        result = c.fetchone()
+        return {
+            'leads_viewed': result[0] if result else 0,
+            'leads_exported': result[1] if result else 0,
+            'month_year': month_year
+        }
+
+def _increment_usage(user_id, field='leads_viewed', amount=1):
+    """Increment usage counter (leads_viewed or leads_exported)"""
+    month_year = _get_current_month_year()
+    _reset_monthly_usage(user_id)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        if field == 'leads_viewed':
+            c.execute(
+                'UPDATE usage_tracking SET leads_viewed = leads_viewed + %s WHERE user_id = %s AND month_year = %s',
+                (amount, user_id, month_year)
+            )
+        elif field == 'leads_exported':
+            c.execute(
+                'UPDATE usage_tracking SET leads_exported = leads_exported + %s WHERE user_id = %s AND month_year = %s',
+                (amount, user_id, month_year)
+            )
+
+@app.route('/api/client/usage', methods=['GET'])
+@limiter.limit("30/minute")
+def client_usage():
+    """Get client's plan and current usage stats"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        plan = _get_user_plan(user_id)
+        limits = _get_plan_limits(plan)
+        usage = _get_usage_stats(user_id)
+
+        return jsonify({
+            'plan': plan,
+            'limits': limits,
+            'usage': usage,
+            'usage_percent': {
+                'leads': (usage['leads_viewed'] / limits['leads_per_month'] * 100) if limits['leads_per_month'] > 0 else 0,
+                'exports': (usage['leads_exported'] / limits['exports_per_month'] * 100) if limits['exports_per_month'] > 0 else 0
+            }
+        }), 200
+    except Exception as e:
+        print(f'[ERROR] /api/client/usage: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/users', methods=['GET'])
+@limiter.limit("30/minute")
+def admin_users():
+    """Get all users and their plans (admin only)"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        # Check if user is admin
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (user_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            # Get all users with their plans
+            c.execute('SELECT id, username, plan, created_at, is_admin FROM users ORDER BY created_at DESC')
+            users = []
+            for row in c.fetchall():
+                usage = _get_usage_stats(row[0])
+                limits = _get_plan_limits(row[2])
+                users.append({
+                    'id': row[0],
+                    'username': row[1],
+                    'plan': row[2],
+                    'created_at': row[3].isoformat() if row[3] else None,
+                    'is_admin': bool(row[4]),
+                    'usage': usage,
+                    'limits': limits
+                })
+
+            return jsonify({'users': users, 'total': len(users)}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/users: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/summary', methods=['GET'])
+@limiter.limit("30/minute")
+def admin_summary():
+    """Quick summary stats for the admin home page."""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            c.execute('SELECT COUNT(*) FROM users')
+            total_users = c.fetchone()[0]
+
+            c.execute('SELECT COUNT(*) FROM users WHERE is_admin = TRUE')
+            total_admins = c.fetchone()[0]
+
+            c.execute('SELECT plan, COUNT(*) FROM users GROUP BY plan')
+            users_by_plan = {row[0]: row[1] for row in c.fetchall()}
+
+            c.execute('''SELECT COUNT(*) FROM leads l
+                         JOIN batches b ON l.batch_id = b.id
+                         WHERE b.is_shared = TRUE''')
+            total_leads = c.fetchone()[0]
+
+            # Leads added this week
+            week_ago = datetime.now() - timedelta(days=7)
+            c.execute('''SELECT COUNT(*) FROM leads l
+                         JOIN batches b ON l.batch_id = b.id
+                         WHERE b.is_shared = TRUE AND l.extracted_at >= %s''', (week_ago,))
+            leads_this_week = c.fetchone()[0]
+
+        return jsonify({
+            'total_users': total_users,
+            'total_admins': total_admins,
+            'total_customers': total_users - total_admins,
+            'users_by_plan': users_by_plan,
+            'total_leads': total_leads,
+            'leads_this_week': leads_this_week,
+        }), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/summary: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/batches', methods=['GET'])
+@limiter.limit("30/minute")
+def admin_list_batches():
+    """List all batches (admin only) — for the admin base-management view."""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            c.execute('''
+                SELECT b.id, b.name, b.status, b.total_urls, b.processed_urls,
+                       b.total_leads, b.created_at, b.finished_at, b.is_shared,
+                       COUNT(l.id) as lead_count
+                FROM batches b
+                LEFT JOIN leads l ON l.batch_id = b.id
+                GROUP BY b.id, b.name, b.status, b.total_urls, b.processed_urls,
+                         b.total_leads, b.created_at, b.finished_at, b.is_shared
+                ORDER BY b.created_at DESC
+                LIMIT 50
+            ''')
+            batches = []
+            for row in c.fetchall():
+                batches.append({
+                    'id': row[0],
+                    'name': row[1],
+                    'status': row[2],
+                    'total_urls': row[3],
+                    'processed_urls': row[4],
+                    'total_leads': row[5],
+                    'created_at': row[6].isoformat() if row[6] else None,
+                    'finished_at': row[7].isoformat() if row[7] else None,
+                    'is_shared': bool(row[8]) if row[8] is not None else True,
+                    'lead_count': row[9],
+                })
+            return jsonify({'batches': batches}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/batches: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/batches/<int:batch_id>/publish', methods=['PUT'])
+@limiter.limit("30/minute")
+def admin_publish_batch(batch_id):
+    """Publish a batch to the shared base (admin only)."""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+            c.execute('UPDATE batches SET is_shared = TRUE WHERE id = %s', (batch_id,))
+            if c.rowcount == 0:
+                return jsonify({'error': 'Batch not found'}), 404
+            return jsonify({'success': True, 'batch_id': batch_id, 'is_shared': True}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/batches/{batch_id}/publish: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/batches/<int:batch_id>/unpublish', methods=['PUT'])
+@limiter.limit("30/minute")
+def admin_unpublish_batch(batch_id):
+    """Remove a batch from the shared base (admin only)."""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+            c.execute('UPDATE batches SET is_shared = FALSE WHERE id = %s', (batch_id,))
+            if c.rowcount == 0:
+                return jsonify({'error': 'Batch not found'}), 404
+            return jsonify({'success': True, 'batch_id': batch_id, 'is_shared': False}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/batches/{batch_id}/unpublish: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/users/<int:user_id>/plan', methods=['PUT'])
+@limiter.limit("30/minute")
+def admin_update_user_plan(user_id):
+    """Update a user's plan (admin only)"""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        # Check if requester is admin
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            # Validate new plan exists
+            data = request.get_json() or {}
+            new_plan = data.get('plan', 'free').lower()
+
+            c.execute('SELECT plan_name FROM plan_limits WHERE plan_name = %s', (new_plan,))
+            if not c.fetchone():
+                return jsonify({'error': f'Invalid plan: {new_plan}'}), 400
+
+            # Update user's plan
+            c.execute('UPDATE users SET plan = %s WHERE id = %s', (new_plan, user_id))
+
+            return jsonify({'message': f'User {user_id} plan updated to {new_plan}', 'new_plan': new_plan}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/users/{user_id}/plan: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/plans', methods=['GET'])
+@limiter.limit("30/minute")
+def admin_plans():
+    """Get all available plans (admin only)"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        # Check if user is admin
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (user_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            # Get all plans
+            c.execute('SELECT plan_name, leads_per_month, exports_per_month, price_monthly, features FROM plan_limits ORDER BY price_monthly ASC')
+            plans = []
+            for row in c.fetchall():
+                plans.append({
+                    'name': row[0],
+                    'leads_per_month': row[1],
+                    'exports_per_month': row[2],
+                    'price_monthly': float(row[3]) if row[3] else 0,
+                    'features': row[4] if row[4] else {}
+                })
+
+            return jsonify({'plans': plans}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/plans: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/plans-stats', methods=['GET'])
+def admin_plans_stats():
+    """Get plans with user counts (admin only)"""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            c.execute('''
+                SELECT
+                    pl.plan_name,
+                    pl.leads_per_month,
+                    pl.exports_per_month,
+                    pl.price_monthly,
+                    pl.features,
+                    COUNT(u.id) AS user_count
+                FROM plan_limits pl
+                LEFT JOIN users u ON u.plan = pl.plan_name
+                GROUP BY pl.plan_name, pl.leads_per_month, pl.exports_per_month, pl.price_monthly, pl.features
+                ORDER BY pl.price_monthly ASC
+            ''')
+            plans = []
+            for row in c.fetchall():
+                plans.append({
+                    'name': row[0],
+                    'leads_per_month': row[1],
+                    'exports_per_month': row[2],
+                    'price_monthly': float(row[3]) if row[3] else 0,
+                    'features': row[4] if row[4] else {},
+                    'user_count': row[5]
+                })
+
+            return jsonify({'plans': plans}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/plans-stats: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/plans/<plan_name>', methods=['PUT'])
+def admin_update_plan(plan_name):
+    """Update plan limits (admin only)"""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            # Validate plan name
+            valid_plans = ['free', 'pro', 'enterprise']
+            if plan_name not in valid_plans:
+                return jsonify({'error': 'Invalid plan name'}), 400
+
+            data = request.json or {}
+            allowed_fields = ['leads_per_month', 'exports_per_month', 'price_monthly']
+            updates = {k: v for k, v in data.items() if k in allowed_fields}
+
+            if not updates:
+                return jsonify({'error': 'No valid fields to update'}), 400
+
+            set_clause = ', '.join([f'{k} = %s' for k in updates.keys()])
+            values = list(updates.values()) + [plan_name]
+            c.execute(f'UPDATE plan_limits SET {set_clause} WHERE plan_name = %s', values)
+            conn.commit()
+
+            # Return updated plan
+            c.execute('SELECT plan_name, leads_per_month, exports_per_month, price_monthly, features FROM plan_limits WHERE plan_name = %s', (plan_name,))
+            row = c.fetchone()
+            if not row:
+                return jsonify({'error': 'Plan not found'}), 404
+
+            return jsonify({
+                'plan': {
+                    'name': row[0],
+                    'leads_per_month': row[1],
+                    'exports_per_month': row[2],
+                    'price_monthly': float(row[3]) if row[3] else 0,
+                    'features': row[4] if row[4] else {}
+                }
+            }), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/plans/{plan_name}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/users/<int:target_id>/reset-usage', methods=['POST'])
+@limiter.limit("30/minute")
+def admin_reset_user_usage(target_id):
+    """Reset current month usage for a user (admin only)"""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            month_year = _get_current_month_year()
+            c.execute(
+                '''INSERT INTO usage_tracking (user_id, month_year, leads_viewed, leads_exported, reset_at)
+                   VALUES (%s, %s, 0, 0, %s)
+                   ON CONFLICT (user_id, month_year)
+                   DO UPDATE SET leads_viewed = 0, leads_exported = 0, reset_at = %s''',
+                (target_id, month_year, datetime.now(), datetime.now())
+            )
+            return jsonify({'message': f'Usage reset for user {target_id}', 'month_year': month_year}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/users/{target_id}/reset-usage: {e}')
+        return jsonify({'error': str(e)}), 500
 
 
 # ============= Scheduler Setup =============

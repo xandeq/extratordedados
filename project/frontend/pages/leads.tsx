@@ -6,7 +6,8 @@ import {
   Tag, Filter, Mail, Phone, Building2, MessageCircle,
   Instagram, Facebook, Linkedin, ExternalLink, MoreHorizontal,
   Users, ArrowUpDown, Download, Trash2, Sparkles, CheckCircle2,
-  AlertCircle, XCircle, Copy, BadgeCheck, RefreshCw
+  AlertCircle, XCircle, Copy, BadgeCheck, RefreshCw, Lock,
+  Bookmark, BookmarkCheck, ChevronDown, X as XIcon
 } from 'lucide-react'
 import api from '../lib/api'
 import { useToast } from '../components/Toast'
@@ -15,8 +16,10 @@ import LoadingSkeleton from '../components/LoadingSkeleton'
 import EmptyState from '../components/EmptyState'
 import LeadDrawer from '../components/LeadDrawer'
 import ExportModal from '../components/ExportModal'
+import UpgradeModal from '../components/UpgradeModal'
 import InfoBox from '../components/InfoBox'
 import Tooltip from '../components/Tooltip'
+import { useClientPlan } from '../lib/useClientPlan'
 
 interface Lead {
   id: number
@@ -43,6 +46,7 @@ interface Lead {
   contact_name: string
   batch_name: string
   batch_id: number
+  lead_score: number
 }
 
 const CRM_STATUSES = [
@@ -61,11 +65,27 @@ const SORT_OPTIONS = [
   { value: 'company', label: 'Empresa A-Z' },
   { value: 'status', label: 'Status' },
   { value: 'updated', label: 'Atualizados' },
+  { value: 'score', label: 'Melhor score' },
 ]
+
+function ScoreBadge({ score }: { score: number }) {
+  const pct = score ?? 0
+  const color = pct >= 70
+    ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
+    : pct >= 40
+      ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400'
+      : 'bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400'
+  return (
+    <span className={`inline-flex items-center justify-center w-10 h-6 rounded-full text-xs font-semibold tabular-nums ${color}`}>
+      {pct}
+    </span>
+  )
+}
 
 export default function Leads() {
   const router = useRouter()
   const { addToast } = useToast()
+  const { plan, canViewLeads, canExport, usage, limits } = useClientPlan()
 
   const [leads, setLeads] = useState<Lead[]>([])
   const [loading, setLoading] = useState(true)
@@ -99,6 +119,28 @@ export default function Leads() {
   // Export
   const [showExport, setShowExport] = useState(false)
 
+  // Send to CRM
+  const [showSendToCrmModal, setShowSendToCrmModal] = useState(false)
+  const [crmApiUrl, setCrmApiUrl] = useState('')
+  const [crmAuthToken, setCrmAuthToken] = useState('')
+  const [sendingToCrm, setSendingToCrm] = useState(false)
+  const [crmSyncResult, setCrmSyncResult] = useState<{
+    success: boolean
+    sent_count?: number
+    failed_count?: number
+    message?: string
+    error?: string
+  } | null>(null)
+
+  // Upgrade Modal
+  const [showUpgrade, setShowUpgrade] = useState(false)
+  const [upgradeReason, setUpgradeReason] = useState<'export' | 'filters' | 'generic'>('generic')
+
+  const triggerUpgrade = (reason: 'export' | 'filters' | 'generic') => {
+    setUpgradeReason(reason)
+    setShowUpgrade(true)
+  }
+
   // Tag input modal (replaces prompt())
   const [showTagInput, setShowTagInput] = useState(false)
   const [tagInputValue, setTagInputValue] = useState('')
@@ -123,6 +165,20 @@ export default function Leads() {
   const [deletingAll, setDeletingAll] = useState(false)
 
 
+  // Saved Filters
+  interface SavedFilter {
+    id: number
+    name: string
+    filters: { search?: string; status?: string; tag?: string; city?: string; state?: string; sort?: string }
+    created_at: string
+  }
+  const [savedFilters, setSavedFilters] = useState<SavedFilter[]>([])
+  const [activeFilterId, setActiveFilterId] = useState<number | null>(null)
+  const [showSavedFilters, setShowSavedFilters] = useState(false)
+  const [showSaveModal, setShowSaveModal] = useState(false)
+  const [saveFilterName, setSaveFilterName] = useState('')
+  const [savingFilter, setSavingFilter] = useState(false)
+
   // Sanitize
   const [sanitizing, setSanitizing] = useState(false)
   const [sanitizeReport, setSanitizeReport] = useState<{
@@ -139,16 +195,26 @@ export default function Leads() {
   const tagInputRef = useRef<HTMLInputElement>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
 
+  // Close saved filters dropdown on outside click
+  useEffect(() => {
+    if (!showSavedFilters) return
+    const handler = () => setShowSavedFilters(false)
+    document.addEventListener('click', handler)
+    return () => document.removeEventListener('click', handler)
+  }, [showSavedFilters])
+
   // Listen for global Esc (close modal event from Layout shortcuts)
   useEffect(() => {
     const handler = () => {
+      if (showSaveModal) { setShowSaveModal(false); return }
       if (showTagInput) { setShowTagInput(false); return }
       if (showExport) { setShowExport(false); return }
+      if (showSendToCrmModal) { setShowSendToCrmModal(false); setCrmSyncResult(null); return }
       if (drawerLead) { setDrawerLead(null); return }
     }
     window.addEventListener('app:close-modal', handler)
     return () => window.removeEventListener('app:close-modal', handler)
-  }, [showTagInput, showExport, drawerLead])
+  }, [showSaveModal, showTagInput, showExport, showSendToCrmModal, drawerLead])
 
   // Auto-focus tag input when shown
   useEffect(() => {
@@ -218,6 +284,87 @@ export default function Leads() {
   }, [page, sort, searchDebounced, statusFilter, tagFilter, cityFilter, stateFilter])
 
   useEffect(() => { fetchLeads() }, [fetchLeads])
+
+  const fetchSavedFilters = useCallback(async () => {
+    try {
+      const res = await api.get('/api/leads/saved-filters')
+      setSavedFilters(res.data.filters || [])
+    } catch {
+      // silently fail — plan may not allow saved filters
+    }
+  }, [])
+
+  useEffect(() => { fetchSavedFilters() }, [fetchSavedFilters])
+
+  const hasActiveFilters = search || statusFilter || tagFilter || cityFilter || stateFilter || sort !== 'newest'
+
+  const applyFilter = (sf: SavedFilter) => {
+    setSearch(sf.filters.search || '')
+    setSearchDebounced(sf.filters.search || '')
+    setStatusFilter(sf.filters.status || '')
+    setTagFilter(sf.filters.tag || '')
+    setCityFilter(sf.filters.city || '')
+    setStateFilter(sf.filters.state || '')
+    setSort(sf.filters.sort || 'newest')
+    setActiveFilterId(sf.id)
+    setShowSavedFilters(false)
+    setPage(1)
+  }
+
+  const clearAllFilters = () => {
+    setSearch('')
+    setSearchDebounced('')
+    setStatusFilter('')
+    setTagFilter('')
+    setCityFilter('')
+    setStateFilter('')
+    setSort('newest')
+    setActiveFilterId(null)
+    setPage(1)
+  }
+
+  const handleSaveFilter = async () => {
+    if (!saveFilterName.trim()) return
+    setSavingFilter(true)
+    try {
+      await api.post('/api/leads/saved-filters', {
+        name: saveFilterName.trim(),
+        filters: {
+          search: searchDebounced || undefined,
+          status: statusFilter || undefined,
+          tag: tagFilter || undefined,
+          city: cityFilter || undefined,
+          state: stateFilter || undefined,
+          sort: sort !== 'newest' ? sort : undefined,
+        }
+      })
+      addToast(`Filtro "${saveFilterName.trim()}" salvo`, 'success')
+      setShowSaveModal(false)
+      setSaveFilterName('')
+      fetchSavedFilters()
+    } catch (err: unknown) {
+      const msg = (err as any)?.response?.data?.error
+      if ((err as any)?.response?.data?.upgrade_required) {
+        setShowSaveModal(false)
+        setSaveFilterName('')
+        triggerUpgrade('filters')
+      } else {
+        addToast(msg || 'Erro ao salvar filtro', 'error')
+      }
+    } finally {
+      setSavingFilter(false)
+    }
+  }
+
+  const handleDeleteFilter = async (id: number) => {
+    try {
+      await api.delete(`/api/leads/saved-filters/${id}`)
+      if (activeFilterId === id) setActiveFilterId(null)
+      fetchSavedFilters()
+    } catch {
+      addToast('Erro ao excluir filtro', 'error')
+    }
+  }
 
   const toggleSelect = (id: number) => {
     setSelected(prev => {
@@ -344,17 +491,92 @@ export default function Leads() {
     }
   }
 
+  const handleSendToCrm = async () => {
+    if (!crmApiUrl.trim() || !crmAuthToken.trim()) {
+      addToast('URL e token do CRM são obrigatórios', 'error')
+      return
+    }
+
+    setSendingToCrm(true)
+    setCrmSyncResult(null)
+    try {
+      const payload = {
+        lead_ids: selected.size > 0 ? Array.from(selected) : [],
+        filters: selected.size === 0 ? {
+          status: statusFilter,
+          tag: tagFilter,
+          city: cityFilter,
+          state: stateFilter,
+          search: searchDebounced,
+        } : {},
+        crm_api_url: crmApiUrl.trim(),
+        crm_auth_token: crmAuthToken.trim(),
+      }
+
+      const res = await api.post('/api/leads/send-to-crm', payload)
+      setCrmSyncResult({
+        success: true,
+        sent_count: res.data.sent_count,
+        failed_count: res.data.failed_count,
+        message: res.data.message || `${res.data.sent_count} leads enviados para o CRM`,
+      })
+      addToast(`✅ ${res.data.sent_count} leads enviados com sucesso!`, 'success')
+    } catch (err: any) {
+      const errorMsg = err.response?.data?.error || 'Erro ao enviar leads para o CRM'
+      setCrmSyncResult({
+        success: false,
+        error: errorMsg,
+      })
+      addToast(errorMsg, 'error')
+    } finally {
+      setSendingToCrm(false)
+    }
+  }
+
   const totalAll = Object.values(statusCounts).reduce((a, b) => a + b, 0)
 
   if (loading) return <LoadingSkeleton />
 
   return (
     <div className="space-y-5 animate-fade-in">
+      {/* SaaS Limit Banner */}
+      {usage && limits && (
+        <>
+          {!canViewLeads() && (
+            <div className="px-4 py-3 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-red-700 dark:text-red-300 flex items-center gap-2">
+              <Lock className="w-5 h-5 flex-shrink-0" />
+              <div>
+                <p className="font-semibold">Limite de visualização atingido</p>
+                <p className="text-sm">Você visualizou {usage.leads_viewed} de {limits.leads_per_month} leads neste mês. Faça upgrade para continuar.</p>
+              </div>
+            </div>
+          )}
+          {!canExport() && (
+            <div className="px-4 py-3 bg-orange-50 dark:bg-orange-900/30 border border-orange-200 dark:border-orange-800 rounded-lg text-orange-700 dark:text-orange-300 flex items-center gap-2">
+              <AlertCircle className="w-5 h-5 flex-shrink-0" />
+              <div>
+                <p className="font-semibold">Limite de exportação atingido</p>
+                <p className="text-sm">Você exportou {usage.leads_exported} de {limits.exports_per_month} listas neste mês. Faça upgrade para continuar.</p>
+              </div>
+            </div>
+          )}
+          {canViewLeads() && canExport() && usage.leads_exported / limits.exports_per_month > 0.8 && (
+            <div className="px-4 py-3 bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-800 rounded-lg text-yellow-700 dark:text-yellow-300 flex items-center gap-2">
+              <AlertCircle className="w-5 h-5 flex-shrink-0" />
+              <div>
+                <p className="font-semibold">Próximo do limite de exportação</p>
+                <p className="text-sm">Você utilizou {Math.round(usage.leads_exported / limits.exports_per_month * 100)}% do seu limite. Considere fazer upgrade.</p>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Leads CRM</h1>
-          <p className="text-sm text-gray-500 mt-0.5">{total} leads encontrados</p>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Base de Leads</h1>
+          <p className="text-sm text-gray-500 mt-0.5">{total} leads disponíveis</p>
         </div>
         {total > 0 && (
           <div className="flex items-center gap-2">
@@ -375,14 +597,35 @@ export default function Leads() {
             </div>
             <div className="flex items-center gap-1.5">
               <button
-                onClick={() => setShowExport(true)}
-                className="inline-flex items-center gap-2 px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white text-sm font-semibold rounded-xl shadow-sm transition-colors"
+                onClick={() => {
+                  if (!canExport()) {
+                    addToast('Você atingiu o limite de exportações para este mês', 'error')
+                    return
+                  }
+                  setShowExport(true)
+                }}
+                disabled={!canExport()}
+                title={!canExport() ? 'Limite de exportação atingido' : 'Exportar leads'}
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-primary-600 hover:bg-primary-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-xl shadow-sm transition-colors"
               >
                 <Download className="w-4 h-4" />
-                Exportar
+                Exportar {!canExport() && '(Limite)'}
               </button>
               <Tooltip
-                text="Baixe sua lista em CSV, JSON ou formato pronto para WhatsApp, email marketing e telemarketing."
+                text={canExport() ? "Baixe sua lista em CSV, JSON ou formato pronto para WhatsApp, email marketing e telemarketing." : "Você atingiu o limite de exportações. Faça upgrade para continuar."}
+                position="bottom"
+              />
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setShowSendToCrmModal(true)}
+                title="Enviar leads selecionados ou filtrados para um CRM"
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold rounded-xl shadow-sm transition-colors"
+              >
+                📤 Enviar para CRM
+              </button>
+              <Tooltip
+                text="Envie seus leads para o DIAX CRM ou qualquer outro sistema com API compatível."
                 position="bottom"
               />
             </div>
@@ -393,8 +636,8 @@ export default function Leads() {
       {/* InfoBox */}
       <InfoBox
         storageKey="leads"
-        title="Seus Leads — CRM Basico"
-        description="Aqui ficam todos os contatos extraidos. Voce pode filtrar por status, tag, cidade ou lote, atualizar o status de cada lead no funil de vendas e exportar para sua ferramenta favorita."
+        title="Base de Leads"
+        description="Acesse a base central de contatos qualificados. Filtre por status, tag, cidade ou segmento, organize no seu funil de vendas e exporte para sua ferramenta favorita."
         steps={[
           'Use os filtros de status (Novo, Contatado...) para organizar seu funil',
           'Clique em um lead para abrir o painel lateral e adicionar notas e tags',
@@ -513,6 +756,88 @@ export default function Leads() {
         </div>
       </div>
 
+      {/* Saved Filters Bar */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {/* Active filter indicator */}
+        {activeFilterId && (
+          <span className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 border border-blue-200 dark:bg-blue-900/20 dark:border-blue-800 text-blue-700 dark:text-blue-300 text-xs font-medium rounded-full">
+            <BookmarkCheck className="w-3.5 h-3.5" />
+            {savedFilters.find(f => f.id === activeFilterId)?.name ?? 'Filtro ativo'}
+            <button onClick={clearAllFilters} className="ml-0.5 hover:text-blue-900 dark:hover:text-blue-100">
+              <XIcon className="w-3 h-3" />
+            </button>
+          </span>
+        )}
+
+        {/* Saved filters dropdown trigger */}
+        {savedFilters.length > 0 && (
+          <div className="relative">
+            <button
+              onClick={() => setShowSavedFilters(!showSavedFilters)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 text-xs font-medium rounded-full hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+            >
+              <Bookmark className="w-3.5 h-3.5 text-blue-500" />
+              Meus filtros ({savedFilters.length})
+              <ChevronDown className={`w-3 h-3 transition-transform ${showSavedFilters ? 'rotate-180' : ''}`} />
+            </button>
+            {showSavedFilters && (
+              <div className="absolute top-full left-0 mt-1.5 z-30 w-64 bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-lg py-1">
+                {savedFilters.map((sf) => (
+                  <div
+                    key={sf.id}
+                    className={`flex items-center gap-2 px-3 py-2.5 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors ${activeFilterId === sf.id ? 'bg-blue-50 dark:bg-blue-900/20' : ''}`}
+                  >
+                    <button
+                      onClick={() => applyFilter(sf)}
+                      className="flex-1 text-left"
+                    >
+                      <p className={`text-sm font-medium ${activeFilterId === sf.id ? 'text-blue-700 dark:text-blue-300' : 'text-gray-800 dark:text-gray-200'}`}>
+                        {sf.name}
+                      </p>
+                      <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5 truncate">
+                        {[sf.filters.city, sf.filters.state, sf.filters.status, sf.filters.tag].filter(Boolean).join(' · ') || 'Sem filtros específicos'}
+                      </p>
+                    </button>
+                    {activeFilterId === sf.id && (
+                      <CheckCircle2 className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                    )}
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleDeleteFilter(sf.id) }}
+                      className="p-1 rounded hover:bg-red-50 dark:hover:bg-red-900/20 text-gray-400 hover:text-red-500 transition-colors flex-shrink-0"
+                      title="Excluir filtro"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Save current filter button */}
+        {hasActiveFilters && (
+          <button
+            onClick={() => { setSaveFilterName(''); setShowSaveModal(true) }}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white dark:bg-gray-800 border border-dashed border-blue-300 dark:border-blue-700 text-blue-600 dark:text-blue-400 text-xs font-medium rounded-full hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors"
+          >
+            <Bookmark className="w-3.5 h-3.5" />
+            Salvar filtro atual
+          </button>
+        )}
+
+        {/* Clear filters */}
+        {hasActiveFilters && (
+          <button
+            onClick={clearAllFilters}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-gray-500 dark:text-gray-400 text-xs hover:text-gray-700 dark:hover:text-gray-200 transition-colors"
+          >
+            <XIcon className="w-3.5 h-3.5" />
+            Limpar filtros
+          </button>
+        )}
+      </div>
+
       {/* Bulk actions */}
       {selected.size > 0 && (
         <div className="flex items-center gap-3 px-4 py-3 bg-primary-50 border border-primary-100 rounded-xl">
@@ -589,6 +914,7 @@ export default function Leads() {
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Empresa</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Contato</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Score</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Redes</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Tags</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Lote</th>
@@ -644,6 +970,9 @@ export default function Leads() {
                     </td>
                     <td className="px-4 py-3">
                       <StatusBadge status={lead.crm_status || 'novo'} />
+                    </td>
+                    <td className="px-4 py-3">
+                      <ScoreBadge score={lead.lead_score ?? 0} />
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-0.5">
@@ -727,7 +1056,7 @@ export default function Leads() {
           title="Nenhum lead encontrado"
           description={search || statusFilter || tagFilter
             ? 'Tente alterar os filtros de busca'
-            : 'Faca uma extracao para comecar a gerenciar seus leads'}
+            : 'A base de leads será exibida aqui assim que disponível'}
           action={!search && !statusFilter ? (
             <Link href="/scrape">
               <button className="inline-flex items-center gap-2 px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white text-sm font-semibold rounded-xl transition-colors">
@@ -751,6 +1080,7 @@ export default function Leads() {
       {showExport && (
         <ExportModal
           onClose={() => setShowExport(false)}
+          onUpgradeRequired={() => triggerUpgrade('export')}
           totalLeads={total}
           filters={{
             search: searchDebounced || undefined,
@@ -761,7 +1091,203 @@ export default function Leads() {
         />
       )}
 
+      {/* Send to CRM Modal */}
+      {showSendToCrmModal && (
+        <>
+          <div className="fixed inset-0 bg-black/30 z-40" onClick={() => { setShowSendToCrmModal(false); setCrmSyncResult(null) }} />
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md p-6 animate-fade-in max-h-96 overflow-y-auto">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-bold text-gray-900 dark:text-gray-100">Enviar para CRM</h3>
+                <button
+                  onClick={() => { setShowSendToCrmModal(false); setCrmSyncResult(null) }}
+                  className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
+                >
+                  <XIcon className="w-5 h-5" />
+                </button>
+              </div>
+
+              {!crmSyncResult ? (
+                <>
+                  <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
+                    Envie {selected.size > 0 ? `${selected.size} leads selecionados` : `leads com os filtros atuais`} para seu CRM.
+                  </p>
+
+                  <div className="space-y-4 mb-6">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                        URL do CRM *
+                      </label>
+                      <input
+                        type="url"
+                        value={crmApiUrl}
+                        onChange={(e) => setCrmApiUrl(e.target.value)}
+                        placeholder="http://localhost:5062 ou https://api.seucrm.com"
+                        className="w-full px-4 py-3 bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-xl text-sm text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-400 transition-all"
+                      />
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        (localhost, 127.0.0.1 ou https://)
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                        Token JWT do CRM *
+                      </label>
+                      <input
+                        type="password"
+                        value={crmAuthToken}
+                        onChange={(e) => setCrmAuthToken(e.target.value)}
+                        placeholder="eyJhbGciOiJIUzI1NiIs..."
+                        className="w-full px-4 py-3 bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-xl text-sm text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-400 transition-all"
+                      />
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Guardado apenas em sessão (sessionStorage)
+                      </p>
+                    </div>
+
+                    <div className="p-3 bg-indigo-50 dark:bg-indigo-900/30 rounded-lg border border-indigo-100 dark:border-indigo-800">
+                      <p className="text-xs text-indigo-700 dark:text-indigo-300">
+                        <strong>Leads a enviar:</strong> {selected.size > 0 ? selected.size : total}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => { setShowSendToCrmModal(false); setCrmSyncResult(null) }}
+                      className="flex-1 px-4 py-2.5 bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-900 dark:text-gray-100 text-sm font-semibold rounded-xl transition-colors"
+                    >
+                      Cancelar
+                    </button>
+                    <button
+                      onClick={handleSendToCrm}
+                      disabled={sendingToCrm || !crmApiUrl.trim() || !crmAuthToken.trim()}
+                      className="flex-1 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-semibold rounded-xl transition-colors"
+                    >
+                      {sendingToCrm ? 'Enviando...' : '📤 Enviar'}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  {crmSyncResult.success ? (
+                    <>
+                      <div className="p-4 bg-emerald-50 dark:bg-emerald-900/30 rounded-lg border border-emerald-100 dark:border-emerald-800 mb-4">
+                        <div className="flex items-start gap-3">
+                          <CheckCircle2 className="w-6 h-6 text-emerald-600 dark:text-emerald-400 flex-shrink-0 mt-0.5" />
+                          <div>
+                            <p className="font-semibold text-emerald-700 dark:text-emerald-300 mb-1">
+                              Enviado com sucesso!
+                            </p>
+                            <p className="text-sm text-emerald-600 dark:text-emerald-400 mb-2">
+                              {crmSyncResult.message}
+                            </p>
+                            <div className="text-sm text-emerald-600 dark:text-emerald-400">
+                              <p>✅ Enviados: <strong>{crmSyncResult.sent_count}</strong></p>
+                              {crmSyncResult.failed_count ? <p>⚠️ Falhados: <strong>{crmSyncResult.failed_count}</strong></p> : null}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => { setShowSendToCrmModal(false); setCrmSyncResult(null) }}
+                        className="w-full px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold rounded-xl transition-colors"
+                      >
+                        Fechar
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <div className="p-4 bg-red-50 dark:bg-red-900/30 rounded-lg border border-red-100 dark:border-red-800 mb-4">
+                        <div className="flex items-start gap-3">
+                          <XCircle className="w-6 h-6 text-red-600 dark:text-red-400 flex-shrink-0 mt-0.5" />
+                          <div>
+                            <p className="font-semibold text-red-700 dark:text-red-300 mb-1">
+                              Erro ao enviar
+                            </p>
+                            <p className="text-sm text-red-600 dark:text-red-400">
+                              {crmSyncResult.error}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex gap-3">
+                        <button
+                          onClick={() => setCrmSyncResult(null)}
+                          className="flex-1 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold rounded-xl transition-colors"
+                        >
+                          Tentar Novamente
+                        </button>
+                        <button
+                          onClick={() => { setShowSendToCrmModal(false); setCrmSyncResult(null) }}
+                          className="flex-1 px-4 py-2.5 bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-900 dark:text-gray-100 text-sm font-semibold rounded-xl transition-colors"
+                        >
+                          Fechar
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Upgrade Modal */}
+      {showUpgrade && (
+        <UpgradeModal
+          onClose={() => setShowUpgrade(false)}
+          reason={upgradeReason}
+          currentPlan={plan ?? 'free'}
+        />
+      )}
+
       {/* Tag Input Mini-Modal */}
+      {/* Save Filter Modal */}
+      {showSaveModal && (
+        <>
+          <div className="fixed inset-0 bg-black/30 z-40" onClick={() => setShowSaveModal(false)} />
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-sm p-6 animate-fade-in">
+              <h3 className="text-base font-bold text-gray-900 dark:text-gray-100 mb-1">Salvar Filtro</h3>
+              <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
+                Nomeie a combinação atual de filtros para reutilizar depois.
+              </p>
+              <input
+                autoFocus
+                type="text"
+                value={saveFilterName}
+                onChange={(e) => setSaveFilterName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleSaveFilter() }}
+                placeholder="Ex: Clínicas em Vitória, SP premium..."
+                maxLength={100}
+                className="w-full px-4 py-3 bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-xl text-sm text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400 transition-all mb-4"
+              />
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setShowSaveModal(false)}
+                  className="flex-1 px-4 py-2.5 border border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-xl font-medium text-sm hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  onClick={handleSaveFilter}
+                  disabled={!saveFilterName.trim() || savingFilter}
+                  className="flex-1 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl font-semibold text-sm transition-colors flex items-center justify-center gap-2"
+                >
+                  <Bookmark className="w-4 h-4" />
+                  {savingFilter ? 'Salvando...' : 'Salvar'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
       {showTagInput && (
         <>
           <div className="fixed inset-0 bg-black/30 z-40" onClick={() => setShowTagInput(false)} />
