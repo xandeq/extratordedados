@@ -15,6 +15,7 @@ import random
 import time
 import logging
 import logging.handlers
+import traceback
 from urllib.parse import urlparse, urljoin, quote as requests_quote
 
 # ── Structured error logger for scraper ──────────────────────────────────────
@@ -69,6 +70,212 @@ def _db_log_writer():
 
 _db_log_writer_thread = threading.Thread(target=_db_log_writer, daemon=True)
 _db_log_writer_thread.start()
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(APP_DIR)
+REPO_ROOT = os.path.dirname(PROJECT_DIR)
+SECRETS_CACHE_PATH = os.path.join(REPO_ROOT, '.secrets.cache.json')
+LOCAL_SECRET_ENV_FILES = [
+    os.path.join(REPO_ROOT, '.deploy.env'),
+    os.path.join(REPO_ROOT, '.env'),
+    os.path.join(PROJECT_DIR, '.env'),
+    os.path.join(APP_DIR, '.env'),
+]
+
+_aws_secret_blob_cache = {}
+_aws_secret_blob_failures = {}
+_local_secret_cache = None
+
+os.environ.setdefault('AWS_EC2_METADATA_DISABLED', 'true')
+
+
+def _load_env_file_into_environ(path):
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding='utf-8') as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key:
+                    os.environ.setdefault(key, value)
+    except Exception:
+        pass
+
+
+for _env_file in LOCAL_SECRET_ENV_FILES:
+    _load_env_file_into_environ(_env_file)
+
+
+def _normalize_env_aliases():
+    alias_pairs = [
+        ('DB_PASS', 'DB_PASSWORD'),
+        ('CRM_PASSWORD', 'CRM_PASS'),
+        ('SYNC_PASSWORD', 'CRM_PASS'),
+        ('SYNC_EMAIL', 'CRM_EMAIL'),
+        ('APIFY_API_KEY', 'APIFY_TOKEN'),
+        ('INSTAGRAM_USERNAME', 'INSTAGRAM_USER'),
+        ('INSTAGRAM_PASSWORD', 'INSTAGRAM_PASS'),
+        ('LINKEDIN_USERNAME', 'LINKEDIN_USER'),
+        ('LINKEDIN_PASSWORD', 'LINKEDIN_PASS'),
+    ]
+    for source_key, target_key in alias_pairs:
+        if os.environ.get(source_key) and not os.environ.get(target_key):
+            os.environ[target_key] = os.environ[source_key]
+
+
+_normalize_env_aliases()
+
+
+def _load_local_secret_cache():
+    global _local_secret_cache
+    if _local_secret_cache is not None:
+        return _local_secret_cache
+    try:
+        import json as _json
+        with open(SECRETS_CACHE_PATH, encoding='utf-8') as f:
+            _local_secret_cache = _json.load(f)
+        if not isinstance(_local_secret_cache, dict):
+            _local_secret_cache = {}
+    except Exception:
+        _local_secret_cache = {}
+    return _local_secret_cache
+
+
+def _save_local_secret_cache():
+    try:
+        import json as _json
+        cache = _load_local_secret_cache()
+        with open(SECRETS_CACHE_PATH, 'w', encoding='utf-8') as f:
+            _json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _cache_secret_blob(secret_id, secret_data):
+    if not secret_id or not isinstance(secret_data, dict):
+        return
+    cache = _load_local_secret_cache()
+    cache[secret_id] = secret_data
+    _save_local_secret_cache()
+
+
+def _get_cached_secret_blob(secret_id):
+    if not secret_id:
+        return None
+    cache = _load_local_secret_cache()
+    data = cache.get(secret_id)
+    return data if isinstance(data, dict) else None
+
+
+def _fetch_secret_blob_from_aws(secret_id):
+    if not secret_id:
+        return None
+    if secret_id in _aws_secret_blob_cache:
+        return _aws_secret_blob_cache[secret_id]
+
+    last_failure = _aws_secret_blob_failures.get(secret_id)
+    if last_failure and (time.time() - last_failure) < 300:
+        return None
+
+    try:
+        import boto3
+        import json as _json
+        from botocore.config import Config as _BotoConfig
+
+        client = boto3.client(
+            'secretsmanager',
+            region_name='us-east-1',
+            config=_BotoConfig(connect_timeout=2, read_timeout=3, retries={'max_attempts': 1}),
+        )
+        response = client.get_secret_value(SecretId=secret_id)
+        secret_string = response.get('SecretString') or '{}'
+        secret_data = _json.loads(secret_string)
+        if isinstance(secret_data, dict):
+            _aws_secret_blob_cache[secret_id] = secret_data
+            _cache_secret_blob(secret_id, secret_data)
+            return secret_data
+    except Exception:
+        _aws_secret_blob_failures[secret_id] = time.time()
+    return None
+
+
+def _read_secret_key_from_blob(secret_blob, candidate_keys):
+    if not isinstance(secret_blob, dict):
+        return None
+    for key in candidate_keys:
+        value = secret_blob.get(key)
+        if value:
+            return value
+    return None
+
+
+def _get_secret_from_db(provider, field='api_key'):
+    if not provider or field not in ('api_key', 'api_secret'):
+        return None
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT {field} FROM api_configs WHERE provider = %s AND is_active = TRUE "
+            "ORDER BY updated_at DESC NULLS LAST LIMIT 1",
+            (provider,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return None
+
+
+def resolve_secret_value(key, secret_ids=None, env_keys=None, db_provider=None, db_field='api_key', default=''):
+    candidate_keys = []
+    if env_keys:
+        candidate_keys.extend([k for k in env_keys if k])
+    if key and key not in candidate_keys:
+        candidate_keys.insert(0, key)
+
+    for env_key in candidate_keys:
+        value = os.environ.get(env_key)
+        if value:
+            return value
+
+    for secret_id in (secret_ids or []):
+        live_blob = _fetch_secret_blob_from_aws(secret_id)
+        value = _read_secret_key_from_blob(live_blob, candidate_keys)
+        if value:
+            return value
+
+    for secret_id in (secret_ids or []):
+        cached_blob = _get_cached_secret_blob(secret_id)
+        value = _read_secret_key_from_blob(cached_blob, candidate_keys)
+        if value:
+            return value
+
+    if db_provider:
+        db_value = _get_secret_from_db(db_provider, db_field)
+        if db_value:
+            return db_value
+
+    return default
+
+
+def warm_secrets_cache():
+    """Best effort: hydrate local cache while AWS is available."""
+    for secret_id in ('extratordedados/prod', 'tools/rapidapi', 'tools/serper', 'tools/apify'):
+        _fetch_secret_blob_from_aws(secret_id)
+
+
+warm_secrets_cache()
 
 
 def _classify_error(msg, exc_text):
@@ -170,6 +377,64 @@ def scraper_log(level, provider, query, msg, exc=None, **kwargs):
             _log_queue.put_nowait((level.upper(), provider, query, str(msg), exc_text, fix_prompt, error_type, extra_json))
         except queue.Full:
             pass
+
+
+def persist_system_log(level, provider, query, message, exception_text=None, **kwargs):
+    """Persist a structured system log entry to the same queue used by /app-logs."""
+    error_type = _classify_error(str(message), exception_text)
+    extra = {k: v for k, v in kwargs.items() if v is not None} if kwargs else {}
+    fix_prompt = _build_fix_prompt(level.upper(), provider, query, str(message), exception_text, error_type, extra)
+    import json as _json
+    extra_json = _json.dumps(extra, ensure_ascii=False, default=str) if extra else None
+    try:
+        _log_queue.put_nowait((
+            level.upper(),
+            provider,
+            query,
+            str(message),
+            exception_text,
+            fix_prompt,
+            error_type,
+            extra_json,
+        ))
+    except queue.Full:
+        pass
+
+
+def _stack_trace_text(exc=None):
+    if exc and getattr(exc, '__traceback__', None):
+        return ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))[:4000]
+    return ''.join(traceback.format_stack(limit=20))[-4000:]
+
+
+def _log_send_to_crm_failure(*, user_id=None, filters=None, lead_ids=None, crm_api_url=None,
+                             error_message='', exc=None, stack_text=None, status_code=None,
+                             stage=None, response_body=None, total_leads=None, source='backend'):
+    stack_text = (stack_text or '').strip() or _stack_trace_text(exc)
+    persist_system_log(
+        'ERROR',
+        'send_leads_to_crm',
+        'send_leads_to_crm',
+        error_message[:1000],
+        stack_text,
+        action='send_leads_to_crm',
+        timestamp=datetime.now().isoformat(),
+        user_id=user_id,
+        filters=filters or {},
+        lead_ids=lead_ids or [],
+        crm_api_url=crm_api_url,
+        status_code=status_code,
+        stage=stage,
+        response_body=response_body[:1000] if isinstance(response_body, str) else response_body,
+        total_leads=total_leads,
+        source=source,
+        endpoint='/api/leads/send-to-crm',
+        request_params={
+            'filters': filters or {},
+            'lead_ids': lead_ids or [],
+        },
+        context=f'action=send_leads_to_crm stage={stage or "unknown"} user_id={user_id}',
+    )
 
 
 def _persist_thread_errors(provider: str):
@@ -1263,6 +1528,8 @@ def normalize_email(email_str):
     Returns the normalized email or None if invalid/low-quality.
     """
     email_str = email_str.strip().lower()
+    # Remove scraping artifacts prepended to email (e.g. "e-mailcontato@..." → "contato@...")
+    email_str = re.sub(r'^(e-mail|email:|mailto:|e\.mail|email\s*[:=])\s*', '', email_str, flags=re.I)
     email_str = email_str.rstrip('.')
 
     score, is_valid, rejection_reason = calculate_email_quality_score(email_str)
@@ -6351,6 +6618,368 @@ def sanitize_leads():
     })
 
 
+# ============= AI Name/Email Normalizer =============
+
+def _get_llm_key_for_normalize():
+    """Returns (provider, api_key) — tries OpenRouter first, then Groq."""
+    blob = _fetch_secret_blob_from_aws('tools/openrouter')
+    if blob:
+        key = _read_secret_key_from_blob(blob, ['OPENROUTER_API_KEY'])
+        if key:
+            return 'openrouter', key
+    blob = _fetch_secret_blob_from_aws('tools/groq')
+    if blob:
+        key = _read_secret_key_from_blob(blob, ['GROQ_API_KEY'])
+        if key:
+            return 'groq', key
+    return None, None
+
+
+def _call_llm_normalize(prompt, provider, api_key):
+    """Call LLM and return parsed JSON. Raises on failure."""
+    import requests as _req
+    import json as _json
+
+    if provider == 'openrouter':
+        url = 'https://openrouter.ai/api/v1/chat/completions'
+        headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+        payload = {'model': 'deepseek/deepseek-chat', 'messages': [{'role': 'user', 'content': prompt}], 'temperature': 0.1, 'max_tokens': 4000}
+    elif provider == 'groq':
+        url = 'https://api.groq.com/openai/v1/chat/completions'
+        headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+        payload = {'model': 'llama-3.1-8b-instant', 'messages': [{'role': 'user', 'content': prompt}], 'temperature': 0.1, 'max_tokens': 4000}
+    else:
+        raise ValueError(f'Unknown provider: {provider}')
+
+    resp = _req.post(url, headers=headers, json=payload, timeout=45)
+    resp.raise_for_status()
+    resp_json = resp.json()
+    content = resp_json['choices'][0]['message']['content'].strip()
+    usage = resp_json.get('usage', {})
+    # Strip markdown code fences if present
+    if content.startswith('```'):
+        content = re.sub(r'^```[a-z]*\n?', '', content)
+        content = re.sub(r'\n?```$', '', content)
+    import json as _json2
+    parsed = _json2.loads(content)
+    # Attach usage metadata to result
+    if isinstance(parsed, dict):
+        parsed['_usage'] = {
+            'provider': provider,
+            'prompt_tokens': usage.get('prompt_tokens', 0),
+            'completion_tokens': usage.get('completion_tokens', 0),
+            'total_tokens': usage.get('total_tokens', 0),
+        }
+    return parsed
+
+
+def _ai_normalize_batch(leads_batch):
+    """
+    Send a batch of leads to LLM for normalization.
+    Returns (results_list, error_str).
+    results_list items: {id, company_name, email, contact_name}
+    """
+    import json as _json
+
+    provider, api_key = _get_llm_key_for_normalize()
+    if not api_key:
+        return None, 'Chave LLM não disponível (configure OpenRouter ou Groq no AWS SM)'
+
+    leads_input = [
+        {
+            'id': l['id'],
+            'company_name': (l.get('company_name') or '').strip(),
+            'email': (l.get('email') or '').strip(),
+            'contact_name': (l.get('contact_name') or '').strip(),
+        }
+        for l in leads_batch
+    ]
+
+    prompt = f"""Você é um especialista em limpeza e normalização de dados de leads empresariais brasileiros. Siga as instruções abaixo com precisão.
+
+━━ CAMPO: company_name ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Remova sufixos jurídicos: LTDA, ME, EIRELI, S/A, EPP, SS, S.S., LTDA ME, LTDA EPP, S.A., SA, MICRO EMPRESA, MICROEMPRESA, SOCIEDADE SIMPLES.
+2. Substitua hifens usados como separadores por espaços (ex: "Clínica-Saúde" → "Clínica Saúde", "Auto-Peças" → "Auto Peças").
+3. Se o nome for um slogan, frase de marketing ou título de categoria de diretório, substitua pelo nome derivado do domínio do email (se disponível) ou retorne "".
+   Identifique como INVÁLIDO (não é nome de empresa) quando:
+   a) Contém verbos/palavras de marketing: "seja", "venha", "conheça", "bem-vindo", "confira", "clique", "acesse", "saiba mais", "qualidade", "excelência", "ligue", "entre em contato".
+   b) É um título de categoria de diretório: padrão "[Categoria] em [Cidade/Estado]" ou "[Categoria] e [Categoria] em [Cidade]".
+      Exemplos: "Oficinas Mecânicas em Vila Velha", "Restaurantes e Lanchonetes em São Paulo", "Clínicas Odontológicas em Vitória/ES".
+   c) É um título de artigo/listicle com número ordinal ou superlativo: padrão "N Melhores [X] em [Y]", "Top N [X]", "Os Melhores [X] de [Y]", "Lista de [X]", "Melhores [X] em [Y]".
+      Exemplos: "10 Melhores Oficinas Mecânicas em Vila Velha", "Top 5 Restaurantes em SP", "Os Melhores Dentistas de Vitória".
+   d) É uma descrição genérica de segmento sem nome próprio: "Oficina Mecânica", "Restaurante", "Clínica Médica" (sem nome próprio após).
+   e) Contém CNPJ embutido no início ou no meio (padrão XX.XXX.XXX/XXXX-XX): remova o CNPJ e processe o restante normalmente.
+4b. Se o nome começa com um nome próprio de empresa seguido de descrição de categoria+localidade (padrão "[NomeEmpresa] [Categoria] [Cidade/Estado]"), extraia apenas o nome próprio inicial e descarte o restante.
+    Exemplos:
+    - "Financial Contabilidade Escritório de Contabilidade Vitória/ES" → "Financial Contabilidade"
+    - "Sorriso Feliz Clínica Odontológica em Vila Velha ES" → "Sorriso Feliz"
+    - "Auto Center Silva Oficina Mecânica Cariacica" → "Auto Center Silva"
+   - Se houver email disponível: derive o nome a partir do email seguindo este processo:
+     a) Se o domínio for corporativo (não gmail/hotmail/yahoo/outlook/bol/uol/terra): use o domínio (ex: `facilittacont.com.br` → "Facilitta Cont", `w3contabilidade.com.br` → "W3 Contabilidade").
+     b) Se o domínio for pessoal (gmail/hotmail/yahoo/outlook/bol/uol/terra): use o local-part (antes do @), removendo PRIMEIRO os sufixos genéricos no final (contato, info, comercial, vendas, atendimento, faleconosco, email, empresa, comercial01, comercial02) e DEPOIS os prefixos genéricos no início (contato, info, comercial).
+        Exemplo: "ateliepatriciaalmeidacontato@gmail.com" → remove sufixo "contato" → "ateliepatriciaalmeida" → "Ateliê Patricia Almeida"
+        Exemplo: "anizioautopecas@gmail.com" → sem sufixo/prefixo genérico → "Anizio Auto Peças"
+        Exemplo: "contato@gmail.com" → local-part é puramente genérico → retorne ""
+     c) Processo de separação de palavras concatenadas: detecte transições de minúscula→maiúscula (camelCase), pontos, hifens, números entre letras, ou padrões semânticos óbvios (ex: "autocenter" → "Auto Center", "clinicasorriso" → "Clínica Sorriso").
+     d) Aplique Title Case e corrija acentuação óbvia: pecas→peças, clinica→clínica, odonto→Odonto, atelie→Ateliê, joao→João, etc.
+   - Se o email não existir e não houver como derivar nome: retorne "".
+4. Aplique Title Case correto para português: preposições "de", "da", "do", "e", "das", "dos", "no", "na", "em", "com", "por", "para" em minúsculas quando no meio do nome.
+5. Remova fragmentos de URL, CNPJ (padrão XX.XXX.XXX/XXXX-XX), números de telefone, ou texto genérico como "Página Inicial", "Home", "Site", "Empresa", "Nossa Empresa".
+6. Se, após a limpeza, a string estiver vazia ou tiver menos de 2 caracteres, retorne "".
+
+Exemplos:
+- "CLÍNICA SORRISO LTDA" → "Clínica Sorriso"
+- "Auto-Center-Vitória ME" → "Auto Center Vitória"
+- "Oficinas Mecânicas e Mecânicas Automotivas em Vila Velha" + email "anizioautopecas@gmail.com" → "Anizio Auto Peças"
+- "10 Melhores Oficinas Mecânicas em Vila Velha" + email "ativesite@gmail.com" → "Ative Site"
+- "Top 5 Clínicas Odontológicas em Vitória" + email "contato@sorrisoperfeito.com.br" → "Sorriso Perfeito"
+- "Restaurantes em São Paulo" + email "joao@restaurantedobem.com.br" → "Restaurante do Bem"
+- "Escritório de Contabilidade em Vitória-ES" + email "contato@facilittacont.com.br" → "Facilitta Cont"
+- "Escritório de Contabilidade em Vitória/ES" + email "contato@w3contabilidade.com.br" → "W3 Contabilidade"
+- "Financial Contabilidade Escritório de Contabilidade Vitória/ES" → "Financial Contabilidade"
+- "13.122.119/0001-89 Escritório de Contabilidade em Vitória" + email "contato@facilittacont.com.br" → "Facilitta Cont"
+- "Salões de Beleza em Vitória" + email "ateliepatriciaalmeidacontato@gmail.com" → "Ateliê Patricia Almeida"
+- "Seja bem-vindo!" + email "contato@enzoodonto.com.br" → "Enzo Odonto"
+- "12.345.678/0001-90 Restaurante do João" → "Restaurante do João"
+- "Clínicas Odontológicas em Vitória" + sem email → ""
+- "Home" → ""
+
+━━ CAMPO: email ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Remova artefatos de scraping colados antes do email:
+   - Prefixos como "e-mail", "email:", "mailto:", "E-mail:", "Email:" grudados antes do endereço (ex: "e-mailcontato@empresa.com.br" → "contato@empresa.com.br", "mailto:info@site.com" → "info@site.com")
+2. Corrija typos óbvios no domínio:
+   - gmaiil / gmaill / gmai.com → gmail.com
+   - hotmai / hotnail / hotmali → hotmail.com
+   - .cmo / .ocm / .con / .coml → .com
+   - .corn → .com
+   - outloo / outlok → outlook.com
+   - yahooo / yaho → yahoo.com.br
+   - .con.br / .cpm.br → .com.br
+3. Remova espaços dentro do email.
+3. Converta para lowercase.
+4. Retorne "" para emails claramente inválidos:
+   - Sem "@" ou com múltiplos "@"
+   - Domínio sem ponto (ex: "joao@empresa")
+   - Terminações sem sentido (.c, .br1, .com2)
+   - Contém caracteres especiais inválidos fora do padrão RFC
+5. Se já estiver correto, retorne o valor original sem alteração.
+
+Preferência de prefixo (quando houver dúvida): contato@ > comunicacao@ > marketing@ > faleconosco@ > comercial@ > vendas@
+
+━━ CAMPO: contact_name ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Aplique Title Case correto para português.
+2. Mantenha títulos: "Dr.", "Dra.", "Prof.", "Profa.", "Sr.", "Sra.", "Eng.", "Adv."
+3. Se o valor for claramente um nome de empresa ou razão social (não de uma pessoa física), retorne "".
+4. Se o campo estiver vazio, retorne "".
+
+━━ CAMPO ESPECIAL: discard ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Retorne discard=true quando o lead NÃO serve para marketing no Brasil:
+1. Empresa estrangeira sem operação no Brasil: domínio de email internacional (.com sem .br) de empresa claramente americana/europeia/asiática (ex: rollingstone.com, gettyimages.com, pmc.com, wrightsmedia.com, nytimes.com, bbc.co.uk).
+2. Mídia/veículo de imprensa internacional que apareceu por erro de scraping.
+3. Email claramente corporativo de empresa multinacional sem relação com o nicho local brasileiro buscado.
+ATENÇÃO: NÃO descartar emails pessoais (gmail, hotmail, yahoo) nem empresas brasileiras com .com. Só descartar quando o domínio for de empresa estrangeira reconhecida.
+Quando discard=true, preencha discard_reason com uma frase curta em português (ex: "Empresa americana - Rolling Stone EUA").
+
+━━ FORMATO DE SAÍDA ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RETORNE SOMENTE JSON VÁLIDO. Sem markdown, sem texto antes ou depois.
+Inclua todos os leads recebidos. Mantenha os IDs originais.
+
+{{"results": [{{"id": 123, "company_name": "Nome Limpo", "email": "email@dominio.com", "contact_name": "Nome Pessoa", "discard": false, "discard_reason": ""}}]}}
+
+━━ LEADS PARA NORMALIZAR ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{_json.dumps(leads_input, ensure_ascii=False)}"""
+
+    try:
+        result = _call_llm_normalize(prompt, provider, api_key)
+        if result and 'results' in result:
+            usage = result.pop('_usage', {})
+            return result['results'], None, usage
+        return None, 'LLM retornou formato inesperado', {}
+    except Exception as e:
+        # Auto-fallback to Groq if OpenRouter failed
+        if provider == 'openrouter':
+            blob = _fetch_secret_blob_from_aws('tools/groq')
+            if blob:
+                groq_key = _read_secret_key_from_blob(blob, ['GROQ_API_KEY'])
+                if groq_key:
+                    try:
+                        result = _call_llm_normalize(prompt, 'groq', groq_key)
+                        if result and 'results' in result:
+                            usage = result.pop('_usage', {})
+                            return result['results'], None, usage
+                    except Exception as e2:
+                        return None, f'OpenRouter: {e} | Groq: {e2}', {}
+        return None, str(e), {}
+
+
+@app.route('/api/leads/ai-normalize', methods=['POST'])
+@limiter.limit("5/hour")
+def ai_normalize_leads():
+    """
+    AI-powered normalization of company names, emails and contact names.
+    Fixes: legal suffixes, hyphens, slogans, email typos, capitalization.
+    Processes up to 500 leads in batches of 25 per LLM call.
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json(silent=True) or {}
+    lead_ids = data.get('lead_ids')  # Optional list of specific lead IDs
+
+    with get_db() as conn:
+        c = conn.cursor()
+        if lead_ids:
+            placeholders = ','.join(['%s'] * len(lead_ids))
+            c.execute(
+                f'SELECT id, company_name, email, contact_name FROM leads '
+                f'WHERE id IN ({placeholders}) AND batch_id IN '
+                f'(SELECT id FROM batches WHERE user_id = %s)',
+                lead_ids + [user_id]
+            )
+        else:
+            c.execute(
+                'SELECT id, company_name, email, contact_name FROM leads '
+                'WHERE batch_id IN (SELECT id FROM batches WHERE user_id = %s) '
+                'ORDER BY id DESC LIMIT 500',
+                (user_id,)
+            )
+        leads_raw = [{'id': r[0], 'company_name': r[1], 'email': r[2], 'contact_name': r[3]}
+                     for r in c.fetchall()]
+
+    if not leads_raw:
+        return jsonify({'success': True, 'report': {'analyzed': 0, 'normalized': 0, 'name_fixed': 0, 'email_fixed': 0, 'contact_fixed': 0}})
+
+    BATCH_SIZE = 25
+    all_results = []
+    errors = []
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    llm_provider_used = None
+
+    for i in range(0, len(leads_raw), BATCH_SIZE):
+        batch = leads_raw[i:i + BATCH_SIZE]
+        results, err, usage = _ai_normalize_batch(batch)
+        if err:
+            errors.append(err)
+            break
+        if results:
+            all_results.extend(results)
+        if usage:
+            total_prompt_tokens     += usage.get('prompt_tokens', 0)
+            total_completion_tokens += usage.get('completion_tokens', 0)
+            if not llm_provider_used:
+                llm_provider_used = usage.get('provider', 'unknown')
+
+    total_tokens = total_prompt_tokens + total_completion_tokens
+    # Cost estimate: DeepSeek via OpenRouter ~$0.14/M input + $0.28/M output; Groq free
+    if llm_provider_used == 'openrouter':
+        cost_usd = (total_prompt_tokens / 1_000_000 * 0.14) + (total_completion_tokens / 1_000_000 * 0.28)
+    else:
+        cost_usd = 0.0  # Groq free tier
+
+    if not all_results and errors:
+        return jsonify({'error': f'Normalização falhou: {errors[0]}'}), 500
+
+    # Apply updates
+    orig_map = {l['id']: l for l in leads_raw}
+    normalized = name_fixed = email_fixed = contact_fixed = discarded_foreign = 0
+
+    with get_db() as conn:
+        c = conn.cursor()
+        for r in all_results:
+            lead_id = r.get('id')
+            if not lead_id:
+                continue
+            orig = orig_map.get(lead_id, {})
+
+            new_name    = (r.get('company_name') or '').strip() or None
+            new_email   = (r.get('email') or '').strip() or None
+            new_contact = (r.get('contact_name') or '').strip() or None
+
+            orig_name    = (orig.get('company_name') or '').strip()
+            orig_email   = (orig.get('email') or '').strip()
+            orig_contact = (orig.get('contact_name') or '').strip()
+
+            should_discard   = r.get('discard', False)
+            discard_reason   = (r.get('discard_reason') or '').strip()
+
+            changed = False
+            if should_discard:
+                # Mark as descartado + add tag 'lead_internacional'
+                normalized += 1
+                changed = True
+                try:
+                    c.execute(
+                        """UPDATE leads
+                           SET crm_status='descartado',
+                               tags=array(SELECT DISTINCT unnest(COALESCE(tags, ARRAY[]::text[]) || ARRAY['lead_internacional'])),
+                               notes=CASE WHEN notes IS NULL OR notes='' THEN %s ELSE notes || ' | ' || %s END,
+                               updated_at=NOW()
+                           WHERE id=%s""",
+                        (discard_reason or 'Descartado: empresa estrangeira',
+                         discard_reason or 'Descartado: empresa estrangeira',
+                         lead_id)
+                    )
+                    discarded_foreign += 1
+                except Exception as ue:
+                    print(f'[ai-normalize] discard error lead {lead_id}: {ue}')
+                continue
+
+            if new_name is not None and new_name != orig_name:
+                name_fixed += 1
+                changed = True
+            if new_email is not None and new_email != orig_email:
+                email_fixed += 1
+                changed = True
+            if new_contact is not None and new_contact != orig_contact:
+                contact_fixed += 1
+                changed = True
+
+            if changed:
+                normalized += 1
+                try:
+                    c.execute(
+                        'UPDATE leads SET company_name=%s, email=%s, contact_name=%s, updated_at=NOW() WHERE id=%s',
+                        (
+                            new_name    if new_name    is not None else orig.get('company_name'),
+                            new_email   if new_email   is not None else orig.get('email'),
+                            new_contact if new_contact is not None else orig.get('contact_name'),
+                            lead_id,
+                        )
+                    )
+                except Exception as ue:
+                    print(f'[ai-normalize] update error lead {lead_id}: {ue}')
+        conn.commit()
+
+    return jsonify({
+        'success': True,
+        'report': {
+            'analyzed':          len(leads_raw),
+            'normalized':        normalized,
+            'name_fixed':        name_fixed,
+            'email_fixed':       email_fixed,
+            'contact_fixed':     contact_fixed,
+            'discarded_foreign': discarded_foreign,
+            'batches_processed': (len(leads_raw) + BATCH_SIZE - 1) // BATCH_SIZE,
+            'errors':            errors[:3],
+            'tokens': {
+                'prompt':     total_prompt_tokens,
+                'completion': total_completion_tokens,
+                'total':      total_tokens,
+                'provider':   llm_provider_used or 'unknown',
+                'cost_usd':   round(cost_usd, 5),
+            },
+        }
+    })
+
+
 # ============= CNPJ Enrichment Endpoint (Phase 1) =============
 
 def _run_cnpj_enrichment(user_id, lead_ids=None):
@@ -6577,10 +7206,26 @@ def enrich_leads_cnpj():
 # ============= Advanced Scraping Methods =============
 
 # Credenciais para scrapers autenticados
-INSTAGRAM_USERNAME = os.environ.get('INSTAGRAM_USER', '')
-INSTAGRAM_PASSWORD = os.environ.get('INSTAGRAM_PASS', '')
-LINKEDIN_USERNAME = os.environ.get('LINKEDIN_USER', '')
-LINKEDIN_PASSWORD = os.environ.get('LINKEDIN_PASS', '')
+INSTAGRAM_USERNAME = resolve_secret_value(
+    'INSTAGRAM_USER',
+    secret_ids=['extratordedados/prod'],
+    env_keys=['INSTAGRAM_USER', 'INSTAGRAM_USERNAME'],
+)
+INSTAGRAM_PASSWORD = resolve_secret_value(
+    'INSTAGRAM_PASS',
+    secret_ids=['extratordedados/prod'],
+    env_keys=['INSTAGRAM_PASS', 'INSTAGRAM_PASSWORD'],
+)
+LINKEDIN_USERNAME = resolve_secret_value(
+    'LINKEDIN_USER',
+    secret_ids=['extratordedados/prod'],
+    env_keys=['LINKEDIN_USER', 'LINKEDIN_USERNAME'],
+)
+LINKEDIN_PASSWORD = resolve_secret_value(
+    'LINKEDIN_PASS',
+    secret_ids=['extratordedados/prod'],
+    env_keys=['LINKEDIN_PASS', 'LINKEDIN_PASSWORD'],
+)
 
 def scrape_google_maps(query, city, state, max_results=20):
     """
@@ -6701,44 +7346,20 @@ _rapidapi_key_cache = None
 _rapidapi_key_failed = False  # Evita retry quando AWS SM já falhou nesta sessão
 
 def get_rapidapi_key():
-    """Busca RapidAPI key do AWS Secrets Manager, com cache global e fallback env var."""
+    """Busca RapidAPI key com fallback robusto: env -> AWS -> cache local -> DB."""
     global _rapidapi_key_cache, _rapidapi_key_failed
     if _rapidapi_key_cache:
         return _rapidapi_key_cache
-    # Se já falhou nesta sessão, não tentar AWS SM de novo (evita 3x timeout no retry)
     if _rapidapi_key_failed:
         return None
-    # Tentativa 1: AWS Secrets Manager
-    try:
-        import boto3, json as _json
-        client = boto3.client('secretsmanager', region_name='us-east-1')
-        resp = client.get_secret_value(SecretId='tools/rapidapi')
-        _rapidapi_key_cache = _json.loads(resp['SecretString'])['RAPIDAPI_KEY']
-        print(f"[RAPIDAPI] Key carregada do AWS SM com sucesso")
+    _rapidapi_key_cache = resolve_secret_value(
+        'RAPIDAPI_KEY',
+        secret_ids=['tools/rapidapi', 'extratordedados/prod'],
+        env_keys=['RAPIDAPI_KEY'],
+        db_provider='rapidapi',
+    )
+    if _rapidapi_key_cache:
         return _rapidapi_key_cache
-    except Exception as e:
-        print(f"[RAPIDAPI] Falha ao buscar key do AWS SM: {e}")
-    # Tentativa 2: Variável de ambiente (fallback para VPS sem AWS credentials)
-    env_key = os.environ.get('RAPIDAPI_KEY')
-    if env_key:
-        _rapidapi_key_cache = env_key
-        print(f"[RAPIDAPI] Key carregada de variável de ambiente (fallback)")
-        return _rapidapi_key_cache
-    # Tentativa 3: api_configs do banco (chave configurada pelo usuário no frontend)
-    try:
-        _conn = psycopg2.connect(**DB_CONFIG)
-        _conn.autocommit = True
-        _cur = _conn.cursor()
-        _cur.execute("SELECT api_key FROM api_configs WHERE provider='rapidapi' LIMIT 1")
-        row = _cur.fetchone()
-        _cur.close()
-        _conn.close()
-        if row and row[0]:
-            _rapidapi_key_cache = row[0]
-            print(f"[RAPIDAPI] Key carregada do banco api_configs (fallback)")
-            return _rapidapi_key_cache
-    except Exception:
-        pass
     _rapidapi_key_failed = True
     print(f"[RAPIDAPI] Todas as fontes de key falharam — provider será desabilitado nesta sessão")
     return None
@@ -7141,38 +7762,20 @@ _serper_api_key_cache = None
 _serper_key_failed = False
 
 def _get_serper_key():
-    """Busca Serper.dev API key do AWS SM ou api_configs."""
+    """Busca Serper.dev API key com fallback robusto: env -> AWS -> cache local -> DB."""
     global _serper_api_key_cache, _serper_key_failed
     if _serper_api_key_cache:
         return _serper_api_key_cache
     if _serper_key_failed:
         return None
-    try:
-        import boto3, json as _json
-        client = boto3.client('secretsmanager', region_name='us-east-1')
-        resp = client.get_secret_value(SecretId='tools/serper')
-        _serper_api_key_cache = _json.loads(resp['SecretString'])['SERPER_API_KEY']
-        print(f"[SERPER] Key carregada do AWS SM")
+    _serper_api_key_cache = resolve_secret_value(
+        'SERPER_API_KEY',
+        secret_ids=['tools/serper', 'extratordedados/prod'],
+        env_keys=['SERPER_API_KEY'],
+        db_provider='serper',
+    )
+    if _serper_api_key_cache:
         return _serper_api_key_cache
-    except Exception:
-        pass
-    env_key = os.environ.get('SERPER_API_KEY')
-    if env_key:
-        _serper_api_key_cache = env_key
-        return env_key
-    try:
-        _conn = psycopg2.connect(**DB_CONFIG)
-        _conn.autocommit = True
-        _cur = _conn.cursor()
-        _cur.execute("SELECT api_key FROM api_configs WHERE provider='serper' LIMIT 1")
-        row = _cur.fetchone()
-        _cur.close()
-        _conn.close()
-        if row and row[0]:
-            _serper_api_key_cache = row[0]
-            return _serper_api_key_cache
-    except Exception:
-        pass
     _serper_key_failed = True
     return None
 
@@ -7267,27 +7870,14 @@ def apify_google_maps_search(niche, city, state, max_results=20):
     Free tier: $5/mês de crédito (~1250 businesses/mês).
     Extrai nome, telefone, website, email, endereço, rating.
     """
-    import boto3, json as _json
-
-    # Buscar token Apify
-    apify_token = None
-    try:
-        client = boto3.client('secretsmanager', region_name='us-east-1')
-        resp = client.get_secret_value(SecretId='extratordedados/prod')
-        apify_token = _json.loads(resp['SecretString']).get('APIFY_TOKEN')
-    except Exception:
-        pass
+    apify_token = resolve_secret_value(
+        'APIFY_TOKEN',
+        secret_ids=['extratordedados/prod', 'tools/apify'],
+        env_keys=['APIFY_TOKEN', 'APIFY_API_KEY'],
+        db_provider='apify',
+    )
     if not apify_token:
-        try:
-            client = boto3.client('secretsmanager', region_name='us-east-1')
-            resp = client.get_secret_value(SecretId='tools/apify')
-            apify_token = _json.loads(resp['SecretString']).get('APIFY_API_KEY')
-        except Exception:
-            pass
-    if not apify_token:
-        apify_token = os.environ.get('APIFY_TOKEN')
-    if not apify_token:
-        raise ConfigError("[APIFY] Token não disponível — verifique AWS SM extratordedados/prod")
+        raise ConfigError("[APIFY] Token não disponível — configure em env, cache local ou AWS SM")
 
     query = f"{niche} em {city} {state}"
     run_input = {
@@ -7355,6 +7945,317 @@ def apify_google_maps_search(niche, city, state, max_results=20):
             leads.append(lead)
 
     print(f"[APIFY_MAPS] '{query}': {len(leads)} leads ({sum(1 for l in leads if l.get('email'))} com email)")
+    return leads
+
+
+# ---- METHOD 6: ReceitaWS CNPJ Search ----
+def search_receita_ws(niche, city, state, max_results=10):
+    """
+    ReceitaWS: busca empresas ativas via API pública da Receita Federal.
+    Endpoint search: https://receitaws.com.br/v1/search (3 req/min free)
+    Enriquece cada CNPJ via publica.cnpj.ws para pegar email/telefone oficial.
+    """
+    leads = []
+    seen_cnpjs = set()
+
+    # Slugify state para ReceitaWS (espera sigla de 2 letras)
+    state_uf = state.upper()[:2] if state else ''
+    city_clean = city.strip()
+
+    queries = [
+        {'query': niche, 'uf': state_uf, 'municipio': city_clean},
+    ]
+
+    for q_params in queries:
+        if len(leads) >= max_results:
+            break
+        try:
+            resp = http_requests.get(
+                'https://receitaws.com.br/v1/search',
+                params={**q_params, 'status': 'A'},
+                timeout=15,
+                headers={'Accept': 'application/json'},
+            )
+            if resp.status_code == 429:
+                print(f"[RECEITA_WS] Rate limit — aguardando 20s")
+                time.sleep(20)
+                continue
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            cnpjs_found = []
+            # Resposta pode ser lista de CNPJs ou dict com 'activities'
+            if isinstance(data, list):
+                for item in data:
+                    cnpj = item.get('cnpj') or item.get('CNPJ') or ''
+                    cnpj_clean = re.sub(r'[.\-/]', '', cnpj)
+                    if len(cnpj_clean) == 14 and cnpj_clean not in seen_cnpjs:
+                        seen_cnpjs.add(cnpj_clean)
+                        cnpjs_found.append(cnpj_clean)
+            elif isinstance(data, dict):
+                for item in data.get('activities', []) + data.get('companies', []):
+                    cnpj = item.get('cnpj') or item.get('CNPJ') or ''
+                    cnpj_clean = re.sub(r'[.\-/]', '', str(cnpj))
+                    if len(cnpj_clean) == 14 and cnpj_clean not in seen_cnpjs:
+                        seen_cnpjs.add(cnpj_clean)
+                        cnpjs_found.append(cnpj_clean)
+
+            # Enriquecer cada CNPJ via publica.cnpj.ws
+            for cnpj in cnpjs_found[:max_results]:
+                if len(leads) >= max_results:
+                    break
+                try:
+                    enrich = http_requests.get(
+                        f'https://publica.cnpj.ws/cnpj/{cnpj}',
+                        timeout=10,
+                        headers={'Accept': 'application/json'},
+                    )
+                    if enrich.status_code == 429:
+                        time.sleep(5)
+                        continue
+                    if enrich.status_code != 200:
+                        continue
+                    d = enrich.json()
+                    est = d.get('estabelecimento') or {}
+                    email = est.get('email') or ''
+                    ddd1 = est.get('ddd1') or ''
+                    tel1 = est.get('telefone1') or ''
+                    phone = f"({ddd1}){tel1}" if ddd1 and tel1 else tel1
+                    nome = d.get('razao_social') or est.get('nome_fantasia') or ''
+                    cidade = est.get('cidade', {}).get('nome', city) if isinstance(est.get('cidade'), dict) else city
+                    uf = est.get('estado', {}).get('sigla', state) if isinstance(est.get('estado'), dict) else state
+                    website = est.get('dominio') or ''
+                    if email or phone:
+                        leads.append({
+                            'company_name': nome,
+                            'email': email.lower() if email else '',
+                            'phone': phone,
+                            'website': website,
+                            'address': est.get('logradouro', ''),
+                            'city': cidade,
+                            'state': uf,
+                            'category': niche,
+                            'source': 'receita_ws',
+                            'source_url': f'https://publica.cnpj.ws/cnpj/{cnpj}',
+                            'extra_data': {'cnpj': cnpj},
+                        })
+                    time.sleep(random.uniform(0.5, 1.0))
+                except Exception as e:
+                    print(f"[RECEITA_WS] Enrich CNPJ {cnpj} erro: {e}")
+                    continue
+
+            # Rate limit: 3 req/min no search endpoint
+            time.sleep(20)
+        except Exception as e:
+            print(f"[RECEITA_WS] Erro na busca: {e}")
+            continue
+
+    print(f"[RECEITA_WS] '{niche} {city}': {len(leads)} leads")
+    return leads
+
+
+# ---- METHOD 7: OLX Service Ads Scraper ----
+_OLX_STATE_SLUGS = {
+    'AC': 'acre', 'AL': 'alagoas', 'AP': 'amapa', 'AM': 'amazonas',
+    'BA': 'bahia', 'CE': 'ceara', 'DF': 'distrito-federal', 'ES': 'espirito-santo',
+    'GO': 'goias', 'MA': 'maranhao', 'MT': 'mato-grosso', 'MS': 'mato-grosso-do-sul',
+    'MG': 'minas-gerais', 'PA': 'para', 'PB': 'paraiba', 'PR': 'parana',
+    'PE': 'pernambuco', 'PI': 'piaui', 'RJ': 'rio-de-janeiro', 'RN': 'rio-grande-do-norte',
+    'RS': 'rio-grande-do-sul', 'RO': 'rondonia', 'RR': 'roraima', 'SC': 'santa-catarina',
+    'SP': 'sao-paulo', 'SE': 'sergipe', 'TO': 'tocantins',
+}
+
+def scrape_olx_ads(niche, city, state, max_results=20):
+    """
+    OLX Service Ads: scrapa anúncios de serviços no OLX.
+    Extrai números WhatsApp (wa.me links) e telefone de anúncios.
+    Usa requests + BeautifulSoup (sem Playwright).
+    """
+    state_uf = state.upper()[:2] if state else ''
+    state_slug = _OLX_STATE_SLUGS.get(state_uf, state_uf.lower())
+    city_q = city.strip().lower().replace(' ', '+')
+    niche_q = niche.strip().lower().replace(' ', '+')
+
+    url = f"https://www.olx.com.br/servicos/estado-{state_slug}?q={niche_q}+{city_q}"
+    leads = []
+    wa_pattern = re.compile(r'wa\.me/(\d+)', re.IGNORECASE)
+    phone_pattern = re.compile(r'(?:\+55\s?)?(?:\(?\d{2}\)?\s?)(?:9\s?)?\d{4}[-\s]?\d{4}')
+
+    try:
+        headers = {'User-Agent': random.choice(USER_AGENTS), 'Accept-Language': 'pt-BR,pt;q=0.9'}
+        resp = http_requests.get(url, headers=headers, timeout=15, verify=False)
+        if resp.status_code != 200:
+            print(f"[OLX_ADS] HTTP {resp.status_code} para {url}")
+            return leads
+
+        soup = BeautifulSoup(resp.text, 'lxml')
+
+        # Links de anúncios individuais
+        ad_links = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if '/servicos/' in href and 'olx.com.br' in href and href not in ad_links:
+                ad_links.append(href)
+            if len(ad_links) >= max_results:
+                break
+
+        print(f"[OLX_ADS] Encontrados {len(ad_links)} anúncios para '{niche} {city}'")
+
+        seen_wa = set()
+        for ad_url in ad_links[:max_results]:
+            try:
+                ad_resp = http_requests.get(ad_url, headers=headers, timeout=10, verify=False)
+                if ad_resp.status_code != 200:
+                    continue
+
+                page_text = ad_resp.text
+                ad_soup = BeautifulSoup(page_text, 'lxml')
+
+                # Extrair título/empresa
+                title_el = ad_soup.find('h1') or ad_soup.find('title')
+                company = title_el.get_text(strip=True)[:100] if title_el else ''
+
+                # Buscar wa.me links
+                wa_numbers = wa_pattern.findall(page_text)
+                phones = phone_pattern.findall(page_text)
+
+                wa_formatted = None
+                if wa_numbers:
+                    raw = wa_numbers[0]
+                    # Garantir formato 55 + número
+                    if not raw.startswith('55'):
+                        raw = '55' + raw
+                    wa_formatted = f"https://wa.me/{raw}"
+                    phone_from_wa = raw[2:] if raw.startswith('55') else raw
+                else:
+                    phone_from_wa = None
+
+                phone_clean = phones[0] if phones else phone_from_wa
+
+                if (wa_formatted or phone_clean) and wa_formatted not in seen_wa:
+                    seen_wa.add(wa_formatted)
+                    leads.append({
+                        'company_name': company,
+                        'phone': phone_clean,
+                        'whatsapp': wa_formatted,
+                        'city': city,
+                        'state': state,
+                        'category': niche,
+                        'source': 'olx_ads',
+                        'source_url': ad_url,
+                    })
+
+                time.sleep(random.uniform(2, 4))
+            except Exception as e:
+                print(f"[OLX_ADS] Erro ao processar anúncio: {e}")
+                continue
+
+    except Exception as e:
+        print(f"[OLX_ADS] Erro geral: {e}")
+
+    print(f"[OLX_ADS] '{niche} {city}': {len(leads)} leads com WhatsApp/telefone")
+    return leads
+
+
+# ---- METHOD 8: WhatsApp Dorks via Serper ----
+def search_whatsapp_dorks(niche, city, state, max_results=15):
+    """
+    WhatsApp Discovery via Serper dorks.
+    Busca por links wa.me/55 relacionados ao nicho e cidade.
+    Extrai números WhatsApp formatados.
+    """
+    api_key = _get_serper_key()
+    if not api_key:
+        raise ConfigError("[WA_DORKS] Serper API key não disponível")
+
+    dorks = [
+        f'"wa.me/55" "{niche}" "{city}"',
+        f'site:wa.me "55" {niche} {city}',
+        f'whatsapp {niche} {city} {state} contato',
+    ]
+
+    wa_pattern = re.compile(r'wa\.me/(\d+)', re.IGNORECASE)
+    leads = []
+    seen_wa = set()
+
+    for dork in dorks:
+        if len(leads) >= max_results:
+            break
+        try:
+            resp = http_requests.post(
+                'https://google.serper.dev/search',
+                json={'q': dork, 'gl': 'br', 'hl': 'pt-br', 'num': 20},
+                headers={'X-API-KEY': api_key, 'Content-Type': 'application/json'},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                raise RuntimeError("[WA_DORKS] Quota Serper esgotada (429)")
+            resp.raise_for_status()
+            data = resp.json()
+
+            for item in data.get('organic', []):
+                # Extrair wa.me do snippet + link
+                text = (item.get('snippet') or '') + ' ' + (item.get('link') or '')
+                wa_numbers = wa_pattern.findall(text)
+                for raw in wa_numbers:
+                    if not raw.startswith('55'):
+                        raw = '55' + raw
+                    wa_url = f"https://wa.me/{raw}"
+                    if wa_url not in seen_wa and len(leads) < max_results:
+                        seen_wa.add(wa_url)
+                        leads.append({
+                            'company_name': item.get('title', ''),
+                            'whatsapp': wa_url,
+                            'phone': raw[2:] if raw.startswith('55') else raw,
+                            'website': item.get('link', ''),
+                            'city': city,
+                            'state': state,
+                            'category': niche,
+                            'source': 'whatsapp_dorks',
+                            'source_url': item.get('link', ''),
+                        })
+
+            # Crawl top URLs que podem ter wa.me links embutidos
+            for item in data.get('organic', [])[:5]:
+                if len(leads) >= max_results:
+                    break
+                link = item.get('link', '')
+                if not link or not is_valid_result_url(link):
+                    continue
+                try:
+                    headers = {'User-Agent': random.choice(USER_AGENTS)}
+                    page_resp = http_requests.get(link, headers=headers, timeout=8, verify=False)
+                    if page_resp.status_code == 200:
+                        found = wa_pattern.findall(page_resp.text)
+                        for raw in found:
+                            if not raw.startswith('55'):
+                                raw = '55' + raw
+                            wa_url = f"https://wa.me/{raw}"
+                            if wa_url not in seen_wa and len(leads) < max_results:
+                                seen_wa.add(wa_url)
+                                leads.append({
+                                    'company_name': item.get('title', ''),
+                                    'whatsapp': wa_url,
+                                    'phone': raw[2:] if raw.startswith('55') else raw,
+                                    'website': link,
+                                    'city': city,
+                                    'state': state,
+                                    'category': niche,
+                                    'source': 'whatsapp_dorks',
+                                    'source_url': link,
+                                })
+                except Exception:
+                    pass
+                time.sleep(random.uniform(0.5, 1.5))
+
+            time.sleep(random.uniform(1, 2))
+        except Exception as e:
+            if '429' in str(e) or 'quota' in str(e).lower():
+                raise
+            print(f"[WA_DORKS] Erro no dork: {e}")
+            continue
+
+    print(f"[WA_DORKS] '{niche} {city}': {len(leads)} leads com WhatsApp")
     return leads
 
 
@@ -8478,18 +9379,38 @@ def send_leads_to_crm():
 
     data = request.get_json() or {}
     lead_ids = data.get('lead_ids', [])
-    filters = data.get('filters', {})
+    filters = data.get('filters', {}) if isinstance(data.get('filters', {}), dict) else {}
     crm_api_url = data.get('crm_api_url', '').strip()
     crm_auth_token = data.get('crm_auth_token', '').strip()
 
     # Validation
     if not crm_api_url or not crm_auth_token:
+        _log_send_to_crm_failure(
+            user_id=user_id,
+            filters=filters,
+            lead_ids=lead_ids,
+            crm_api_url=crm_api_url,
+            error_message='CRM URL and token are required',
+            status_code=400,
+            stage='validation',
+            source='backend',
+        )
         return jsonify({'success': False, 'error': 'CRM URL and token are required'}), 400
 
     # SSRF Prevention: validate CRM URL
     parsed = urlparse(crm_api_url)
     hostname = parsed.hostname or ''
     if not (hostname == 'localhost' or hostname == '127.0.0.1' or parsed.scheme == 'https'):
+        _log_send_to_crm_failure(
+            user_id=user_id,
+            filters=filters,
+            lead_ids=lead_ids,
+            crm_api_url=crm_api_url,
+            error_message='Invalid CRM URL. Only http://localhost, http://127.0.0.1, or https:// URLs are allowed',
+            status_code=400,
+            stage='validation',
+            source='backend',
+        )
         return jsonify({
             'success': False,
             'error': 'Invalid CRM URL. Only http://localhost, http://127.0.0.1, or https:// URLs are allowed'
@@ -8543,6 +9464,16 @@ def send_leads_to_crm():
         rows = c.fetchall()
 
     if not rows:
+        _log_send_to_crm_failure(
+            user_id=user_id,
+            filters=filters,
+            lead_ids=lead_ids,
+            crm_api_url=crm_api_url,
+            error_message='No leads found matching criteria',
+            status_code=404,
+            stage='load_leads',
+            source='backend',
+        )
         return jsonify({
             'success': False,
             'error': 'No leads found matching criteria',
@@ -8562,6 +9493,17 @@ def send_leads_to_crm():
             unique_leads.append(lead)
 
     if not unique_leads:
+        _log_send_to_crm_failure(
+            user_id=user_id,
+            filters=filters,
+            lead_ids=lead_ids,
+            crm_api_url=crm_api_url,
+            error_message='No leads with valid emails found',
+            status_code=404,
+            stage='prepare_payload',
+            total_leads=len(leads),
+            source='backend',
+        )
         return jsonify({
             'success': False,
             'error': 'No leads with valid emails found',
@@ -8595,9 +9537,11 @@ def send_leads_to_crm():
         customers.append(customer)
 
     # Send to CRM API
+    # Note: the CRM bulk-import endpoint expects 'request' (not 'customers').
+    # 'source' is an integer enum on the CRM side — omitted here so the API
+    # applies its own default rather than rejecting an invalid string value.
     payload = {
-        'customers': customers,
-        'source': 'ExtractorImport'
+        'request': customers,
     }
 
     headers = {
@@ -8627,6 +9571,18 @@ def send_leads_to_crm():
             }), 200
         else:
             error_msg = response.text[:200] if response.text else f'HTTP {response.status_code}'
+            _log_send_to_crm_failure(
+                user_id=user_id,
+                filters=filters,
+                lead_ids=lead_ids,
+                crm_api_url=crm_api_url,
+                error_message=f'CRM API error: {error_msg}',
+                status_code=response.status_code,
+                stage='crm_api_request',
+                response_body=response.text,
+                total_leads=len(unique_leads),
+                source='backend',
+            )
             return jsonify({
                 'success': False,
                 'error': f'CRM API error: {error_msg}',
@@ -8636,13 +9592,59 @@ def send_leads_to_crm():
 
     except Exception as e:
         error_str = str(e)[:200]
-        print(f"[SEND_TO_CRM] Error: {error_str}")
+        _log_send_to_crm_failure(
+            user_id=user_id,
+            filters=filters,
+            lead_ids=lead_ids,
+            crm_api_url=crm_api_url,
+            error_message=f'Failed to send leads to CRM: {error_str}',
+            exc=e,
+            status_code=500,
+            stage='crm_api_request',
+            total_leads=len(unique_leads),
+            source='backend',
+        )
         return jsonify({
             'success': False,
             'error': f'Failed to send leads to CRM: {error_str}',
             'sent_count': 0,
             'failed_count': len(unique_leads)
         }), 500
+
+
+@app.route('/api/client-logs/send-to-crm-error', methods=['POST'])
+@limiter.limit("30/minute")
+def client_log_send_to_crm_error():
+    """Persist frontend send-to-CRM failures into system_logs."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    filters = data.get('filters', {}) if isinstance(data.get('filters', {}), dict) else {}
+    lead_ids = data.get('lead_ids', [])
+    crm_api_url = (data.get('crm_api_url') or '').strip()
+    error_message = (data.get('error') or 'Frontend send-to-CRM error').strip()
+    stack = (data.get('stack') or '').strip()
+    stage = (data.get('stage') or 'frontend').strip()
+    status_code = data.get('status_code')
+
+    _log_send_to_crm_failure(
+        user_id=user_id,
+        filters=filters,
+        lead_ids=lead_ids,
+        crm_api_url=crm_api_url,
+        error_message=error_message,
+        stack_text=stack,
+        status_code=status_code,
+        stage=stage,
+        response_body=data.get('response_data'),
+        total_leads=data.get('total_leads'),
+        source='frontend',
+    )
+
+    return jsonify({'ok': True}), 202
 
 
 @app.route('/api/analytics', methods=['GET'])
@@ -8919,6 +9921,12 @@ def start_massive_search():
             total_jobs += min(2, len(niches)) * min(2, len(cities_to_search))
         if 'local_business_data' in methods:
             total_jobs += min(5, len(niches)) * min(3, len(cities_to_search))
+        if 'receita_ws' in methods:
+            total_jobs += min(3, len(niches)) * min(3, len(cities_to_search))
+        if 'olx_ads' in methods:
+            total_jobs += min(3, len(niches)) * min(3, len(cities_to_search))
+        if 'whatsapp_dorks' in methods:
+            total_jobs += min(3, len(niches)) * min(2, len(cities_to_search))
 
         is_shared_val = not is_draft  # draft → is_shared=FALSE; normal → TRUE
         c.execute(
@@ -9134,6 +10142,39 @@ def start_massive_search():
                          city_data.get('region', 'manual'), 1, 'pending', 'apify_maps', datetime.now()))
                     apify_maps_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
 
+        receita_ws_jobs = []
+        if 'receita_ws' in methods:
+            for niche in niches[:3]:
+                for city_data in cities_to_search[:3]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'receita_ws', datetime.now()))
+                    receita_ws_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
+        olx_ads_jobs = []
+        if 'olx_ads' in methods:
+            for niche in niches[:3]:
+                for city_data in cities_to_search[:3]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'olx_ads', datetime.now()))
+                    olx_ads_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
+        whatsapp_dorks_jobs = []
+        if 'whatsapp_dorks' in methods:
+            for niche in niches[:3]:
+                for city_data in cities_to_search[:2]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'whatsapp_dorks', datetime.now()))
+                    whatsapp_dorks_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
         # Bug 2 fix: mark batch as 'processing' now that all jobs are queued
         c.execute("UPDATE batches SET status='processing' WHERE id=%s", (batch_id,))
 
@@ -9229,6 +10270,21 @@ def start_massive_search():
         threading.Thread(target=process_apify_maps_massive,
                          args=(batch_id, apify_maps_jobs, user_id), daemon=True).start()
 
+    # Thread 13: ReceitaWS CNPJ Search (3 req/min free)
+    if receita_ws_jobs:
+        threading.Thread(target=process_receita_ws_massive,
+                         args=(batch_id, receita_ws_jobs, user_id), daemon=True).start()
+
+    # Thread 14: OLX Service Ads (WhatsApp harvesting)
+    if olx_ads_jobs:
+        threading.Thread(target=process_olx_ads_massive,
+                         args=(batch_id, olx_ads_jobs, user_id), daemon=True).start()
+
+    # Thread 15: WhatsApp Dorks via Serper
+    if whatsapp_dorks_jobs:
+        threading.Thread(target=process_whatsapp_dorks_massive,
+                         args=(batch_id, whatsapp_dorks_jobs, user_id), daemon=True).start()
+
     # Bug 4 fix: monitor thread marks batch 'completed' when all jobs finish
     monitor_thread = threading.Thread(target=_monitor_batch_completion, args=(batch_id,), daemon=True)
     monitor_thread.start()
@@ -9254,6 +10310,9 @@ def start_massive_search():
             'cnpj_open': len(cnpj_open_jobs),
             'serper_google': len(serper_google_jobs),
             'apify_maps': len(apify_maps_jobs),
+            'receita_ws': len(receita_ws_jobs),
+            'olx_ads': len(olx_ads_jobs),
+            'whatsapp_dorks': len(whatsapp_dorks_jobs),
         },
         'status': 'processing',
         'message': f'Busca massiva iniciada com {total_jobs} jobs em {len(methods)} métodos'
@@ -9511,9 +10570,10 @@ def _save_leads_to_batch(c, conn, batch_id, leads, source, city, state, provider
             address = lead.get('address') or None
             instagram_url = lead.get('instagram') or None
             linkedin_url = lead.get('linkedin') or None
+            whatsapp = lead.get('whatsapp') or None
 
             # Requer pelo menos UM campo de contato real (não aceita leads só com nome)
-            if not email and not phone and not instagram_url and not linkedin_url:
+            if not email and not phone and not instagram_url and not linkedin_url and not whatsapp:
                 continue
 
             # Limpar e validar nome da empresa antes de salvar
@@ -9537,11 +10597,11 @@ def _save_leads_to_batch(c, conn, batch_id, leads, source, city, state, provider
 
             c.execute(
                 '''INSERT INTO leads (batch_id, company_name, email, phone, website, address,
-                                      instagram, linkedin, city, state, source, extracted_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                      instagram, linkedin, whatsapp, city, state, source, extracted_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT (batch_id, email) DO NOTHING''',
                 (batch_id, company, dedup_email, phone, website, address,
-                 instagram_url, linkedin_url, city, state, source, now)
+                 instagram_url, linkedin_url, whatsapp, city, state, source, now)
             )
             # Bug 3 fix: only count rows actually inserted (rowcount=0 means ON CONFLICT skipped)
             if c.rowcount == 1:
@@ -10203,6 +11263,231 @@ def process_apify_maps_massive(batch_id, jobs_data, user_id):
             pass
 
 
+@_persist_thread_errors('receita_ws')
+def process_receita_ws_massive(batch_id, jobs_data, user_id):
+    """ReceitaWS — busca empresas ativas via API Receita Federal + enriquece CNPJ."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[RECEITA_WS] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'receita_ws', f'batch={batch_id}',
+                f'Iniciando ReceitaWS search. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche, city, state = job_data['niche'], job_data['city'], job_data['state']
+            query = f"{niche} {city} {state}"
+
+            print(f"[RECEITA_WS] Job {job_idx+1}/{len(jobs_data)}: {query}")
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: search_receita_ws(n, ci, s, max_results=10),
+                    provider='receita_ws', query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'receita_ws', city, state, 'RECEITA_WS')
+                    total_saved += leads_saved
+                    status, err_msg = 'completed', None
+                    print(f"[RECEITA_WS] Job {job_idx+1} OK: {leads_saved} leads")
+                    scraper_log('INFO', 'receita_ws', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados'
+                    print(f"[RECEITA_WS] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved if result else 0, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'receita_ws', query, f'Erro: {e}', e)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            # Rate limit: 3 req/min no search endpoint ReceitaWS
+            time.sleep(random.uniform(20, 25))
+
+        scraper_log('INFO', 'receita_ws', f'batch={batch_id}',
+                    f'Thread finalizada. Total: {total_saved} leads.')
+        print(f"[RECEITA_WS] Finalizado. batch={batch_id}, total={total_saved}")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'receita_ws', f'batch={batch_id}', f'Erro crítico: {e}', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@_persist_thread_errors('olx_ads')
+def process_olx_ads_massive(batch_id, jobs_data, user_id):
+    """OLX Ads — scrapa anúncios de serviços no OLX para extrair WhatsApp/telefone."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[OLX_ADS] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'olx_ads', f'batch={batch_id}',
+                f'Iniciando OLX Ads scraping. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche, city, state = job_data['niche'], job_data['city'], job_data['state']
+            query = f"{niche} {city} {state}"
+
+            print(f"[OLX_ADS] Job {job_idx+1}/{len(jobs_data)}: {query}")
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: scrape_olx_ads(n, ci, s, max_results=20),
+                    provider='olx_ads', query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'olx_ads', city, state, 'OLX_ADS')
+                    total_saved += leads_saved
+                    status, err_msg = 'completed', None
+                    print(f"[OLX_ADS] Job {job_idx+1} OK: {leads_saved} leads")
+                    scraper_log('INFO', 'olx_ads', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados'
+                    print(f"[OLX_ADS] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved if result else 0, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'olx_ads', query, f'Erro: {e}', e)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(5, 10))
+
+        scraper_log('INFO', 'olx_ads', f'batch={batch_id}',
+                    f'Thread finalizada. Total: {total_saved} leads.')
+        print(f"[OLX_ADS] Finalizado. batch={batch_id}, total={total_saved}")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'olx_ads', f'batch={batch_id}', f'Erro crítico: {e}', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@_persist_thread_errors('whatsapp_dorks')
+def process_whatsapp_dorks_massive(batch_id, jobs_data, user_id):
+    """WhatsApp Dorks — descobre números WhatsApp via Serper dorks."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[WA_DORKS] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'whatsapp_dorks', f'batch={batch_id}',
+                f'Iniciando WhatsApp Dorks. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+        quota_exceeded = False
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche, city, state = job_data['niche'], job_data['city'], job_data['state']
+            query = f"{niche} {city} {state}"
+
+            if quota_exceeded:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', 'quota_exceeded', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+                continue
+
+            print(f"[WA_DORKS] Job {job_idx+1}/{len(jobs_data)}: {query}")
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: search_whatsapp_dorks(n, ci, s, max_results=15),
+                    provider='whatsapp_dorks', query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'whatsapp_dorks', city, state, 'WA_DORKS')
+                    total_saved += leads_saved
+                    status, err_msg = 'completed', None
+                    print(f"[WA_DORKS] Job {job_idx+1} OK: {leads_saved} leads")
+                    scraper_log('INFO', 'whatsapp_dorks', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados'
+                    if err and ('429' in str(err) or 'quota' in str(err).lower() or isinstance(err, ConfigError)):
+                        quota_exceeded = True
+                    print(f"[WA_DORKS] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved if result else 0, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'whatsapp_dorks', query, f'Erro: {e}', e)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(3, 6))
+
+        scraper_log('INFO', 'whatsapp_dorks', f'batch={batch_id}',
+                    f'Thread finalizada. Total: {total_saved} leads.')
+        print(f"[WA_DORKS] Finalizado. batch={batch_id}, total={total_saved}")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'whatsapp_dorks', f'batch={batch_id}', f'Erro crítico: {e}', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 # ============================================================
 # EXTERNAL APIs INTEGRATION (Apollo.io, PDL, FindThatLead)
 # ============================================================
@@ -10339,10 +11624,25 @@ def enrich_with_external_apis():
     company_name = data.get('company_name', '').strip()
     domain = data.get('domain', '').strip()
 
-    # API keys (can be stored in DB or env vars)
-    apollo_key = os.environ.get('APOLLO_API_KEY')
-    pdl_key = os.environ.get('PDL_API_KEY')
-    findthatlead_key = os.environ.get('FINDTHATLEAD_API_KEY')
+    # API keys with fallback: env -> AWS -> cache local -> DB
+    apollo_key = resolve_secret_value(
+        'APOLLO_API_KEY',
+        secret_ids=['extratordedados/prod'],
+        env_keys=['APOLLO_API_KEY'],
+        db_provider='apollo',
+    )
+    pdl_key = resolve_secret_value(
+        'PDL_API_KEY',
+        secret_ids=['extratordedados/prod'],
+        env_keys=['PDL_API_KEY'],
+        db_provider='pdl',
+    )
+    findthatlead_key = resolve_secret_value(
+        'FINDTHATLEAD_API_KEY',
+        secret_ids=['extratordedados/prod'],
+        env_keys=['FINDTHATLEAD_API_KEY'],
+        db_provider='findthatlead',
+    )
 
     results = []
 
@@ -10378,24 +11678,23 @@ Add this code to app.py after line ~300 (after DB connection pool setup)
 ALEXANDREQUEIROZ_API = 'https://api.alexandrequeiroz.com.br'
 
 def _load_crm_credentials():
-    """Load CRM credentials from AWS Secrets Manager with env var fallback."""
-    try:
-        import boto3
-        client = boto3.client('secretsmanager', region_name='us-east-1')
-        r = client.get_secret_value(SecretId='extratordedados/prod')
-        import json as _json
-        data = _json.loads(r['SecretString'])
-        email = data.get('CRM_EMAIL', 'admin@alexandrequeiroz.com.br')
-        password = data.get('CRM_PASS', '')
-        if password:
-            print(f"[SYNC] CRM credentials loaded from AWS SM")
-            return email, password
-    except Exception as e:
-        print(f"[SYNC] AWS SM unavailable ({e}), using env vars")
-    return (
-        os.environ.get('CRM_EMAIL', 'admin@alexandrequeiroz.com.br'),
-        os.environ.get('CRM_PASS', '')
+    """Load CRM credentials with fallback: env -> AWS -> cache local."""
+    email = resolve_secret_value(
+        'CRM_EMAIL',
+        secret_ids=['extratordedados/prod'],
+        env_keys=['CRM_EMAIL'],
+        default='admin@alexandrequeiroz.com.br',
     )
+    password = resolve_secret_value(
+        'CRM_PASS',
+        secret_ids=['extratordedados/prod'],
+        env_keys=['CRM_PASS'],
+        default='',
+    )
+    if password:
+        return email, password
+    print("[SYNC] CRM credentials unavailable in env, AWS, and local cache")
+    return email, password
 
 ALEXANDREQUEIROZ_EMAIL, ALEXANDREQUEIROZ_PASSWORD = _load_crm_credentials()
 
@@ -11799,6 +13098,33 @@ def crm_sync_status():
     except Exception as e:
         print(f'[ERROR] /api/crm/sync-status: {e}')
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/crm/auto-token', methods=['GET'])
+@limiter.limit("10/minute")
+def crm_auto_token():
+    """
+    Get CRM URL and JWT token automatically.
+    Token is obtained via get_alexandrequeiroz_token() with cache 6h.
+    Used by frontend modal to auto-fill "Enviar para CRM" form.
+    """
+    user = verify_token(get_auth_header())
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        token = get_alexandrequeiroz_token()
+        if not token:
+            return jsonify({'error': 'Não foi possível autenticar no CRM'}), 503
+
+        return jsonify({
+            'crm_url': ALEXANDREQUEIROZ_API,
+            'token': token,
+        }), 200
+
+    except Exception as e:
+        print(f'[ERROR] /api/crm/auto-token: {e}')
+        return jsonify({'error': f'Erro ao obter token: {str(e)[:100]}'}), 500
 
 
 @app.route('/api/crm/sync-now', methods=['POST'])
