@@ -9537,11 +9537,14 @@ def send_leads_to_crm():
         customers.append(customer)
 
     # Send to CRM API
-    # Note: the CRM bulk-import endpoint expects 'request' (not 'customers').
-    # 'source' is an integer enum on the CRM side — omitted here so the API
-    # applies its own default rather than rejecting an invalid string value.
+    # The CRM endpoint expects:
+    #   { "request": { "customers": [...] } }
+    # 'request' is the outer wrapper object; 'customers' is the array inside it.
+    # 'source' is an integer enum — omitted so the API applies its default.
     payload = {
-        'request': customers,
+        'request': {
+            'customers': customers,
+        }
     }
 
     headers = {
