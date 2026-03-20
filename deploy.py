@@ -98,7 +98,7 @@ def get_credentials():
         'FTP_HOST': pick('FTP_HOST', 'ftp.extratordedados.com.br'),
         'FTP_USER': pick('FTP_USER', 'alexa084'),
         'FTP_PASS': pick('FTP_PASS', 'Alexandre10#'),
-        'FTP_ROOT': pick('FTP_ROOT', '/extratordedados.com.br'),
+        'FTP_ROOT': pick('FTP_ROOT', '/'),
     }
     if not creds['VPS_PASS']:
         print("\nERRO: VPS_PASS não encontrado.")
@@ -174,6 +174,20 @@ def deploy_backend(creds):
 HTACCESS = """\
 # trailingSlash: true -> diretorios com index.html (Apache serve nativamente)
 DirectoryIndex index.html
+
+# Disable server-side caching for HTML files (force fresh serve)
+<FilesMatch "\\.html$">
+    Header set Cache-Control "no-cache, no-store, must-revalidate"
+    Header set Pragma "no-cache"
+    Header set Expires "0"
+    Header unset ETag
+    FileETag None
+</FilesMatch>
+
+# Cache static assets aggressively (they have content-hashed names)
+<FilesMatch "\\.(js|css|png|jpg|ico|woff2?)$">
+    Header set Cache-Control "public, max-age=31536000, immutable"
+</FilesMatch>
 
 RewriteEngine On
 RewriteBase /
@@ -252,7 +266,7 @@ def deploy_frontend(creds):
         ensure_dir(remote)
         for item in sorted(os.listdir(local)):
             lp = os.path.join(local, item)
-            rp = remote + '/' + item
+            rp = (remote.rstrip('/') + '/' + item) if remote != '/' else '/' + item
             if os.path.isdir(lp):
                 upload_dir(lp, rp)
             else:
