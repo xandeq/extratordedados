@@ -9537,14 +9537,13 @@ def send_leads_to_crm():
         customers.append(customer)
 
     # Send to CRM API
-    # The CRM endpoint expects:
-    #   { "request": { "customers": [...] } }
-    # 'request' is the outer wrapper object; 'customers' is the array inside it.
-    # 'source' is an integer enum — omitted so the API applies its default.
+    # The CRM endpoint expects flat JSON: { "customers": [...], "source": <int> }
+    # 'source' is an integer enum (0 = default/import). Sending it as a string
+    # causes JSON binding to fail entirely, which is why previous attempts
+    # produced "request field is required" (the [FromBody] parameter went null).
     payload = {
-        'request': {
-            'customers': customers,
-        }
+        'customers': customers,
+        'source': 0,
     }
 
     headers = {
