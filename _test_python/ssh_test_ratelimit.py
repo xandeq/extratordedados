@@ -1,3 +1,4 @@
+import os
 """Debug rate limiting directly on VPS (bypass Traefik)"""
 import paramiko
 import sys
@@ -6,7 +7,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect('185.173.110.180', username='root', password='1982X@ndeq1982#', timeout=15)
+ssh.connect('185.173.110.180', username='root', password=os.environ.get('VPS_PASS', ''), timeout=15)
 
 def run(cmd, timeout=15):
     stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
@@ -22,7 +23,7 @@ cmd = '''
 for i in $(seq 1 8); do
   RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:8000/api/login \
     -H "Content-Type: application/json" \
-    -d '{"username":"admin","password":"1982Xandeq1982#"}')
+    -d '{"username":"admin","password":"REDACTED_PASSWORD"}')
   echo "Request $i: HTTP $RESP"
 done
 '''
@@ -56,7 +57,7 @@ print("\n=== Test with full response headers ===")
 cmd = '''
 curl -s -D - -X POST http://127.0.0.1:8000/api/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"1982Xandeq1982#"}' 2>&1 | head -20
+  -d '{"username":"admin","password":"REDACTED_PASSWORD"}' 2>&1 | head -20
 '''
 out, err = run(cmd)
 print(out)

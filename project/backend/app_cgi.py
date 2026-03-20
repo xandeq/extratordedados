@@ -22,7 +22,7 @@ os.environ['SSL_CERT_FILE'] = os.path.expanduser("~") + "/python_libs/certifi/ca
 os.environ['REQUESTS_CA_BUNDLE'] = os.path.expanduser("~") + "/python_libs/certifi/cacert.pem"
 
 DB_PATH = os.path.expanduser("~") + "/extrator.db"
-ADMIN_PASSWORD_HASH = hashlib.sha256("1982Xandeq1982#".encode()).hexdigest()
+ADMIN_PASSWORD_HASH = hashlib.sha256(os.environ.get("ADMIN_PASSWORD", "").encode()).hexdigest()
 
 # ============= Database =============
 

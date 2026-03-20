@@ -3,6 +3,8 @@ import { useRouter } from 'next/router'
 import { Globe, FileJson, FileText, ClipboardList, Zap, Info, Loader2, Search, Save, Trash2, MapPin, Key, ChevronDown, ChevronUp, CheckCircle2, XCircle, AlertTriangle } from 'lucide-react'
 import api from '../lib/api'
 import { useToast } from '../components/Toast'
+import InfoBox from '../components/InfoBox'
+import Tooltip from '../components/Tooltip'
 
 interface ExtractedContact {
   id: number
@@ -617,13 +619,59 @@ export default function Scrape() {
 
   const selectedCount = extractedContacts.filter((c) => c.selected).length
 
+  // Tab descriptions for InfoBox
+  const tabInfo: Record<Tab, { title: string; description: string; steps?: string[] }> = {
+    search: {
+      title: 'Busca por Nicho + Cidade (DuckDuckGo/Bing)',
+      description: 'Pesquisa empresas no segmento que voce escolher dentro de uma regiao. O sistema acessa cada resultado e extrai emails, telefones e dados da empresa automaticamente.',
+      steps: ['Digite o tipo de negocio (ex: dentista, pet shop)', 'Escolha uma regiao ou informe cidade e estado', 'Clique em Buscar — voce sera redirecionado para o progresso'],
+    },
+    'api-search': {
+      title: 'Busca via API (Hunter.io / Snov.io)',
+      description: 'Usa APIs pagas de enriquecimento de dados para encontrar emails corporativos com maior precisao. Requer configurar uma chave de API primeiro.',
+      steps: ['Configure sua chave de API no painel abaixo', 'Informe o nicho e a regiao desejada', 'Inicie a busca — os creditos da API sao consumidos por resultado'],
+    },
+    url: {
+      title: 'Scraping de URL Unica',
+      description: 'Cole o endereco de um site especifico e o sistema extrai todos os emails, telefones e dados de contato encontrados naquele dominio.',
+      steps: ['Cole a URL do site (ex: https://minhaempresa.com.br)', 'Clique em Extrair e aguarde o resultado'],
+    },
+    json: {
+      title: 'Lote por JSON / Lista de URLs',
+      description: 'Envie um arquivo JSON com uma lista de URLs para processar varios sites de uma vez. Ideal para importar listas exportadas de outras ferramentas.',
+      steps: ['Cole um JSON no formato: [{"website": "url1"}, ...]', 'Ou uma lista simples de URLs separadas por linha', 'Defina um nome para o lote e clique em Iniciar'],
+    },
+    text: {
+      title: 'Lote por Texto (URLs separadas)',
+      description: 'Cole uma lista de URLs em texto puro, uma por linha. O sistema processa cada URL e extrai os dados automaticamente.',
+      steps: ['Cole as URLs no campo (uma por linha)', 'O sistema detecta e valida as URLs automaticamente', 'Clique em Iniciar Lote'],
+    },
+    paste: {
+      title: 'Extrair de Texto Colado',
+      description: 'Cole qualquer texto que contenha emails e telefones (ex: lista de contatos, pagina copiada de um site) e o sistema identifica e organiza os dados automaticamente.',
+      steps: ['Cole o texto bruto no campo abaixo', 'Clique em Extrair — os contatos aparecerao em uma tabela', 'Revise, selecione os que deseja e clique em Salvar Leads'],
+    },
+  }
+
   return (
     <div className="max-w-3xl mx-auto space-y-6 animate-fade-in">
       {/* Header */}
       <div>
-        <h1 className="text-2xl font-bold text-gray-900">Nova Extracao</h1>
+        <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Nova Extracao</h1>
         <p className="text-sm text-gray-500 mt-0.5">Escolha o formato e inicie a extracao de leads</p>
       </div>
+
+      {/* InfoBox */}
+      <InfoBox
+        storageKey="scrape"
+        title="Como extrair leads?"
+        description="Esta pagina tem 6 metodos de extracao. Escolha o que melhor se adapta ao que voce tem disponivel: uma busca por palavras-chave, uma URL, uma lista ou um texto copiado."
+        steps={[
+          'Busca: pesquise por nicho e cidade (mais usado)',
+          'URL Unica: extraia de um site especifico',
+          'Extrair de Texto: cole qualquer conteudo com emails/telefones',
+        ]}
+      />
 
       {/* Tabs */}
       <div className="flex gap-1 p-1 bg-gray-100 rounded-xl">
@@ -655,6 +703,15 @@ export default function Scrape() {
         </div>
       )}
 
+      {/* Tab-level InfoBox */}
+      <InfoBox
+        key={tab}
+        storageKey={`scrape_tab_${tab}`}
+        title={tabInfo[tab].title}
+        description={tabInfo[tab].description}
+        steps={tabInfo[tab].steps}
+      />
+
       {/* Busca por Motor de Busca */}
       {tab === 'search' && (
         <div className="bg-white rounded-xl border border-gray-200 p-6">
@@ -667,8 +724,9 @@ export default function Scrape() {
           <form onSubmit={handleSearchSubmit} className="space-y-4">
             {/* Nicho */}
             <div>
-              <label htmlFor="searchNiche" className="block text-sm font-medium text-gray-700 mb-1.5">
+              <label htmlFor="searchNiche" className="flex items-center gap-1.5 text-sm font-medium text-gray-700 mb-1.5">
                 Nicho / Segmento
+                <Tooltip text="O tipo de negocio que voce quer encontrar. Ex: 'dentista', 'pet shop', 'advogado tributarista'." />
               </label>
               <input
                 id="searchNiche"
@@ -774,8 +832,9 @@ export default function Scrape() {
 
             {/* Max pages */}
             <div>
-              <label htmlFor="searchMaxPages" className="block text-sm font-medium text-gray-700 mb-1.5">
+              <label htmlFor="searchMaxPages" className="flex items-center gap-1.5 text-sm font-medium text-gray-700 mb-1.5">
                 Paginas de resultado (1-3)
+                <Tooltip text="Quantas paginas de resultados do buscador visitar por cidade. Mais paginas = mais leads, porem processo mais lento e maior risco de bloqueio." />
               </label>
               <select
                 id="searchMaxPages"

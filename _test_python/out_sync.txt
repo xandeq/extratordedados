@@ -1,0 +1,27 @@
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] Starting auto-sync for batch 21
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] Found 9 leads to sync for batch 21
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] Obtained new token for alexandrequeiroz.com.br
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] ✅ Created lead: publicidade@exame.com -> ID: 210b256d-2b4b-4ebd-a139-1f1828411828
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] ✅ Created lead: 91162-9770revistaatendimento@exame.comatendimento -> ID: a7bd46c2-de14-4be8-a2b7-443ad484d23e
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] ✅ Created lead: atendimento@exame.com -> ID: e773e0ef-ba70-4033-b95a-bc3882a9f232
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] ✅ Created lead: fornecedores@manimanioca.com.br -> ID: a51e3a9f-d24f-41e9-8aa9-ad4f44a09360
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] ✅ Created lead: reservasmani@manimanioca.com.br -> ID: 9b384c71-0170-46e0-8afe-7234005c2314
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] ✅ Created lead: janaina@estudiosilo.com.br -> ID: 940fd85b-5b09-4495-8776-e09bd665ae85
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] ✅ Created lead: trabalheconosco@domrestaurante.com.br -> ID: c4fb2fc5-c8eb-465f-bdf9-9b254f90cdaa
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] ✅ Created lead: dom@domrestaurante.com.br -> ID: 8313ec9f-6cb6-438e-80bc-c58ade6f00c8
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] ✅ Created lead: comunicacao@domrestaurante.com.br -> ID: c09c0bf3-be7e-4ae7-85e1-e1ca36b4efd4
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] Batch sync complete: 9 created, 0 skipped, 0 errors
+Mar 05 07:57:14 srv961004 gunicorn[1259778]: [SYNC] ✅ Batch 21 sync complete: 9 created, 0 skipped, 0 errors
+Mar 05 11:12:22 srv961004 gunicorn[1448672]: [SYNC] Starting auto-sync for batch 22
+Mar 05 11:12:22 srv961004 gunicorn[1448672]: [SYNC] Batch 22 failed, aborting sync
+Mar 05 11:12:22 srv961004 gunicorn[1448672]: [SYNC] Starting auto-sync for batch 23
+Mar 05 12:23:19 srv961004 gunicorn[1448672]: [SYNC] Found 4 leads to sync for batch 23
+Mar 05 12:23:19 srv961004 gunicorn[1448672]: [SYNC] Obtained new token for alexandrequeiroz.com.br
+Mar 05 12:23:19 srv961004 gunicorn[1448672]: [SYNC] ✅ Created lead: info@restaurantesenvitoria.com -> ID: 5932f8a8-100d-4434-8dd2-0beab1c20206
+Mar 05 12:23:19 srv961004 gunicorn[1448672]: [SYNC] ✅ Created lead: info@euskadigastronomika.eus -> ID: cf09a1ee-0592-44aa-8a9a-656cc9de81a8
+Mar 05 12:23:19 srv961004 gunicorn[1448672]: [SYNC] ✅ Created lead: beartzainkultura@gmail.com -> ID: c59cba1c-e594-4ae2-8045-f5a1c4c84446
+Mar 05 12:23:19 srv961004 gunicorn[1448672]: [SYNC] ✅ Created lead: reservas@el2gasteiz.com -> ID: fb2b3020-1389-408c-9872-599a20e03f8f
+Mar 05 12:23:19 srv961004 gunicorn[1448672]: [SYNC] Batch sync complete: 4 created, 0 skipped, 0 errors
+Mar 05 12:23:19 srv961004 gunicorn[1448672]: [SYNC] ✅ Batch 23 sync complete: 4 created, 0 skipped, 0 errors
+Mar 05 12:28:20 srv961004 gunicorn[1517856]: [SYNC] Starting auto-sync for batch 24
+Mar 05 12:28:20 srv961004 gunicorn[1517856]: [SYNC] Starting auto-sync for batch 25

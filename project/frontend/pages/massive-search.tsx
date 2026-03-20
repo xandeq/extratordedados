@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react';
-import Layout from '../components/Layout';
-import { Search, Target, Zap, MapPin, Database, Globe, Instagram, Linkedin, CheckCircle2, XCircle, Loader2, TrendingUp } from 'lucide-react';
-import api from '../lib/api';
+import { Building2, CheckCircle2, Database, Globe, Hash, Instagram, Linkedin, Loader2, Mail, MapPin, Search, TrendingUp, XCircle, Zap } from 'lucide-react';
 import { useRouter } from 'next/router';
+import { useEffect, useState } from 'react';
+import api from '../lib/api';
+import InfoBox from '../components/InfoBox';
+import Tooltip from '../components/Tooltip';
 
 interface SearchMethod {
   id: string;
@@ -32,18 +33,58 @@ const PREDEFINED_NICHES: Niche[] = [
   { id: 'restaurante', name: 'Restaurante', selected: false },
 ];
 
+const LS_KEY_CUSTOM_NICHES = 'massive_search_custom_niches';
+
+function loadLocalNiches(): string[] {
+  try {
+    const raw = localStorage.getItem(LS_KEY_CUSTOM_NICHES);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+function saveLocalNiches(names: string[]) {
+  try { localStorage.setItem(LS_KEY_CUSTOM_NICHES, JSON.stringify(names)); } catch {}
+}
+
+function mergeCustomNiches(base: Niche[], customNames: string[]): Niche[] {
+  const existing = new Set(base.map(n => n.name.toLowerCase()));
+  const newOnes: Niche[] = customNames
+    .filter(name => !existing.has(name.toLowerCase()))
+    .map((name, i) => ({ id: `custom_${i}_${name}`, name, selected: false }));
+  return newOnes.length > 0 ? [...base, ...newOnes] : base;
+}
+
 const REGIONS = [
-  { id: 'grande-vitoria-es', name: 'Grande Vitória-ES', cities: ['Vitória', 'Vila Velha', 'Serra', 'Cariacica', 'Viana', 'Guarapari', 'Fundão'] },
-  { id: 'grande-sp', name: 'Grande São Paulo-SP', cities: ['São Paulo', 'Guarulhos', 'Osasco', 'Santo André'] },
-  { id: 'grande-rj', name: 'Grande Rio de Janeiro-RJ', cities: ['Rio de Janeiro', 'Niterói', 'Duque de Caxias'] },
-  { id: 'grande-bh', name: 'Grande Belo Horizonte-MG', cities: ['Belo Horizonte', 'Contagem', 'Betim'] },
+  { id: 'grande_vitoria_es', name: 'Grande Vitória-ES', cities: ['Vitória', 'Vila Velha', 'Serra', 'Cariacica', 'Viana', 'Guarapari', 'Fundão'] },
+  { id: 'grande_sp', name: 'Grande São Paulo-SP', cities: ['São Paulo', 'Guarulhos', 'Osasco', 'Santo André'] },
+  { id: 'grande_rj', name: 'Grande Rio de Janeiro-RJ', cities: ['Rio de Janeiro', 'Niterói', 'Duque de Caxias'] },
+  { id: 'grande_bh', name: 'Grande Belo Horizonte-MG', cities: ['Belo Horizonte', 'Contagem', 'Betim'] },
 ];
 
 export default function MassiveSearch() {
   const router = useRouter();
-  const [niches, setNiches] = useState<Niche[]>(PREDEFINED_NICHES);
+  // Initialize with predefined + localStorage (instant, no network)
+  const [niches, setNiches] = useState<Niche[]>(() =>
+    mergeCustomNiches(PREDEFINED_NICHES, loadLocalNiches())
+  );
   const [customNiche, setCustomNiche] = useState('');
-  const [selectedRegion, setSelectedRegion] = useState('grande-vitoria-es');
+
+  // Also load from DB and merge (in case localStorage is incomplete)
+  useEffect(() => {
+    api.get('/api/niches/custom')
+      .then(res => {
+        const saved: { id: number; name: string }[] = res.data?.niches || [];
+        if (saved.length === 0) return;
+        const dbNames = saved.map(s => s.name);
+        // Sync DB niches to localStorage too
+        const localNames = loadLocalNiches();
+        const allNames = Array.from(new Set([...localNames, ...dbNames]));
+        saveLocalNiches(allNames);
+        setNiches(prev => mergeCustomNiches(prev, dbNames));
+      })
+      .catch(() => {});
+  }, []);
+  const [selectedRegion, setSelectedRegion] = useState('grande_vitoria_es');
   const [maxPages, setMaxPages] = useState(2);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -90,22 +131,98 @@ export default function MassiveSearch() {
       rateLimit: '2 empresas/hora',
       enabled: false,
     },
+    {
+      id: 'local_business_data',
+      name: 'Local Business Data',
+      icon: Building2,
+      description: 'Google Maps via API (RapidAPI) — sem browser, dados estruturados',
+      rateLimit: '500 leads/mês (free)',
+      enabled: true,
+    },
+    {
+      id: 'google_email_harvest',
+      name: 'Google Email Harvest',
+      icon: Mail,
+      description: 'Busca emails no Google com dorks + visita os top sites para extrair contatos',
+      rateLimit: '3 nichos × 3 cidades',
+      enabled: true,
+    },
+    {
+      id: 'website_email_crawler',
+      name: 'Website Email Crawler',
+      icon: Globe,
+      description: 'Busca sites via DuckDuckGo e faz deep crawl em /contato, /sobre para extrair emails',
+      rateLimit: '5 nichos × 5 cidades',
+      enabled: true,
+    },
+    {
+      id: 'cnpj_open',
+      name: 'CNPJ Open (Receita Federal)',
+      icon: Hash,
+      description: 'Busca CNPJs em diretórios e enriquece via API OpenCNPJ — email e telefone oficiais',
+      rateLimit: 'Grátis (50 req/s)',
+      enabled: true,
+    },
+    {
+      id: 'serper_google',
+      name: 'Serper Google API',
+      icon: Search,
+      description: 'Google Search API (Serper.dev) — resultados estruturados com emails nos snippets',
+      rateLimit: '2500 buscas/mês (free)',
+      enabled: false,
+    },
+    {
+      id: 'apify_maps',
+      name: 'Apify Google Maps',
+      icon: MapPin,
+      description: 'Apify actor para Google Maps com extração automática de emails dos sites',
+      rateLimit: '~1250 leads/mês ($5 free)',
+      enabled: false,
+    },
   ]);
 
   const toggleNiche = (id: string) => {
     setNiches(niches.map(n => n.id === id ? { ...n, selected: !n.selected } : n));
   };
 
-  const addCustomNiche = () => {
-    if (customNiche.trim()) {
-      const newNiche: Niche = {
-        id: `custom_${Date.now()}`,
-        name: customNiche.trim(),
-        selected: true,
-      };
-      setNiches([...niches, newNiche]);
+  const addCustomNiche = async () => {
+    const name = customNiche.trim();
+    if (!name) return;
+    // Prevent duplicates
+    if (niches.some(n => n.name.toLowerCase() === name.toLowerCase())) {
+      setNiches(prev => prev.map(n =>
+        n.name.toLowerCase() === name.toLowerCase() ? { ...n, selected: true } : n
+      ));
       setCustomNiche('');
+      return;
     }
+
+    const newNiche: Niche = { id: `custom_${Date.now()}`, name, selected: true };
+    setNiches(prev => [...prev, newNiche]);
+    setCustomNiche('');
+
+    // Save to localStorage (always works)
+    const localNames = loadLocalNiches();
+    if (!localNames.some(n => n.toLowerCase() === name.toLowerCase())) {
+      saveLocalNiches([...localNames, name]);
+    }
+
+    // Also persist to DB
+    try {
+      await api.post('/api/niches/custom', { name });
+    } catch {
+      // localStorage already saved — niche persists regardless
+    }
+  };
+
+  const removeCustomNiche = (id: string, name: string) => {
+    // Only allow removing custom niches, not predefined ones
+    if (PREDEFINED_NICHES.some(n => n.id === id)) return;
+    setNiches(prev => prev.filter(n => n.id !== id));
+    const localNames = loadLocalNiches().filter(n => n.toLowerCase() !== name.toLowerCase());
+    saveLocalNiches(localNames);
+    // Also remove from DB (fire-and-forget)
+    api.delete(`/api/niches/custom/${encodeURIComponent(name)}`).catch(() => {});
   };
 
   const toggleMethod = (id: string) => {
@@ -166,8 +283,7 @@ export default function MassiveSearch() {
   const estimatedJobs = selectedNichesCount * enabledMethodsCount * (selectedRegionData?.cities.length || 1);
 
   return (
-    <Layout>
-      <div className="max-w-7xl mx-auto py-8 px-4">
+    <div className="max-w-7xl mx-auto py-8 px-4">
         {/* Header */}
         <div className="mb-8">
           <div className="flex items-center gap-3 mb-3">
@@ -179,6 +295,21 @@ export default function MassiveSearch() {
               <p className="text-gray-600 dark:text-gray-400">Extraia leads usando múltiplos métodos simultaneamente</p>
             </div>
           </div>
+        </div>
+
+        {/* InfoBox */}
+        <div className="mb-6">
+          <InfoBox
+            storageKey="massive_search"
+            title="Busca Massiva — Como funciona?"
+            description="Esta ferramenta dispara varios metodos de extracao ao mesmo tempo para varios nichos e cidades simultaneamente. E a forma mais rapida de capturar muitos leads de uma vez."
+            steps={[
+              'Passo 1: Escolha os tipos de negocio que deseja prospectar',
+              'Passo 2: Selecione a regiao (conjunto de cidades)',
+              'Passo 3: Marque quais metodos de busca ativar (DuckDuckGo, Google Maps, etc.)',
+              'Clique em Iniciar — voce sera redirecionado para o progresso em tempo real',
+            ]}
+          />
         </div>
 
         {/* Alert Messages */}
@@ -206,25 +337,44 @@ export default function MassiveSearch() {
                   1
                 </div>
                 <h2 className="text-xl font-bold text-gray-900 dark:text-white">Selecione os Nichos</h2>
+                <Tooltip text="Nicho = tipo de negocio. Escolha um ou mais. Voce pode adicionar um nicho personalizado se o seu segmento nao estiver na lista." position="right" />
               </div>
 
               <div className="grid grid-cols-2 gap-3 mb-4">
-                {niches.map((niche) => (
-                  <button
-                    key={niche.id}
-                    onClick={() => toggleNiche(niche.id)}
-                    className={`p-3 rounded-lg border-2 transition-all ${
-                      niche.selected
-                        ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300'
-                        : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600 text-gray-700 dark:text-gray-300'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2">
-                      {niche.selected && <CheckCircle2 className="h-4 w-4 flex-shrink-0" />}
-                      <span className="text-sm font-medium">{niche.name}</span>
+                {niches.map((niche) => {
+                  const isCustom = !PREDEFINED_NICHES.some(p => p.id === niche.id);
+                  return (
+                    <div key={niche.id} className="relative group">
+                      <button
+                        onClick={() => toggleNiche(niche.id)}
+                        className={`w-full p-3 rounded-lg border-2 transition-all ${
+                          niche.selected
+                            ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300'
+                            : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600 text-gray-700 dark:text-gray-300'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          {niche.selected && <CheckCircle2 className="h-4 w-4 flex-shrink-0" />}
+                          <span className="text-sm font-medium">{niche.name}</span>
+                          {isCustom && (
+                            <span className="ml-auto text-xs px-1.5 py-0.5 bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 rounded">
+                              custom
+                            </span>
+                          )}
+                        </div>
+                      </button>
+                      {isCustom && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); removeCustomNiche(niche.id, niche.name); }}
+                          className="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+                          title="Remover nicho"
+                        >
+                          &times;
+                        </button>
+                      )}
                     </div>
-                  </button>
-                ))}
+                  );
+                })}
               </div>
 
               {/* Custom Niche Input */}
@@ -253,6 +403,7 @@ export default function MassiveSearch() {
                   2
                 </div>
                 <h2 className="text-xl font-bold text-gray-900 dark:text-white">Selecione a Região</h2>
+                <Tooltip text="A regiao define quais cidades serao pesquisadas. O sistema busca cada nicho em cada cidade da regiao selecionada." position="right" />
               </div>
 
               <div className="space-y-3">
@@ -292,6 +443,7 @@ export default function MassiveSearch() {
                   3
                 </div>
                 <h2 className="text-xl font-bold text-gray-900 dark:text-white">Métodos de Extração</h2>
+                <Tooltip text="Cada metodo usa uma fonte diferente. Ative todos para capturar mais leads. Desative metodos que nao deseja usar (ex: Instagram requer conta configurada)." position="right" />
               </div>
 
               <div className="space-y-3">
@@ -335,8 +487,9 @@ export default function MassiveSearch() {
               <h2 className="text-lg font-bold text-gray-900 dark:text-white mb-4">Opções Avançadas</h2>
 
               <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                <label className="flex items-center gap-1.5 text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                   Páginas por Busca: {maxPages}
+                  <Tooltip text="Quantas paginas de resultados visitar por nicho+cidade. 1 = mais rapido, menos leads. 3 = mais lento, mais leads." />
                 </label>
                 <input
                   type="range"
@@ -381,7 +534,12 @@ export default function MassiveSearch() {
                 </div>
 
                 <div className="pt-4 border-t border-blue-400/30">
-                  <p className="text-blue-100 text-sm mb-1">Jobs Estimados</p>
+                  <p className="flex items-center gap-1 text-blue-100 text-sm mb-1">
+                    Jobs Estimados
+                    <span className="inline-flex">
+                      <Tooltip text="Total de combinacoes: nichos x metodos x cidades. Cada job e executado em paralelo." position="left" />
+                    </span>
+                  </p>
                   <p className="text-3xl font-bold">{estimatedJobs}</p>
                 </div>
 
@@ -434,6 +592,5 @@ export default function MassiveSearch() {
           </div>
         </div>
       </div>
-    </Layout>
   );
 }

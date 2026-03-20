@@ -20,7 +20,7 @@ CORS(app, origins=["https://extratordedados.com.br", "http://extratordedados.com
 
 # Config
 DB_PATH = "/opt/extrator-api/extrator.db"
-ADMIN_PASSWORD_HASH = hashlib.sha256("1982Xandeq1982#".encode()).hexdigest()
+ADMIN_PASSWORD_HASH = hashlib.sha256(os.environ.get("ADMIN_PASSWORD", "").encode()).hexdigest()
 
 # ============= Database =============
 

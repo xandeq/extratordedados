@@ -1,3 +1,4 @@
+import os
 import paramiko
 import ssl
 import socket
@@ -95,7 +96,7 @@ for origin in ['https://extratordedados.com.br', 'http://extratordedados.com.br'
     try:
         context = ssl.create_default_context()
         conn = http.client.HTTPSConnection('api.extratordedados.com.br', 443, timeout=10, context=context)
-        body = json.dumps({'username': 'admin', 'password': '1982Xandeq1982#'})
+        body = json.dumps({'username': 'admin', 'password': 'REDACTED_PASSWORD'})
         headers = {
             'Content-Type': 'application/json',
             'Origin': origin,
@@ -117,7 +118,7 @@ print("\n--- 6. Traefik & API Status on VPS ---")
 try:
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect('185.173.110.180', username='root', password='1982X@ndeq1982#', timeout=15)
+    ssh.connect('185.173.110.180', username='root', password=os.environ.get('VPS_PASS', ''), timeout=15)
 
     commands = [
         ('Traefik status', 'docker service ls --filter name=traefik --format "{{.Name}} {{.Replicas}}"'),

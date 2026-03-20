@@ -1,0 +1,43 @@
+============================================================
+NORMALIZATION FUNCTION TESTS
+============================================================
+
+[PASS]  contato@acme.com.br
+   Company : got="Acme" (expected contains "Acme")
+   Contact : got="" (expected contains "")
+
+[PASS]  joao.silva@gmail.com
+   Company : got="" (expected contains "")
+   Contact : got="Joao Silva" (expected contains "Joao Silva")
+
+[PASS]  fernando.oliveira@outlook.com
+   Company : got="" (expected contains "")
+   Contact : got="Fernando Oliveira" (expected contains "Fernando Oliveira")
+
+[PASS]  financeiro@empresa.com.br
+   Company : got="Empresa" (expected contains "Empresa")
+   Contact : got="" (expected contains "")
+
+[PASS]  rh@bigcorp.com.br
+   Company : got="Bigcorp" (expected contains "Bigcorp")
+   Contact : got="" (expected contains "")
+
+[PASS]  info@techsolutions.com.br
+   Company : got="Techsolutions" (expected contains "Techsolutions")
+   Contact : got="" (expected contains "")
+
+[PASS]  maria.santos@imoveis-vitoria.com.br
+   Company : got="Imoveis Vitoria" (expected contains "Imoveis Vitoria")
+   Contact : got="Maria Santos" (expected contains "Maria Santos")
+
+[PASS]  publicidade@exame.com.br
+   Company : got="Exame" (expected contains "Exame")
+   Contact : got="Publicidade" (expected contains "")
+
+[PASS]  ana.lima@empresa.com.br
+   Company : got="Empresa" (expected contains "Empresa")
+   Contact : got="Ana Lima" (expected contains "Ana Lima")
+
+============================================================
+ALL TESTS PASSED
+============================================================

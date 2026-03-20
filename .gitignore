@@ -27,3 +27,4 @@ __pycache__/
 
 # OS
 NUL
+.deploy.env

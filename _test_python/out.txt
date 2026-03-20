@@ -1,0 +1,10 @@
+﻿Logging in to https://api.alexandrequeiroz.com.br...
+Login Status: 200
+Token length: 481
+
+Testing GET customers...
+GET Status: 200
+
+Testing POST customer...
+POST Status: 409
+POST Response: {"code":"Conflict.Email","message":"Jß existe um cadastro com o e-mail 'test@extrator.com.br'."}

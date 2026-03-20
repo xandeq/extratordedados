@@ -1,3 +1,4 @@
+import os
 """
 AUTO-SYNC TO ALEXANDREQUEIROZ.COM.BR API
 Add this code to app.py after line ~300 (after DB connection pool setup)
@@ -7,7 +8,7 @@ Add this code to app.py after line ~300 (after DB connection pool setup)
 
 ALEXANDREQUEIROZ_API = 'https://api.alexandrequeiroz.com.br'
 ALEXANDREQUEIROZ_EMAIL = 'admin@alexandrequeiroz.com.br'
-ALEXANDREQUEIROZ_PASSWORD = '1982Xandeq1982#'
+ALEXANDREQUEIROZ_PASSWORD = os.environ.get('CRM_PASS', '')
 
 # Global token cache (expires in 6 hours)
 _alexandrequeiroz_token = None

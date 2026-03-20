@@ -4,12 +4,13 @@ Step 2: Deploy upgraded app.py, install dependencies, migrate data, restart serv
 import paramiko
 import sys
 import os
+from _secrets import vps_host, vps_user, vps_pass, db_password
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-VPS_HOST = '185.173.110.180'
-VPS_USER = 'root'
-VPS_PASS = '1982X@ndeq1982#'
+VPS_HOST = vps_host()
+VPS_USER = vps_user()
+VPS_PASS = vps_pass()
 
 LOCAL_APP = r'C:\Users\acq20\Desktop\Trabalho\Alexandre Queiroz Marketing Digital\DIAX\extrator-de-dados\project\backend\app.py'
 LOCAL_REQS = r'C:\Users\acq20\Desktop\Trabalho\Alexandre Queiroz Marketing Digital\DIAX\extrator-de-dados\project\backend\requirements.txt'
@@ -69,7 +70,7 @@ PG_CONFIG = {
     'port': 5432,
     'dbname': 'extrator',
     'user': 'extrator',
-    'password': 'Extr4t0r_S3cur3_2026!',
+    'password': os.environ.get('DB_PASSWORD', ''),
 }
 
 # Check if SQLite DB exists
@@ -187,7 +188,7 @@ Environment=DB_HOST=127.0.0.1
 Environment=DB_PORT=5432
 Environment=DB_NAME=extrator
 Environment=DB_USER=extrator
-Environment=DB_PASSWORD=Extr4t0r_S3cur3_2026!
+Environment=DB_PASSWORD={db_password()}
 ExecStart=/opt/extrator-api/venv/bin/gunicorn --bind 0.0.0.0:8000 --workers 2 --timeout 120 app:app
 Restart=always
 RestartSec=5

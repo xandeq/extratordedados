@@ -57,7 +57,7 @@ print("  PASS: PostgreSQL confirmed")
 
 # 2. Login
 print("\n--- 2. POST /api/login ---")
-r = api_call('POST', '/api/login', {'username': 'admin', 'password': '1982Xandeq1982#'})
+r = api_call('POST', '/api/login', {'username': 'admin', 'password': 'REDACTED_PASSWORD'})
 print(f"  Status: {r['status']}")
 print(f"  Rate Limit: {r['rate_limit']}, Remaining: {r['rate_remaining']}")
 assert r['status'] == 200
@@ -132,7 +132,7 @@ if resp.status == 200:
 print("\n--- 7. Rate Limiting Test (login: 5/min) ---")
 print("  Sending 6 rapid login requests...")
 for i in range(6):
-    r = api_call('POST', '/api/login', {'username': 'admin', 'password': '1982Xandeq1982#'})
+    r = api_call('POST', '/api/login', {'username': 'admin', 'password': 'REDACTED_PASSWORD'})
     status = r['status']
     remaining = r['rate_remaining']
     print(f"  Request {i+1}: status={status}, remaining={remaining}")

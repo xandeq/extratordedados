@@ -10,9 +10,505 @@ import os
 import io
 import csv
 import threading
+import queue
 import random
 import time
+import logging
+import logging.handlers
+import traceback
 from urllib.parse import urlparse, urljoin, quote as requests_quote
+
+# ── Structured error logger for scraper ──────────────────────────────────────
+_scraper_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scraper_errors.log')
+_scraper_logger = logging.getLogger('scraper_errors')
+_scraper_logger.setLevel(logging.DEBUG)
+if not _scraper_logger.handlers:
+    _fh = logging.handlers.RotatingFileHandler(
+        _scraper_log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'
+    )
+    _fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%dT%H:%M:%S'))
+    _scraper_logger.addHandler(_fh)
+
+
+# ── DB log queue (written by background thread) ────────────────────────────────
+_log_queue: queue.Queue = queue.Queue(maxsize=2000)
+
+
+def _db_log_writer():
+    """Daemon thread: drains _log_queue and inserts into system_logs table."""
+    import psycopg2 as _pg2
+    # Delay until DB_CONFIG is populated (app finishes importing)
+    time.sleep(3)
+    while True:
+        try:
+            item = _log_queue.get(timeout=5)
+            if item is None:
+                break
+            # Support both old 6-tuple and new 8-tuple format
+            if len(item) == 6:
+                level, provider, q_text, message, exc_text, fix_prompt = item
+                error_type, extra_json = None, None
+            else:
+                level, provider, q_text, message, exc_text, fix_prompt, error_type, extra_json = item
+            try:
+                conn = _pg2.connect(**DB_CONFIG)
+                c = conn.cursor()
+                c.execute(
+                    '''INSERT INTO system_logs (level, provider, query, message, exception, fix_prompt, error_type, extra_data)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
+                    (level, provider, q_text, message, exc_text, fix_prompt, error_type, extra_json)
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass  # never crash the writer
+        except queue.Empty:
+            continue
+        except Exception:
+            continue
+
+
+_db_log_writer_thread = threading.Thread(target=_db_log_writer, daemon=True)
+_db_log_writer_thread.start()
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(APP_DIR)
+REPO_ROOT = os.path.dirname(PROJECT_DIR)
+SECRETS_CACHE_PATH = os.path.join(REPO_ROOT, '.secrets.cache.json')
+LOCAL_SECRET_ENV_FILES = [
+    os.path.join(REPO_ROOT, '.deploy.env'),
+    os.path.join(REPO_ROOT, '.env'),
+    os.path.join(PROJECT_DIR, '.env'),
+    os.path.join(APP_DIR, '.env'),
+]
+
+_aws_secret_blob_cache = {}
+_aws_secret_blob_failures = {}
+_local_secret_cache = None
+
+os.environ.setdefault('AWS_EC2_METADATA_DISABLED', 'true')
+
+
+def _load_env_file_into_environ(path):
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding='utf-8') as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key:
+                    os.environ.setdefault(key, value)
+    except Exception:
+        pass
+
+
+for _env_file in LOCAL_SECRET_ENV_FILES:
+    _load_env_file_into_environ(_env_file)
+
+
+def _normalize_env_aliases():
+    alias_pairs = [
+        ('DB_PASS', 'DB_PASSWORD'),
+        ('CRM_PASSWORD', 'CRM_PASS'),
+        ('SYNC_PASSWORD', 'CRM_PASS'),
+        ('SYNC_EMAIL', 'CRM_EMAIL'),
+        ('APIFY_API_KEY', 'APIFY_TOKEN'),
+        ('INSTAGRAM_USERNAME', 'INSTAGRAM_USER'),
+        ('INSTAGRAM_PASSWORD', 'INSTAGRAM_PASS'),
+        ('LINKEDIN_USERNAME', 'LINKEDIN_USER'),
+        ('LINKEDIN_PASSWORD', 'LINKEDIN_PASS'),
+    ]
+    for source_key, target_key in alias_pairs:
+        if os.environ.get(source_key) and not os.environ.get(target_key):
+            os.environ[target_key] = os.environ[source_key]
+
+
+_normalize_env_aliases()
+
+
+def _load_local_secret_cache():
+    global _local_secret_cache
+    if _local_secret_cache is not None:
+        return _local_secret_cache
+    try:
+        import json as _json
+        with open(SECRETS_CACHE_PATH, encoding='utf-8') as f:
+            _local_secret_cache = _json.load(f)
+        if not isinstance(_local_secret_cache, dict):
+            _local_secret_cache = {}
+    except Exception:
+        _local_secret_cache = {}
+    return _local_secret_cache
+
+
+def _save_local_secret_cache():
+    try:
+        import json as _json
+        cache = _load_local_secret_cache()
+        with open(SECRETS_CACHE_PATH, 'w', encoding='utf-8') as f:
+            _json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _cache_secret_blob(secret_id, secret_data):
+    if not secret_id or not isinstance(secret_data, dict):
+        return
+    cache = _load_local_secret_cache()
+    cache[secret_id] = secret_data
+    _save_local_secret_cache()
+
+
+def _get_cached_secret_blob(secret_id):
+    if not secret_id:
+        return None
+    cache = _load_local_secret_cache()
+    data = cache.get(secret_id)
+    return data if isinstance(data, dict) else None
+
+
+def _fetch_secret_blob_from_aws(secret_id):
+    if not secret_id:
+        return None
+    if secret_id in _aws_secret_blob_cache:
+        return _aws_secret_blob_cache[secret_id]
+
+    last_failure = _aws_secret_blob_failures.get(secret_id)
+    if last_failure and (time.time() - last_failure) < 300:
+        return None
+
+    try:
+        import boto3
+        import json as _json
+        from botocore.config import Config as _BotoConfig
+
+        client = boto3.client(
+            'secretsmanager',
+            region_name='us-east-1',
+            config=_BotoConfig(connect_timeout=2, read_timeout=3, retries={'max_attempts': 1}),
+        )
+        response = client.get_secret_value(SecretId=secret_id)
+        secret_string = response.get('SecretString') or '{}'
+        secret_data = _json.loads(secret_string)
+        if isinstance(secret_data, dict):
+            _aws_secret_blob_cache[secret_id] = secret_data
+            _cache_secret_blob(secret_id, secret_data)
+            return secret_data
+    except Exception:
+        _aws_secret_blob_failures[secret_id] = time.time()
+    return None
+
+
+def _read_secret_key_from_blob(secret_blob, candidate_keys):
+    if not isinstance(secret_blob, dict):
+        return None
+    for key in candidate_keys:
+        value = secret_blob.get(key)
+        if value:
+            return value
+    return None
+
+
+def _get_secret_from_db(provider, field='api_key'):
+    if not provider or field not in ('api_key', 'api_secret'):
+        return None
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT {field} FROM api_configs WHERE provider = %s AND is_active = TRUE "
+            "ORDER BY updated_at DESC NULLS LAST LIMIT 1",
+            (provider,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return None
+
+
+def resolve_secret_value(key, secret_ids=None, env_keys=None, db_provider=None, db_field='api_key', default=''):
+    candidate_keys = []
+    if env_keys:
+        candidate_keys.extend([k for k in env_keys if k])
+    if key and key not in candidate_keys:
+        candidate_keys.insert(0, key)
+
+    for env_key in candidate_keys:
+        value = os.environ.get(env_key)
+        if value:
+            return value
+
+    for secret_id in (secret_ids or []):
+        live_blob = _fetch_secret_blob_from_aws(secret_id)
+        value = _read_secret_key_from_blob(live_blob, candidate_keys)
+        if value:
+            return value
+
+    for secret_id in (secret_ids or []):
+        cached_blob = _get_cached_secret_blob(secret_id)
+        value = _read_secret_key_from_blob(cached_blob, candidate_keys)
+        if value:
+            return value
+
+    if db_provider:
+        db_value = _get_secret_from_db(db_provider, db_field)
+        if db_value:
+            return db_value
+
+    return default
+
+
+def warm_secrets_cache():
+    """Best effort: hydrate local cache while AWS is available."""
+    for secret_id in ('extratordedados/prod', 'tools/rapidapi', 'tools/serper', 'tools/apify'):
+        _fetch_secret_blob_from_aws(secret_id)
+
+
+warm_secrets_cache()
+
+
+def _classify_error(msg, exc_text):
+    """Classify error type based on message and exception text."""
+    combined = f'{msg or ""} {exc_text or ""}'.lower()
+    if any(k in combined for k in ('rate limit', 'rate_limit', 'ratelimit', '429', 'too many requests')):
+        return 'rate_limit'
+    if any(k in combined for k in ('quota', 'insufficient_quota', 'quotaexceedederror', 'billing', 'credits', 'creditos', '402')):
+        return 'quota_exceeded'
+    if any(k in combined for k in ('timeout', 'timed out', 'connect timeout', 'read timeout')):
+        return 'network_timeout'
+    if any(k in combined for k in ('connection', 'connectionerror', 'connection refused', 'dns', 'unreachable')):
+        return 'connection_error'
+    if any(k in combined for k in ('parse', 'parsing', 'json', 'decode', 'keyerror', 'indexerror', 'attributeerror')):
+        return 'parsing_error'
+    if any(k in combined for k in ('blocked', 'captcha', 'forbidden', '403', 'access denied')):
+        return 'scraping_blocked'
+    if any(k in combined for k in ('sem resultados', 'no results', 'noresult', 'empty response')):
+        return 'no_results'
+    if any(k in combined for k in ('html', 'selector', 'element', 'structure')):
+        return 'html_structure_changed'
+    if any(k in combined for k in ('unavailable', '503', '502', '500', 'server error', 'internal server')):
+        return 'provider_unavailable'
+    if any(k in combined for k in ('auth', 'unauthorized', '401', 'invalid key', 'chave invalida')):
+        return 'auth_error'
+    if any(k in combined for k in ('duplicate', 'unique', 'already exists', 'duplicat')):
+        return 'duplicate_error'
+    if any(k in combined for k in ('retryerror', 'tentativas esgotadas', 'retry exhausted')):
+        return 'retry_exhausted'
+    return 'unknown'
+
+
+def _build_fix_prompt(level, provider, query, msg, exc_text, error_type=None, extra=None):
+    """Generate a ready-to-paste Claude fix prompt for this error/warning."""
+    import inspect
+    frame = inspect.stack()
+    caller_fn = frame[2].function if len(frame) > 2 else 'desconhecida'
+    caller_file = os.path.basename(frame[2].filename) if len(frame) > 2 else 'desconhecido'
+    if not error_type:
+        error_type = _classify_error(msg, exc_text)
+
+    extra = extra or {}
+    prompt = (
+        f"Analise o seguinte erro ocorrido no sistema de scraping de leads.\n\n"
+        f"## Informações do Erro\n"
+        f"- **Nível**: {level}\n"
+        f"- **Tipo de Erro**: {error_type}\n"
+        f"- **Provider/Módulo**: {provider}\n"
+        f"- **Query/Contexto**: {query}\n"
+        f"- **Mensagem**: {msg}\n"
+        f"- **Exceção**: {exc_text or 'N/A'}\n"
+        f"- **Função**: {caller_fn}\n"
+        f"- **Arquivo**: {caller_file}\n"
+    )
+    if extra.get('endpoint'):
+        prompt += f"- **Endpoint**: {extra['endpoint']}\n"
+    if extra.get('source_url'):
+        prompt += f"- **URL/Fonte**: {extra['source_url']}\n"
+    if extra.get('execution_time_ms'):
+        prompt += f"- **Tempo de execução**: {extra['execution_time_ms']}ms\n"
+    if extra.get('retry_count'):
+        prompt += f"- **Tentativas**: {extra['retry_count']}\n"
+    if extra.get('request_params'):
+        prompt += f"- **Parâmetros**: {extra['request_params']}\n"
+
+    prompt += (
+        f"\n## Contexto\n"
+        f"O sistema estava realizando {'busca automática de leads' if not extra.get('context') else extra['context']} "
+        f"usando o provider {provider}.\n\n"
+        f"## Objetivo da análise\n"
+        f"1. Identifique a causa raiz do erro\n"
+        f"2. Proponha correção no código (mostre o código corrigido)\n"
+        f"3. Explique o que causou o problema\n"
+        f"4. Sugira melhorias para evitar que o erro aconteça novamente\n"
+        f"5. Sugira fallback provider caso este falhe\n"
+    )
+    return prompt
+
+
+def scraper_log(level, provider, query, msg, exc=None, **kwargs):
+    """Structured log helper. level: DEBUG/INFO/WARNING/ERROR/CRITICAL.
+    Always logs to file. Only persists ERROR/WARNING/CRITICAL to DB.
+    Optional kwargs: endpoint, source_url, execution_time_ms, retry_count,
+    request_params, context (stored as JSON in extra_data column)."""
+    record = f'provider={provider} query="{query}" msg={msg}'
+    exc_text = None
+    if exc:
+        exc_text = f'{type(exc).__name__}: {exc}'
+        record += f' exc={exc_text}'
+    getattr(_scraper_logger, level.lower())(record)
+    # Only persist ERROR, WARNING, CRITICAL to DB (not DEBUG/INFO)
+    if level.upper() in ('ERROR', 'WARNING', 'CRITICAL'):
+        error_type = _classify_error(str(msg), exc_text)
+        extra = {k: v for k, v in kwargs.items() if v is not None} if kwargs else {}
+        fix_prompt = _build_fix_prompt(level.upper(), provider, query, str(msg), exc_text, error_type, extra)
+        import json as _json
+        extra_json = _json.dumps(extra, ensure_ascii=False, default=str) if extra else None
+        try:
+            _log_queue.put_nowait((level.upper(), provider, query, str(msg), exc_text, fix_prompt, error_type, extra_json))
+        except queue.Full:
+            pass
+
+
+def persist_system_log(level, provider, query, message, exception_text=None, **kwargs):
+    """Persist a structured system log entry to the same queue used by /app-logs."""
+    error_type = _classify_error(str(message), exception_text)
+    extra = {k: v for k, v in kwargs.items() if v is not None} if kwargs else {}
+    fix_prompt = _build_fix_prompt(level.upper(), provider, query, str(message), exception_text, error_type, extra)
+    import json as _json
+    extra_json = _json.dumps(extra, ensure_ascii=False, default=str) if extra else None
+    try:
+        _log_queue.put_nowait((
+            level.upper(),
+            provider,
+            query,
+            str(message),
+            exception_text,
+            fix_prompt,
+            error_type,
+            extra_json,
+        ))
+    except queue.Full:
+        pass
+
+
+def _stack_trace_text(exc=None):
+    if exc and getattr(exc, '__traceback__', None):
+        return ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))[:4000]
+    return ''.join(traceback.format_stack(limit=20))[-4000:]
+
+
+def _log_send_to_crm_failure(*, user_id=None, filters=None, lead_ids=None, crm_api_url=None,
+                             error_message='', exc=None, stack_text=None, status_code=None,
+                             stage=None, response_body=None, total_leads=None, source='backend'):
+    stack_text = (stack_text or '').strip() or _stack_trace_text(exc)
+    persist_system_log(
+        'ERROR',
+        'send_leads_to_crm',
+        'send_leads_to_crm',
+        error_message[:1000],
+        stack_text,
+        action='send_leads_to_crm',
+        timestamp=datetime.now().isoformat(),
+        user_id=user_id,
+        filters=filters or {},
+        lead_ids=lead_ids or [],
+        crm_api_url=crm_api_url,
+        status_code=status_code,
+        stage=stage,
+        response_body=response_body[:1000] if isinstance(response_body, str) else response_body,
+        total_leads=total_leads,
+        source=source,
+        endpoint='/api/leads/send-to-crm',
+        request_params={
+            'filters': filters or {},
+            'lead_ids': lead_ids or [],
+        },
+        context=f'action=send_leads_to_crm stage={stage or "unknown"} user_id={user_id}',
+    )
+
+
+def _persist_thread_errors(provider: str):
+    """
+    Decorator factory: wraps background thread functions with a top-level
+    exception handler that persists any unhandled exception to system_logs.
+    Ensures crashes in daemon threads are always recorded in the database.
+    """
+    import functools
+    import traceback as _tb
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                tb_str = _tb.format_exc()
+                msg = f'Unhandled exception in {fn.__name__}: {type(exc).__name__}: {exc}'
+                print(f'[CRITICAL][{provider.upper()}] {msg}\n{tb_str}')
+                # Log via scraper_log (enqueues to DB)
+                scraper_log('CRITICAL', provider, str(args[:1]), msg, exc)
+                # Also try direct DB insert as fallback (in case queue writer is down)
+                try:
+                    import psycopg2 as _pg2
+                    _error_type = _classify_error(msg, tb_str[:500])
+                    _fix_prompt = _build_fix_prompt('CRITICAL', provider, str(args[:1]), msg, tb_str[:500], _error_type)
+                    _conn = _pg2.connect(**DB_CONFIG)
+                    _c = _conn.cursor()
+                    _c.execute(
+                        '''INSERT INTO system_logs (level, provider, query, message, exception, fix_prompt, error_type)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+                        ('CRITICAL', provider, str(args[:1])[:500], msg[:1000], tb_str[:4000], _fix_prompt[:5000], _error_type)
+                    )
+                    _conn.commit()
+                    _conn.close()
+                except Exception:
+                    pass  # never let the error handler itself crash
+        return wrapper
+    return decorator
+
+
+# ── Scraper custom exceptions ─────────────────────────────────────────────────
+class QuotaExceededError(Exception):
+    """Rate limit / quota exhausted — safe to retry after backoff."""
+
+class BlockedError(Exception):
+    """IP / fingerprint blocked — skip this provider."""
+
+class CaptchaError(Exception):
+    """CAPTCHA detected — do not retry immediately."""
+
+class ConfigError(Exception):
+    """Missing configuration (API key, credentials) — do NOT retry, fail immediately."""
+
+
+# ── Tenacity (retry with backoff) ─────────────────────────────────────────────
+try:
+    from tenacity import (
+        retry, stop_after_attempt, wait_exponential,
+        retry_if_exception_type, RetryError
+    )
+    _TENACITY_AVAILABLE = True
+except ImportError:
+    _TENACITY_AVAILABLE = False
+    # Minimal stub so code below works even without tenacity installed
+    class RetryError(Exception): pass
+    def retry(*a, **kw):
+        def decorator(fn):
+            return fn
+        return decorator
+    def stop_after_attempt(n): return None
+    def wait_exponential(**kw): return None
+    def retry_if_exception_type(t): return None
 
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
@@ -29,12 +525,31 @@ import psycopg2
 from psycopg2 import pool
 from contextlib import contextmanager
 
+# DNS resolver for MX validation (Phase 1)
+try:
+    import dns.resolver as _dns_resolver
+    _DNS_AVAILABLE = True
+except ImportError:
+    _DNS_AVAILABLE = False
+    _dns_resolver = None
+
+# PDF extraction (Phase 2 — imported lazily per call)
+# rapidfuzz for fuzzy dedup (Phase 3 — imported lazily per call)
+
 app = Flask(__name__)
 app.config['PROPAGATE_EXCEPTIONS'] = True
 
 # Trust X-Forwarded-For from Traefik reverse proxy
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    import pytz
+    _APSCHEDULER_AVAILABLE = True
+except ImportError:
+    _APSCHEDULER_AVAILABLE = False
 
 CORS(app)
 
@@ -58,11 +573,11 @@ DB_CONFIG = {
     'port': int(os.environ.get('DB_PORT', 5432)),
     'dbname': os.environ.get('DB_NAME', 'extrator'),
     'user': os.environ.get('DB_USER', 'extrator'),
-    'password': os.environ.get('DB_PASSWORD', 'Extr4t0r_S3cur3_2026!'),
+    'password': os.environ.get('DB_PASSWORD', ''),
 }
 
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD_HASH = hashlib.sha256("1982Xandeq1982#".encode()).hexdigest()
+ADMIN_PASSWORD_HASH = hashlib.sha256(os.environ.get('ADMIN_PASSWORD', '').encode()).hexdigest()
 
 # ============= Anti-Blocking =============
 
@@ -114,6 +629,7 @@ USER_AGENTS = [
 # ============= Search Engine Config =============
 
 SEARCH_REGIONS = {
+    # ---- Sudeste ----
     'grande_vitoria_es': {
         'name': 'Grande Vitoria - ES',
         'state': 'ES',
@@ -124,27 +640,249 @@ SEARCH_REGIONS = {
         'state': 'SP',
         'cities': ['Sao Paulo', 'Guarulhos', 'Osasco', 'Santo Andre', 'Sao Bernardo do Campo', 'Diadema', 'Maua', 'Barueri'],
     },
+    'sp_zona_sul': {
+        'name': 'Sao Paulo Zona Sul - SP',
+        'state': 'SP',
+        'cities': ['Santo Amaro', 'Ipiranga', 'Jabaquara', 'Campo Limpo', 'M Boi Mirim', 'Cidade Ademar', 'Parelheiros'],
+        'neighborhood': True,
+    },
+    'sp_zona_norte': {
+        'name': 'Sao Paulo Zona Norte - SP',
+        'state': 'SP',
+        'cities': ['Santana', 'Tucuruvi', 'Casa Verde', 'Freguesia do O', 'Jaragua', 'Perus', 'Pirituba'],
+        'neighborhood': True,
+    },
+    'sp_zona_leste': {
+        'name': 'Sao Paulo Zona Leste - SP',
+        'state': 'SP',
+        'cities': ['Penha', 'Ermelino Matarazzo', 'Sao Mateus', 'Cidade Tiradentes', 'Itaquera', 'Aricanduva'],
+        'neighborhood': True,
+    },
+    'sp_zona_oeste': {
+        'name': 'Sao Paulo Zona Oeste - SP',
+        'state': 'SP',
+        'cities': ['Lapa', 'Pinheiros', 'Vila Leopoldina', 'Butanta', 'Rio Pequeno', 'Raposo Tavares'],
+        'neighborhood': True,
+    },
     'grande_rj': {
         'name': 'Grande Rio de Janeiro - RJ',
         'state': 'RJ',
         'cities': ['Rio de Janeiro', 'Niteroi', 'Sao Goncalo', 'Duque de Caxias', 'Nova Iguacu', 'Petropolis'],
+    },
+    'rj_zona_sul': {
+        'name': 'Rio de Janeiro Zona Sul - RJ',
+        'state': 'RJ',
+        'cities': ['Ipanema', 'Copacabana', 'Botafogo', 'Flamengo', 'Laranjeiras', 'Gavea', 'Barra da Tijuca'],
+        'neighborhood': True,
     },
     'grande_bh': {
         'name': 'Grande Belo Horizonte - MG',
         'state': 'MG',
         'cities': ['Belo Horizonte', 'Contagem', 'Betim', 'Ribeirao das Neves', 'Santa Luzia', 'Sabara'],
     },
+    'bh_zonas': {
+        'name': 'BH Centro e Bairros - MG',
+        'state': 'MG',
+        'cities': ['Savassi', 'Lourdes', 'Funcionarios', 'Pampulha', 'Santa Efigenia', 'Buritis', 'Venda Nova'],
+        'neighborhood': True,
+    },
+    'grande_campinas': {
+        'name': 'Grande Campinas - SP',
+        'state': 'SP',
+        'cities': ['Campinas', 'Americana', 'Limeira', 'Piracicaba', 'Sumare', 'Hortolandia', 'Indaiatuba'],
+    },
+    # ---- Sul ----
+    'grande_curitiba': {
+        'name': 'Grande Curitiba - PR',
+        'state': 'PR',
+        'cities': ['Curitiba', 'Sao Jose dos Pinhais', 'Colombo', 'Araucaria', 'Campo Largo', 'Pinhais', 'Almirante Tamandare'],
+    },
+    'grande_porto_alegre': {
+        'name': 'Grande Porto Alegre - RS',
+        'state': 'RS',
+        'cities': ['Porto Alegre', 'Canoas', 'Novo Hamburgo', 'Sao Leopoldo', 'Pelotas', 'Caxias do Sul', 'Gravataí'],
+    },
+    'grande_florianopolis': {
+        'name': 'Grande Florianopolis - SC',
+        'state': 'SC',
+        'cities': ['Florianopolis', 'Sao Jose', 'Palhoca', 'Biguacu', 'Governador Celso Ramos', 'Tijucas'],
+    },
+    # ---- Nordeste ----
+    'grande_fortaleza': {
+        'name': 'Grande Fortaleza - CE',
+        'state': 'CE',
+        'cities': ['Fortaleza', 'Caucaia', 'Maracanau', 'Juazeiro do Norte', 'Sobral', 'Crato', 'Iguatu'],
+    },
+    'grande_recife': {
+        'name': 'Grande Recife - PE',
+        'state': 'PE',
+        'cities': ['Recife', 'Olinda', 'Caruaru', 'Petrolina', 'Jaboatao dos Guararapes', 'Camaragibe', 'Paulista'],
+    },
+    'grande_salvador': {
+        'name': 'Grande Salvador - BA',
+        'state': 'BA',
+        'cities': ['Salvador', 'Feira de Santana', 'Vitoria da Conquista', 'Camacari', 'Ilheus', 'Lauro de Freitas'],
+    },
+    'grande_natal': {
+        'name': 'Grande Natal - RN',
+        'state': 'RN',
+        'cities': ['Natal', 'Mossoro', 'Caicó', 'Parnamirim', 'Sao Goncalo do Amarante', 'Macaiba'],
+    },
+    'grande_joao_pessoa': {
+        'name': 'Grande Joao Pessoa - PB',
+        'state': 'PB',
+        'cities': ['Joao Pessoa', 'Campina Grande', 'Santa Rita', 'Bayeux', 'Cabedelo', 'Patos'],
+    },
+    'grande_maceio': {
+        'name': 'Grande Maceio - AL',
+        'state': 'AL',
+        'cities': ['Maceio', 'Arapiraca', 'Palmeira dos Indios', 'Uniao dos Palmares', 'Rio Largo'],
+    },
+    # ---- Norte ----
+    'grande_manaus': {
+        'name': 'Grande Manaus - AM',
+        'state': 'AM',
+        'cities': ['Manaus', 'Parintins', 'Itacoatiara', 'Manacapuru', 'Coari', 'Tefé'],
+    },
+    'grande_belem': {
+        'name': 'Grande Belem - PA',
+        'state': 'PA',
+        'cities': ['Belem', 'Ananindeua', 'Santarem', 'Maraba', 'Castanhal', 'Braganca'],
+    },
+    # ---- Centro-Oeste ----
+    'grande_brasilia': {
+        'name': 'Grande Brasilia - DF',
+        'state': 'DF',
+        'cities': ['Brasilia', 'Taguatinga', 'Ceilandia', 'Gama', 'Aguas Claras', 'Planaltina', 'Sobradinho'],
+    },
+    'grande_goiania': {
+        'name': 'Grande Goiania - GO',
+        'state': 'GO',
+        'cities': ['Goiania', 'Aparecida de Goiania', 'Anapolis', 'Trindade', 'Senador Canedo', 'Rio Verde'],
+    },
+    'grande_campo_grande': {
+        'name': 'Grande Campo Grande - MS',
+        'state': 'MS',
+        'cities': ['Campo Grande', 'Dourados', 'Tres Lagoas', 'Corumba', 'Ponta Pora'],
+    },
+    'grande_cuiaba': {
+        'name': 'Grande Cuiaba - MT',
+        'state': 'MT',
+        'cities': ['Cuiaba', 'Varzea Grande', 'Rondonopolis', 'Sinop', 'Tangara da Serra'],
+    },
 }
 
+# ============= Daily Pipeline Config =============
+
+DAILY_JOB_NICHES = [
+    'restaurante', 'academia', 'clinica medica', 'dentista', 'advocacia',
+    'contabilidade', 'imobiliaria', 'salao de beleza', 'farmacia',
+    'supermercado', 'pizzaria', 'auto pecas', 'mecanica', 'escola',
+    'hotel', 'pousada', 'sorveteria', 'padaria', 'pet shop',
+]
+DAILY_JOB_REGION  = 'grande_vitoria_es'  # região padrão
+DAILY_JOB_HOUR    = 3                    # 3h da manhã, horário de Brasília
+DAILY_JOB_USER_ID = 1                   # user_id do admin que "roda" o job
+DAILY_CRM_SYNC_HOUR = 9                 # 09:00 da manhã para sync CRM automático
+
 SKIP_DOMAINS = {
+    # Redes sociais
     'facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'linkedin.com',
-    'youtube.com', 'tiktok.com', 'pinterest.com', 'reddit.com',
+    'youtube.com', 'tiktok.com', 'pinterest.com', 'reddit.com', 'threads.net',
+    # Marketplaces e classificados
     'mercadolivre.com.br', 'olx.com.br', 'amazon.com.br', 'magazineluiza.com.br',
-    'gov.br', 'wikipedia.org', 'tripadvisor.com', 'tripadvisor.com.br',
-    'reclameaqui.com.br', 'yelp.com', 'glassdoor.com',
-    'google.com', 'google.com.br', 'bing.com', 'duckduckgo.com',
-    'yahoo.com', 'uol.com.br', 'globo.com', 'terra.com.br',
+    'americanas.com.br', 'shopee.com.br', 'submarino.com.br', 'buscape.com.br',
+    # Governo e enciclopédias
+    'gov.br', 'wikipedia.org', 'wikimedia.org', 'wikidata.org',
+    # Avaliações e diretórios genéricos
+    'tripadvisor.com', 'tripadvisor.com.br', 'reclameaqui.com.br',
+    'yelp.com', 'glassdoor.com', 'foursquare.com', 'zomato.com',
+    # Motores de busca
+    'google.com', 'google.com.br', 'bing.com', 'duckduckgo.com', 'yahoo.com',
+    # Portais brasileiros (conteúdo editorial, não empresas)
+    'uol.com.br', 'globo.com', 'terra.com.br', 'r7.com', 'ig.com.br',
+    'msn.com', 'abril.com.br', 'veja.com.br', 'exame.com', 'valor.com.br',
+    # Portais de notícias nacionais
+    'g1.globo.com', 'ge.globo.com', 'gshow.globo.com', 'oglobo.globo.com',
+    'folha.uol.com.br', 'estadao.com', 'estadao.com.br',
+    'correiobraziliense.com.br', 'gazetaonline.com.br', 'agazeta.com.br',
+    'tribunaonline.com.br', 'aquinoticias.com', 'seculodiario.com.br',
+    # Sites de tecnologia e tech media (internacionais)
+    'digitaltrends.com', 'techcrunch.com', 'theverge.com', 'engadget.com',
+    'wired.com', 'gizmodo.com', 'cnet.com', 'zdnet.com', 'lifehacker.com',
+    'tomsguide.com', 'pcmag.com', 'techradar.com', 'makeuseof.com',
+    # Empresas internacionais que não são leads BR
+    'thermofisher.com', 'mabtech.com', 'sigma-aldrich.com', 'merck.com',
+    'cheyenne.org', 'clubic.com', 'businessinsider.com', 'markets.businessinsider.com',
+    # Portais de finanças/mercado (não são empresas-alvo)
+    'infomoney.com.br', 'investing.com', 'tradingview.com',
+    'morningstar.com', 'bloomberg.com', 'reuters.com',
+    # Agregadores educacionais
+    'ifes.edu.br', 'uff.br', 'usp.br', 'unicamp.br', 'ufrj.br',
 }
+
+# Domínios de email irrelevantes para leads BR (empresas/sites não-alvo)
+# Vai além do SKIP_DOMAINS — aplicado na validação de email
+IRRELEVANT_EMAIL_DOMAINS = {
+    'estadao.com', 'estadao.com.br', 'folha.com', 'globo.com',
+    'digitaltrends.com', 'techcrunch.com', 'theverge.com', 'wired.com',
+    'thermofisher.com', 'mabtech.com', 'cheyenne.org', 'clubic.com',
+    'businessinsider.com', 'morningstar.com', 'bloomberg.com', 'reuters.com',
+    'ifes.edu.br', 'instagram.local', 'linkedin.local', 'facebook.local',
+    'noticiasdealava.eus', 'legacyschool.com.br',
+}
+
+# DDDs válidos no Brasil (ANATEL)
+DDD_VALIDOS_BR = {
+    '11', '12', '13', '14', '15', '16', '17', '18', '19',  # SP
+    '21', '22', '24',                                        # RJ
+    '27', '28',                                              # ES
+    '31', '32', '33', '34', '35', '37', '38',               # MG
+    '41', '42', '43', '44', '45', '46',                     # PR
+    '47', '48', '49',                                        # SC
+    '51', '53', '54', '55',                                  # RS
+    '61',                                                    # DF
+    '62', '64',                                              # GO
+    '63',                                                    # TO
+    '65', '66',                                              # MT
+    '67',                                                    # MS
+    '68',                                                    # AC
+    '69',                                                    # RO
+    '71', '73', '74', '75', '77',                           # BA
+    '79',                                                    # SE
+    '81', '87',                                              # PE
+    '82',                                                    # AL
+    '83',                                                    # PB
+    '84',                                                    # RN
+    '85', '88',                                              # CE
+    '86', '89',                                              # PI
+    '91', '93', '94',                                        # PA
+    '92', '97',                                              # AM
+    '95',                                                    # RR
+    '96',                                                    # AP
+    '98', '99',                                              # MA
+}
+
+# Sufixos/padrões que indicam empresa estrangeira
+FOREIGN_COMPANY_PATTERNS = [
+    r'\bInc\.?\b', r'\bLLC\b', r'\bLtd\.?\b', r'\bCO\s+LTD\b',
+    r'\bGmbH\b', r'\bS\.A\.S\.?\b', r'\bCorp\.?\b', r'\bPLC\b',
+    r'\bAG\b', r'\bNV\b', r'\bBV\b', r'\bSRL\b',
+]
+_FOREIGN_COMPANY_RE = re.compile('|'.join(FOREIGN_COMPANY_PATTERNS), re.IGNORECASE)
+
+# Prefixos de busca que contaminam o campo city
+_CITY_GARBAGE_RE = re.compile(
+    r'^(?:escritório|escritorio|advogado|advocacia|clínica|clinica|dentista'
+    r'|restaurante|padaria|hotel|pousada|escola|academia|farmácia|farmacia'
+    r'|supermercado|mecânica|mecanica|salão|salao|pet\s*shop|imobiliária|imobiliaria'
+    r'|contabilidade|psicólogo|psicologo|médico|medico|veterinário|veterinario'
+    r'|[a-záéíóúàãõâêîôûç\s]+)\s+(?:em|in|de|do|da|no|na)\s+',
+    re.IGNORECASE
+)
+
+# Máximo de leads com o mesmo domínio de email por batch
+MAX_LEADS_PER_EMAIL_DOMAIN = 5
 
 # ============= Email Quality Filters =============
 
@@ -181,6 +919,15 @@ EMAIL_LOW_QUALITY_PATTERNS = [
     r'^(root|admin|administrator|system|daemon)@',
     r'^(info|contact|contato|atendimento|suporte|support|sales|vendas)@',
     r'^(newsletter|news|noticias|updates|marketing)@',
+    r'^(financeiro|rh|recursos-humanos|fiscal|comercial|recepcao|portaria)@',
+    r'^(contabilidade|vendas|sac|ouvidoria|diretoria|gestao)@',
+]
+
+# Sufixos empresariais comuns para limpeza de nomes
+CORPORATE_SUFFIXES = [
+    ' LTDA', ' S/A', ' SA', ' EIRELI', ' ME', ' EPP', ' MEI',
+    ' LIMITADA', ' SERVICOS', ' SERVICE', ' SOLUTIONS', ' CONSULTORIA',
+    ' ASSESSORIA', ' EMPREENDIMENTOS', ' PARTICIPACOES',
 ]
 
 # TLDs de países irrelevantes (quando busca é Brasil)
@@ -206,6 +953,149 @@ DELAY_BETWEEN_DOMAINS = 2
 DELAY_BETWEEN_SUBPAGES = 1
 REQUEST_TIMEOUT = 10
 MAX_SITEMAP_URLS = 20
+
+# ============= MX Record Validation (Phase 1) =============
+
+_MX_CACHE = {}           # domain -> (result: bool|None, timestamp: float)
+_MX_CACHE_TTL = 86400    # 24 hours
+
+def has_valid_mx(domain):
+    """
+    Check if domain has at least one MX record.
+    Returns True (has MX), False (no MX = cannot receive email), None (unknown/timeout).
+    Cached for 24h to avoid hammering DNS servers during scraping runs.
+    """
+    if not _DNS_AVAILABLE or not domain:
+        return None
+    domain = domain.lower().strip().rstrip('.')
+    # Skip obviously invalid domains
+    if not domain or '.' not in domain or len(domain) < 4:
+        return False
+    now = time.time()
+    if domain in _MX_CACHE:
+        result, ts = _MX_CACHE[domain]
+        if now - ts < _MX_CACHE_TTL:
+            return result
+    try:
+        _dns_resolver.resolve(domain, 'MX', lifetime=3.0)
+        result = True
+    except (_dns_resolver.NXDOMAIN, _dns_resolver.NoAnswer, _dns_resolver.NoNameservers):
+        result = False
+    except Exception:
+        result = None  # Network error or timeout — unknown, don't penalize
+    _MX_CACHE[domain] = (result, now)
+    # Trim oldest entries when cache grows large
+    if len(_MX_CACHE) > 3000:
+        sorted_keys = sorted(_MX_CACHE, key=lambda k: _MX_CACHE[k][1])
+        for k in sorted_keys[:500]:
+            _MX_CACHE.pop(k, None)
+    return result
+
+
+# ============= BrasilAPI CNPJ Enrichment (Phase 1) =============
+
+_CNPJ_CACHE = {}             # cnpj_digits -> (data: dict, timestamp: float)
+_CNPJ_CACHE_TTL = 86400 * 30 # 30 days — CNPJ data doesn't change often
+
+def enrich_cnpj_brasilapi(cnpj_raw):
+    """
+    Enrich CNPJ data via BrasilAPI (100% free, no API key needed).
+    Returns enrichment dict or {} on failure/not-found.
+    BrasilAPI rate limit: ~3 req/s — callers should add delay externally.
+    Includes: razao_social, nome_fantasia, phone, address, CNAE, QSA (partners),
+              situacao_cadastral, porte, data_abertura, email (when available).
+    """
+    cnpj = re.sub(r'[^0-9]', '', cnpj_raw or '')
+    if len(cnpj) != 14:
+        return {}
+    now = time.time()
+    if cnpj in _CNPJ_CACHE:
+        data, ts = _CNPJ_CACHE[cnpj]
+        if now - ts < _CNPJ_CACHE_TTL:
+            return data
+    try:
+        url = f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}"
+        r = http_requests.get(
+            url, timeout=8,
+            headers={'User-Agent': random.choice(USER_AGENTS), 'Accept': 'application/json'}
+        )
+        if r.status_code == 200:
+            d = r.json()
+            phone1 = re.sub(r'[^0-9]', '', d.get('ddd_telefone_1') or '')
+            phone2 = re.sub(r'[^0-9]', '', d.get('ddd_telefone_2') or '')
+            qsa_names = [
+                q.get('nome_socio', '')
+                for q in (d.get('qsa') or [])
+                if q.get('nome_socio')
+            ]
+            address_parts = filter(None, [
+                d.get('logradouro'), d.get('numero'),
+                d.get('complemento'), d.get('bairro')
+            ])
+            email_rf = (d.get('email') or '').lower().strip() or None
+            result = {
+                'razao_social': d.get('razao_social'),
+                'nome_fantasia': d.get('nome_fantasia'),
+                'phone': phone1 if phone1 else (phone2 if phone2 else None),
+                'phone2': phone2 if phone1 and phone2 else None,
+                'city': d.get('municipio'),
+                'state': d.get('uf'),
+                'cep': d.get('cep'),
+                'address': ' '.join(address_parts).strip(),
+                'cnae': d.get('cnae_fiscal_descricao'),
+                'cnae_code': str(d.get('cnae_fiscal', '')),
+                'situacao': d.get('descricao_situacao_cadastral'),
+                'porte': d.get('porte'),
+                'abertura': d.get('data_inicio_atividade'),
+                'qsa': qsa_names[:5],
+                'email_rf': email_rf,
+                'natureza': d.get('natureza_juridica'),
+                'capital_social': d.get('capital_social'),
+            }
+            _CNPJ_CACHE[cnpj] = (result, now)
+            print(f"[brasilapi] CNPJ {cnpj}: {result.get('razao_social')} | {result.get('situacao')} | CNAE: {result.get('cnae')}")
+            return result
+        elif r.status_code == 404:
+            _CNPJ_CACHE[cnpj] = ({}, now)
+            print(f"[brasilapi] CNPJ {cnpj}: não encontrado (404)")
+        elif r.status_code == 429:
+            print(f"[brasilapi] Rate limit atingido — aguardando 10s")
+            time.sleep(10)
+    except Exception as e:
+        print(f"[brasilapi] Erro CNPJ {cnpj}: {type(e).__name__}: {e}")
+    return {}
+
+
+def build_lead_from_cnpj_enrichment(cnpj_raw, enrichment):
+    """
+    Converts BrasilAPI enrichment dict into lead field updates.
+    Only fills fields that are empty/None in the existing lead.
+    """
+    if not enrichment:
+        return {}
+    updates = {}
+    # Company name: prefer nome_fantasia, fallback razao_social
+    name = enrichment.get('nome_fantasia') or enrichment.get('razao_social')
+    if name:
+        updates['company_name_cnpj'] = name.title()
+    if enrichment.get('phone'):
+        updates['phone_cnpj'] = enrichment['phone']
+    if enrichment.get('address'):
+        updates['address_cnpj'] = enrichment['address']
+    if enrichment.get('city'):
+        updates['city_cnpj'] = enrichment['city']
+    if enrichment.get('state'):
+        updates['state_cnpj'] = enrichment['state']
+    if enrichment.get('cnae'):
+        updates['category_cnpj'] = enrichment['cnae']
+    if enrichment.get('email_rf'):
+        updates['email_rf'] = enrichment['email_rf']
+    if enrichment.get('qsa'):
+        updates['qsa'] = enrichment['qsa']
+    if enrichment.get('situacao'):
+        updates['cnpj_status'] = enrichment['situacao']
+    return updates
+
 
 # ============= Connection Pool =============
 
@@ -243,6 +1133,7 @@ def init_db():
             username VARCHAR(100) UNIQUE NOT NULL,
             password_hash VARCHAR(64) NOT NULL,
             is_admin BOOLEAN DEFAULT FALSE,
+            plan VARCHAR(20) DEFAULT 'free',
             created_at TIMESTAMP DEFAULT NOW()
         )''')
 
@@ -332,6 +1223,27 @@ def init_db():
             ('extra_data', 'JSONB'),
         ]
 
+        # Phase 1 (Foundation): CNPJ enrichment + MX validation columns
+        new_columns += [
+            ('cnpj_trade_name', 'VARCHAR(255)'),
+            ('cnpj_status', 'VARCHAR(50)'),
+            ('cnpj_cnae', 'VARCHAR(255)'),
+            ('cnpj_abertura', 'VARCHAR(20)'),
+            ('cnpj_porte', 'VARCHAR(50)'),
+            ('cnpj_qsa', 'TEXT'),
+            ('cnpj_enriched', 'BOOLEAN DEFAULT FALSE'),
+            ('mx_valid', 'BOOLEAN'),
+            ('email_type', 'VARCHAR(20)'),
+            ('lead_score', 'INTEGER DEFAULT 0'),
+        ]
+
+        # Phase 2: PDF + Email Pattern + Enhanced crawl columns
+        new_columns += [
+            ('email_pattern', 'VARCHAR(255)'),
+            ('team_members', 'TEXT'),
+            ('pdf_emails_found', 'BOOLEAN DEFAULT FALSE'),
+        ]
+
         for col_name, col_type in new_columns:
             try:
                 c.execute(f'ALTER TABLE leads ADD COLUMN {col_name} {col_type}')
@@ -409,11 +1321,134 @@ def init_db():
             UNIQUE(domain, provider)
         )''')
 
+        c.execute('''CREATE TABLE IF NOT EXISTS daily_jobs (
+            id SERIAL PRIMARY KEY,
+            started_at TIMESTAMP DEFAULT NOW(),
+            finished_at TIMESTAMP,
+            status VARCHAR(20) DEFAULT 'running',
+            batch_id INTEGER,
+            niches_used TEXT[],
+            region_used VARCHAR(50),
+            leads_found INTEGER DEFAULT 0,
+            leads_sanitized INTEGER DEFAULT 0,
+            leads_synced INTEGER DEFAULT 0,
+            leads_skipped INTEGER DEFAULT 0,
+            error_message TEXT
+        )''')
+
+        # CRM Sync Log — for daily automatic 09:00 sync and manual syncs
+        c.execute('''CREATE TABLE IF NOT EXISTS crm_sync_logs (
+            id SERIAL PRIMARY KEY,
+            started_at TIMESTAMP DEFAULT NOW(),
+            finished_at TIMESTAMP,
+            status VARCHAR(20) DEFAULT 'running',
+            leads_total INTEGER DEFAULT 0,
+            leads_synced INTEGER DEFAULT 0,
+            leads_skipped INTEGER DEFAULT 0,
+            leads_failed INTEGER DEFAULT 0,
+            error_message TEXT,
+            trigger VARCHAR(20) DEFAULT 'scheduled'
+        )''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_crm_sync_logs_started ON crm_sync_logs(started_at DESC)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_crm_sync_logs_status ON crm_sync_logs(status)')
+
+        c.execute('''CREATE TABLE IF NOT EXISTS system_logs (
+            id SERIAL PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT NOW(),
+            level VARCHAR(10) NOT NULL,
+            provider VARCHAR(50),
+            query TEXT,
+            message TEXT NOT NULL,
+            exception TEXT
+        )''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_system_logs_created ON system_logs(created_at DESC)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_system_logs_level ON system_logs(level)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_system_logs_provider ON system_logs(provider)')
+
+        # fix_prompt column on system_logs (added later, migrate safely)
+        try:
+            c.execute("ALTER TABLE system_logs ADD COLUMN fix_prompt TEXT")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+
+        # error_type + extra_data columns on system_logs (v2 logs)
+        try:
+            c.execute("ALTER TABLE system_logs ADD COLUMN error_type VARCHAR(50)")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+        try:
+            c.execute("ALTER TABLE system_logs ADD COLUMN extra_data JSONB")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+        c.execute('CREATE INDEX IF NOT EXISTS idx_system_logs_error_type ON system_logs(error_type)')
+
+        # Custom niches table (user-saved niches for massive search)
+        c.execute('''CREATE TABLE IF NOT EXISTS custom_niches (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(name)
+        )''')
+
         # enrichment_source column on search_jobs
         try:
             c.execute("ALTER TABLE search_jobs ADD COLUMN enrichment_source VARCHAR(30) DEFAULT 'scraping'")
         except psycopg2.errors.DuplicateColumn:
             conn.rollback()
+
+        # SaaS Foundation: plan column on users
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN plan VARCHAR(20) DEFAULT 'free'")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+
+        # SaaS Foundation: usage tracking table
+        c.execute('''CREATE TABLE IF NOT EXISTS usage_tracking (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            month_year VARCHAR(7) NOT NULL,
+            leads_viewed INTEGER DEFAULT 0,
+            leads_exported INTEGER DEFAULT 0,
+            reset_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, month_year)
+        )''')
+
+        # SaaS Foundation: plan limits configuration
+        c.execute('''CREATE TABLE IF NOT EXISTS plan_limits (
+            id SERIAL PRIMARY KEY,
+            plan_name VARCHAR(20) UNIQUE NOT NULL,
+            leads_per_month INTEGER NOT NULL,
+            exports_per_month INTEGER NOT NULL,
+            price_monthly DECIMAL(10, 2) DEFAULT 0,
+            features JSONB,
+            created_at TIMESTAMP DEFAULT NOW()
+        )''')
+
+        # Initialize plan limits if not exists
+        c.execute('SELECT COUNT(*) FROM plan_limits')
+        if c.fetchone()[0] == 0:
+            c.execute('''INSERT INTO plan_limits (plan_name, leads_per_month, exports_per_month, price_monthly, features)
+                VALUES
+                    ('free', 100, 1, 0, '{"leads_view": true, "export_csv": true, "filters": ["email", "phone", "city", "state"], "saved_filters": false}'::jsonb),
+                    ('pro', 5000, 20, 99, '{"leads_view": true, "export_csv": true, "export_json": true, "filters": ["email", "phone", "city", "state", "category", "crm_status"], "saved_filters": true, "bulk_actions": true}'::jsonb),
+                    ('enterprise', 999999, 999999, 0, '{"leads_view": true, "export_csv": true, "export_json": true, "export_whatsapp": true, "filters": ["*"], "saved_filters": true, "bulk_actions": true, "api_access": true}'::jsonb)
+            ''')
+
+        # Saved filters (Semana 2)
+        c.execute('''CREATE TABLE IF NOT EXISTS saved_filters (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            name VARCHAR(100) NOT NULL,
+            filters JSONB NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, name)
+        )''')
+
+        # Indexes
+        c.execute('CREATE INDEX IF NOT EXISTS idx_usage_tracking_user_month ON usage_tracking(user_id, month_year)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_usage_tracking_month ON usage_tracking(month_year)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_users_plan ON users(plan)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_saved_filters_user ON saved_filters(user_id)')
 
         # Indexes
         c.execute('CREATE INDEX IF NOT EXISTS idx_emails_job_id ON emails(job_id)')
@@ -429,6 +1464,15 @@ def init_db():
         c.execute('CREATE INDEX IF NOT EXISTS idx_api_usage_user_month ON api_usage(user_id, month_year)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_api_cache_domain ON api_cache(domain, provider)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_api_cache_expires ON api_cache(expires_at)')
+
+        # Semana 4: Shared lead base — mark all batches as shared by default
+        try:
+            c.execute("ALTER TABLE batches ADD COLUMN is_shared BOOLEAN DEFAULT TRUE")
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+        # Backfill: ensure all existing batches are marked as shared
+        c.execute("UPDATE batches SET is_shared = TRUE WHERE is_shared IS NULL")
+        c.execute('CREATE INDEX IF NOT EXISTS idx_batches_is_shared ON batches(is_shared)')
 
         # Insert admin user if not exists
         c.execute('SELECT id FROM users WHERE username = %s', (ADMIN_USERNAME,))
@@ -555,6 +1599,13 @@ def calculate_email_quality_score(email_str):
     if domain.endswith('.com.br') or domain.endswith('.med.br'):
         score += 10
 
+    # Validação MX: domínio sem registro MX não pode receber emails (Phase 1)
+    mx_result = has_valid_mx(domain)
+    if mx_result is True:
+        score += 10   # Bônus: domínio confirmado com servidor de email
+    elif mx_result is False:
+        return 0, False, f'no_mx_record:{domain}'  # Domínio não aceita email
+
     # Garantir range 0-100
     score = max(0, min(100, score))
 
@@ -566,6 +1617,8 @@ def normalize_email(email_str):
     Returns the normalized email or None if invalid/low-quality.
     """
     email_str = email_str.strip().lower()
+    # Remove scraping artifacts prepended to email (e.g. "e-mailcontato@..." → "contato@...")
+    email_str = re.sub(r'^(e-mail|email:|mailto:|e\.mail|email\s*[:=])\s*', '', email_str, flags=re.I)
     email_str = email_str.rstrip('.')
 
     score, is_valid, rejection_reason = calculate_email_quality_score(email_str)
@@ -891,8 +1944,11 @@ def extract_data_from_html(html, url):
     # Extract phones
     phones = extract_phones(text)
 
-    # Extract company name
+    # Extract company name + normalize on extraction
     company_name = extract_company_name(soup, url)
+    # Normalize at extraction time (encoding, title case, generic detection)
+    # email/website not yet known here; full normalize happens in sanitize_single_lead
+    company_name = extract_clean_company_name(company_name) if company_name else company_name
 
     # Phase 3: Extract social media profiles
     socials = extract_social_media(soup)
@@ -991,6 +2047,697 @@ def deep_crawl_domain(url, session=None):
         'pages_crawled': len(pages_crawled),
         **agg,  # Phase 3: all new fields
     }
+
+# ============= Phase 2: PDF + Email Pattern + Enhanced Extraction =============
+
+try:
+    import pdfplumber as _pdfplumber
+    _PDF_AVAILABLE = True
+except ImportError:
+    _pdfplumber = None
+    _PDF_AVAILABLE = False
+
+def extract_pdf_emails(pdf_url, session=None):
+    """Download a PDF and extract emails from its text content."""
+    if not _PDF_AVAILABLE:
+        return []
+    try:
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        if session:
+            resp = session.get(pdf_url, timeout=15, verify=False, headers=headers, stream=True)
+        else:
+            resp = http_requests.get(pdf_url, timeout=15, verify=False, headers=headers, stream=True)
+        if resp.status_code != 200:
+            return []
+        content_type = resp.headers.get('content-type', '')
+        if 'pdf' not in content_type and not pdf_url.lower().endswith('.pdf'):
+            return []
+        # Limit PDF size to 5MB
+        content = b''
+        for chunk in resp.iter_content(8192):
+            content += chunk
+            if len(content) > 5 * 1024 * 1024:
+                break
+        import io
+        found = set()
+        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+        with _pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages[:10]:  # max 10 pages
+                text = page.extract_text() or ''
+                for em in re.findall(email_pattern, text):
+                    found.add(em.lower().strip())
+        # Normalize & validate
+        result = []
+        for em in found:
+            normalized = normalize_email(em)
+            if normalized:
+                result.append(normalized)
+        return result
+    except Exception as e:
+        print(f"[pdf] Error extracting from {pdf_url}: {e}")
+        return []
+
+
+def extract_pdf_links_from_html(soup, base_url):
+    """Find PDF links in a page (contact/privacy policy PDFs often have emails)."""
+    pdf_links = []
+    for tag in soup.find_all('a', href=True):
+        href = tag['href'].strip()
+        if not href:
+            continue
+        href_lower = href.lower()
+        if href_lower.endswith('.pdf') or 'pdf' in href_lower:
+            # Make absolute URL
+            if href.startswith('http'):
+                pdf_links.append(href)
+            elif href.startswith('/'):
+                parsed = urlparse(base_url)
+                pdf_links.append(f"{parsed.scheme}://{parsed.netloc}{href}")
+            if len(pdf_links) >= 3:  # max 3 PDFs per page
+                break
+    return pdf_links
+
+
+def detect_email_pattern(emails_list, domain):
+    """
+    Detect company email naming pattern from 2+ emails on same domain.
+    Returns pattern string like 'nome.sobrenome@domain.com' or None.
+    """
+    if not emails_list or not domain:
+        return None
+    domain = domain.lower().strip()
+    # Filter emails from target domain
+    domain_emails = [e for e in emails_list if e.lower().endswith('@' + domain)]
+    if len(domain_emails) < 2:
+        return None
+
+    locals_list = [e.split('@')[0] for e in domain_emails]
+
+    # Count separators
+    dot_count = sum(1 for l in locals_list if '.' in l)
+    underscore_count = sum(1 for l in locals_list if '_' in l)
+
+    if dot_count >= 2:
+        separator = '.'
+    elif underscore_count >= 2:
+        separator = '_'
+    else:
+        # Check if they look like initials (short strings)
+        avg_len = sum(len(l) for l in locals_list) / len(locals_list)
+        if avg_len <= 4:
+            return f'inicial@{domain}'
+        return None
+
+    # Build pattern description
+    # Determine structure: first.last, first.initial, initial.last
+    parts_list = [l.split(separator) for l in locals_list if separator in l]
+    if not parts_list:
+        return None
+
+    avg_parts = sum(len(p) for p in parts_list) / len(parts_list)
+    if avg_parts >= 1.8:
+        return f'nome{separator}sobrenome@{domain}'
+    else:
+        return f'nome@{domain}'
+
+
+def extract_footer_header_emails(soup):
+    """Extract emails specifically from footer and header tags (higher quality)."""
+    emails = set()
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+    for tag_name in ['footer', 'header']:
+        tag = soup.find(tag_name)
+        if tag:
+            text = tag.get_text()
+            for em in re.findall(email_pattern, text):
+                emails.add(em.lower().strip())
+            # Also check mailto links in footer/header
+            for a in tag.find_all('a', href=True):
+                href = a['href']
+                if 'mailto:' in href:
+                    em = href.replace('mailto:', '').split('?')[0].strip().lower()
+                    if em:
+                        emails.add(em)
+
+    # Also check elements with class/id containing 'footer' or 'contact'
+    for cls_kw in ['footer', 'contact', 'rodape', 'contato']:
+        for el in soup.find_all(class_=lambda c: c and cls_kw in c.lower()):
+            text = el.get_text()
+            for em in re.findall(email_pattern, text):
+                emails.add(em.lower().strip())
+            for a in el.find_all('a', href=True):
+                if 'mailto:' in a['href']:
+                    em = a['href'].replace('mailto:', '').split('?')[0].strip().lower()
+                    if em:
+                        emails.add(em)
+
+    result = []
+    for em in emails:
+        normalized = normalize_email(em)
+        if normalized:
+            result.append(normalized)
+    return result
+
+
+def extract_team_members(soup):
+    """
+    Extract team member info (name, role, email) from About/Team sections.
+    Returns list of dicts with keys: name, role, email.
+    """
+    members = []
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+    team_keywords = [
+        'team', 'equipe', 'nossa-equipe', 'our-team', 'staff', 'time',
+        'diretoria', 'diretores', 'socios', 'fundadores', 'founders',
+        'lideranca', 'gestores', 'responsaveis',
+    ]
+
+    # Find team sections by ID or class
+    team_sections = []
+    for kw in team_keywords:
+        for el in soup.find_all(id=lambda i: i and kw in i.lower()):
+            team_sections.append(el)
+        for el in soup.find_all(class_=lambda c: c and kw in c.lower()):
+            team_sections.append(el)
+
+    # If no specific section found, look for cards/blocks with person-like structure
+    if not team_sections:
+        for el in soup.find_all(['article', 'div', 'li'], class_=lambda c: c and any(
+            kw in c.lower() for kw in ['card', 'member', 'pessoa', 'profile', 'bio']
+        )):
+            team_sections.append(el)
+
+    seen_names = set()
+    for section in team_sections[:5]:  # limit to 5 sections
+        # Look for heading (name) + paragraph (role) pattern
+        headings = section.find_all(['h1','h2','h3','h4','h5','h6','strong','b'])
+        for h in headings[:20]:
+            name = h.get_text().strip()
+            if not name or len(name) > 80 or len(name) < 3:
+                continue
+            if name in seen_names:
+                continue
+            # Role: check next sibling or parent's next sibling
+            role = None
+            next_sib = h.find_next_sibling()
+            if next_sib and next_sib.name in ['p', 'span', 'div']:
+                role_text = next_sib.get_text().strip()
+                if role_text and len(role_text) < 100:
+                    role = role_text
+            # Email: look nearby
+            parent_text = (h.parent or section).get_text() if h.parent else ''
+            found_emails = re.findall(email_pattern, parent_text)
+            email = None
+            if found_emails:
+                em = normalize_email(found_emails[0])
+                if em:
+                    email = em
+            seen_names.add(name)
+            members.append({'name': name, 'role': role, 'email': email})
+
+    return members[:10]  # max 10 members
+
+
+# ============= Phase 2: New Directory Scrapers =============
+
+def scrape_empresas_com_br(niche, city, state, max_pages=2):
+    """
+    Scrape empresas.com.br for business listings.
+    URL format: https://www.empresas.com.br/{state}/{city}/{niche}/
+    Returns list of lead dicts.
+    """
+    leads = []
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+    # Normalize for URL
+    def slug(s):
+        import unicodedata
+        s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
+        s = re.sub(r'[^a-z0-9]+', '-', s.lower()).strip('-')
+        return s
+
+    state_slug = slug(state) if state else ''
+    city_slug = slug(city) if city else ''
+    niche_slug = slug(niche) if niche else ''
+
+    try:
+        for page in range(1, max_pages + 1):
+            if page == 1:
+                url = f"https://www.empresas.com.br/{state_slug}/{city_slug}/{niche_slug}/"
+            else:
+                url = f"https://www.empresas.com.br/{state_slug}/{city_slug}/{niche_slug}/p{page}/"
+
+            headers = {'User-Agent': random.choice(USER_AGENTS)}
+            resp = http_requests.get(url, timeout=10, verify=False, headers=headers)
+            if resp.status_code != 200:
+                break
+
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            # Cards with company info
+            cards = soup.find_all('div', class_=lambda c: c and any(
+                kw in c for kw in ['empresa', 'company', 'listing', 'result', 'card']
+            ))
+            if not cards:
+                # Fallback: try h2/h3 + links pattern
+                cards = soup.find_all(['article', 'li'], class_=True)
+
+            for card in cards[:30]:
+                text = card.get_text()
+                company_name = None
+                website = None
+                phone = None
+                email = None
+
+                # Company name: first heading in card
+                h = card.find(['h2','h3','h4','a'])
+                if h:
+                    company_name = h.get_text().strip()[:255]
+
+                # Website link
+                for a in card.find_all('a', href=True):
+                    href = a['href']
+                    if href.startswith('http') and 'empresas.com.br' not in href:
+                        website = href
+                        break
+
+                # Phone
+                phones = extract_phones(text)
+                if phones:
+                    phone = phones[0]
+
+                # Email
+                em_list = re.findall(email_pattern, text)
+                if em_list:
+                    em = normalize_email(em_list[0])
+                    if em:
+                        email = em
+
+                if company_name:
+                    leads.append({
+                        'company_name': company_name,
+                        'email': email,
+                        'phone': phone,
+                        'website': website,
+                        'city': city,
+                        'state': state,
+                        'category': niche,
+                        'source': 'empresas.com.br',
+                    })
+
+            time.sleep(3)
+    except Exception as e:
+        print(f"[empresas.com.br] Error: {e}")
+
+    return leads
+
+
+def scrape_paginas_amarelas(niche, city, max_pages=2):
+    """
+    Scrape paginasamarelas.com.br (or similar) for business contacts.
+    Returns list of lead dicts.
+    """
+    leads = []
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+    def slug(s):
+        import unicodedata
+        s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
+        s = re.sub(r'[^a-z0-9]+', '-', s.lower()).strip('-')
+        return s
+
+    city_slug = slug(city) if city else ''
+    niche_slug = slug(niche) if niche else ''
+
+    try:
+        for page in range(1, max_pages + 1):
+            url = f"https://www.paginasamarelas.com.br/busca/{niche_slug}/{city_slug}?pagina={page}"
+            headers = {'User-Agent': random.choice(USER_AGENTS)}
+            resp = http_requests.get(url, timeout=10, verify=False, headers=headers)
+            if resp.status_code != 200:
+                break
+
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            cards = soup.find_all(['div', 'article', 'li'], class_=lambda c: c and any(
+                kw in c for kw in ['result', 'listing', 'item', 'empresa', 'business']
+            ))
+
+            for card in cards[:30]:
+                text = card.get_text()
+                company_name = None
+                phone = None
+                email = None
+                website = None
+                address = None
+
+                h = card.find(['h2','h3','h4','strong'])
+                if h:
+                    company_name = h.get_text().strip()[:255]
+
+                phones = extract_phones(text)
+                if phones:
+                    phone = phones[0]
+
+                em_list = re.findall(email_pattern, text)
+                if em_list:
+                    em = normalize_email(em_list[0])
+                    if em:
+                        email = em
+
+                for a in card.find_all('a', href=True):
+                    href = a['href']
+                    if href.startswith('http') and 'paginasamarelas' not in href:
+                        website = href
+                        break
+
+                if company_name:
+                    leads.append({
+                        'company_name': company_name,
+                        'email': email,
+                        'phone': phone,
+                        'website': website,
+                        'city': city,
+                        'category': niche,
+                        'source': 'paginas_amarelas',
+                    })
+
+            time.sleep(3)
+    except Exception as e:
+        print(f"[paginas_amarelas] Error: {e}")
+
+    return leads
+
+
+def scrape_catalogo_br(niche, city, state, max_pages=2):
+    """
+    Scrape catalogo.com.br — Brazilian business directory.
+    Returns list of lead dicts.
+    """
+    leads = []
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+    def slug(s):
+        import unicodedata
+        s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
+        s = re.sub(r'[^a-z0-9 ]+', '', s.lower()).strip()
+        return s.replace(' ', '+')
+
+    query = f"{slug(niche)} {slug(city)}" if city else slug(niche)
+
+    try:
+        for page in range(1, max_pages + 1):
+            url = f"https://www.catalogo.com.br/busca?q={query.replace(' ', '+')}&pagina={page}"
+            headers = {'User-Agent': random.choice(USER_AGENTS)}
+            resp = http_requests.get(url, timeout=10, verify=False, headers=headers)
+            if resp.status_code != 200:
+                break
+
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            cards = soup.find_all(['div', 'article'], class_=lambda c: c and any(
+                kw in c for kw in ['result', 'company', 'empresa', 'item', 'card', 'listing']
+            ))
+
+            for card in cards[:25]:
+                text = card.get_text()
+                company_name = None
+                phone = None
+                email = None
+                website = None
+
+                h = card.find(['h2','h3','h4','strong','a'])
+                if h:
+                    company_name = h.get_text().strip()[:255]
+
+                phones = extract_phones(text)
+                if phones:
+                    phone = phones[0]
+
+                em_list = re.findall(email_pattern, text)
+                if em_list:
+                    em = normalize_email(em_list[0])
+                    if em:
+                        email = em
+
+                for a in card.find_all('a', href=True):
+                    href = a['href']
+                    if href.startswith('http') and 'catalogo.com.br' not in href:
+                        website = href
+                        break
+
+                if company_name:
+                    leads.append({
+                        'company_name': company_name,
+                        'email': email,
+                        'phone': phone,
+                        'website': website,
+                        'city': city,
+                        'state': state,
+                        'category': niche,
+                        'source': 'catalogo_br',
+                    })
+
+            time.sleep(3)
+    except Exception as e:
+        print(f"[catalogo_br] Error: {e}")
+
+    return leads
+
+
+# ============= Phase 2: Integration into deep_crawl_domain =============
+
+def deep_crawl_domain_phase2(url, session=None):
+    """
+    Enhanced crawl: runs deep_crawl_domain + PDF extraction + footer email extraction.
+    Returns enriched result dict.
+    """
+    result = deep_crawl_domain(url, session)
+
+    # Try to enhance with footer/header email extraction from the main page HTML
+    try:
+        html = fetch_page(url, session)
+        if html:
+            soup = BeautifulSoup(html, 'html.parser')
+            footer_emails = extract_footer_header_emails(soup)
+            # Add any new footer emails not already found
+            existing = set(result.get('emails', []))
+            for em in footer_emails:
+                if em not in existing:
+                    result['emails'].append(em)
+                    existing.add(em)
+
+            # PDF extraction: find PDF links on main page
+            pdf_links = extract_pdf_links_from_html(soup, url)
+            for pdf_url in pdf_links:
+                pdf_emails = extract_pdf_emails(pdf_url, session)
+                for em in pdf_emails:
+                    if em not in existing:
+                        result['emails'].append(em)
+                        existing.add(em)
+
+            # Team member extraction
+            members = extract_team_members(soup)
+            if members:
+                result['team_members'] = members
+                # If we found team member emails, add them too
+                for m in members:
+                    if m.get('email') and m['email'] not in existing:
+                        result['emails'].append(m['email'])
+                        existing.add(m['email'])
+
+            # Email pattern detection
+            if result.get('emails'):
+                from urllib.parse import urlparse as _urlparse
+                parsed_url = _urlparse(url)
+                domain = (parsed_url.hostname or '').replace('www.', '')
+                pattern = detect_email_pattern(result['emails'], domain)
+                if pattern:
+                    result['email_pattern'] = pattern
+    except Exception as e:
+        print(f"[phase2_crawl] Enhancement error for {url}: {e}")
+
+    return result
+
+
+# ============= Phase 3: Fuzzy Dedup + Auto-Tags =============
+
+try:
+    from rapidfuzz import fuzz as _rfuzz
+    from rapidfuzz import process as _rfprocess
+    _RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    _rfuzz = None
+    _rfprocess = None
+    _RAPIDFUZZ_AVAILABLE = False
+
+def fuzzy_deduplicate_leads(batch_id, conn, threshold=88):
+    """Find near-duplicate leads by company name within a batch.
+    Marks duplicates with crm_status='duplicado' and tags='duplicado_fuzzy'.
+    Returns count of duplicates marked."""
+    if not _RAPIDFUZZ_AVAILABLE:
+        print("[Phase3] rapidfuzz not available, skipping dedup")
+        return 0
+
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT id, company_name FROM leads
+            WHERE batch_id = %s AND company_name IS NOT NULL AND company_name != ''
+            ORDER BY id
+        """, (batch_id,))
+        rows = cur.fetchall()
+        if not rows:
+            return 0
+
+        ids = [r[0] for r in rows]
+        names = [r[1] for r in rows]
+
+        seen = {}   # normalized_name -> first_id
+        duplicates = []
+
+        for i, (lead_id, name) in enumerate(zip(ids, names)):
+            normalized = name.strip().lower()
+            if not normalized:
+                continue
+
+            # Check against all previously seen names
+            if seen:
+                seen_names = list(seen.keys())
+                match = _rfprocess.extractOne(
+                    normalized,
+                    seen_names,
+                    scorer=_rfuzz.token_sort_ratio,
+                    score_cutoff=threshold
+                )
+                if match:
+                    duplicates.append(lead_id)
+                    continue
+
+            seen[normalized] = lead_id
+
+        if duplicates:
+            cur.execute("""
+                UPDATE leads
+                SET crm_status = 'duplicado',
+                    tags = CASE
+                        WHEN tags IS NULL OR tags = '' THEN 'duplicado_fuzzy'
+                        ELSE tags || ',duplicado_fuzzy'
+                    END,
+                    updated_at = NOW()
+                WHERE id = ANY(%s)
+            """, (duplicates,))
+            conn.commit()
+            print(f"[Phase3] Dedup batch {batch_id}: {len(duplicates)} duplicates marked")
+
+        return len(duplicates)
+    except Exception as e:
+        conn.rollback()
+        print(f"[Phase3] Dedup error: {e}")
+        return 0
+    finally:
+        cur.close()
+
+
+_AUTO_TAG_RULES = [
+    ('saude', ['clinica', 'medico', 'medica', 'hospital', 'saude', 'farmacia', 'odonto', 'dentista',
+                'fisio', 'nutri', 'psico', 'terapia', 'laboratorio', 'exame', 'consulta', 'ortopedia',
+                'cardiologia', 'pediatria', 'oftalmologia', 'dermatologia', 'enfermagem', 'veterinaria']),
+    ('beleza', ['salao', 'barbearia', 'cabeleireiro', 'estetica', 'spa', 'manicure', 'pedicure',
+                'depilacao', 'micropigmentacao', 'maquiagem', 'sobrancelha', 'lash', 'unhas', 'beleza']),
+    ('alimentacao', ['restaurante', 'lanchonete', 'pizzaria', 'churrascaria', 'padaria', 'confeitaria',
+                     'buffet', 'sorveteria', 'cafe', 'bar ', 'boteco', 'sushi', 'marmita', 'delivery',
+                     'alimentacao', 'gastronomia', 'culinaria']),
+    ('educacao', ['escola', 'colegio', 'faculdade', 'curso', 'idioma', 'ingles', 'espanhol',
+                  'reforco', 'cursinho', 'creche', 'ensino', 'educacao', 'treinamento', 'capacitacao',
+                  'master', 'pos-graduacao', 'universitario']),
+    ('juridico', ['advogado', 'advocacia', 'juridico', 'juridica', 'direito', 'escritorio de adv',
+                  'consultoria juridica', 'tabeliao', 'cartorio', 'notarial']),
+    ('contabil', ['contabil', 'contabilidade', 'contador', 'contadora', 'fiscal', 'tributario',
+                  'irpf', 'irpj', 'mei', 'abertura de empresa', 'folha de pagamento', 'rh', 'recursos humanos']),
+    ('tecnologia', ['tecnologia', 'software', 'sistemas', 'ti ', 'informatica', 'desenvolvimento',
+                    'programacao', 'aplicativo', 'app ', 'web ', 'digital', 'startup', 'saas', 'ecommerce',
+                    'e-commerce', 'loja virtual', 'marketing digital', 'agencia digital', 'seo']),
+    ('imoveis', ['imoveis', 'imobiliaria', 'corretor', 'corretora', 'incorporadora', 'construtora imovel',
+                 'aluguel', 'venda de imovel', 'apartamento', 'casa', 'terreno', 'loteamento']),
+    ('construcao', ['construcao', 'reforma', 'engenharia', 'arquitetura', 'eletrica', 'hidraulica',
+                    'pintura', 'marcenaria', 'marmoraria', 'serralheria', 'vidracaria', 'instalacao',
+                    'manutencao', 'impermeabilizacao', 'gesseiro', 'pedreiro']),
+    ('varejo', ['loja', 'comercio', 'varejo', 'vendas', 'produto', 'moda', 'roupa', 'calcado',
+                'eletronico', 'movel', 'decoracao', 'utilidade', 'pet shop', 'livraria', 'farmacia',
+                'supermercado', 'mercado']),
+    ('automotivo', ['auto', 'carro', 'veiculo', 'mecanica', 'oficina', 'funilaria', 'pintura auto',
+                    'lavagem', 'auto pecas', 'concessionaria', 'moto', 'transporte', 'logistica', 'frete']),
+    ('b2b', ['industria', 'industrial', 'distribuidora', 'atacado', 'fornecedor', 'fabricante',
+              'representante', 'importadora', 'exportadora', 'comercio exterior', 'b2b']),
+    ('turismo', ['turismo', 'viagem', 'agencia de viagem', 'hotel', 'pousada', 'resort', 'hostel',
+                 'excursao', 'passeio', 'tour', 'ecoturismo', 'agencia de turismo']),
+    ('pet', ['pet', 'animal', 'veterinaria', 'canil', 'gatil', 'racao', 'banho e tosa', 'adestramento']),
+    ('religioso', ['igreja', 'religiao', 'pastoral', 'ministerio', 'ong', 'associacao', 'fundacao',
+                   'caridade', 'social', 'assistencia social']),
+    ('industria', ['industria', 'fabrica', 'metalurgica', 'siderurgica', 'quimica', 'plastico',
+                   'textil', 'agro', 'agropecuaria', 'rural', 'producao']),
+]
+
+
+def auto_tag_lead(company_name, category=None, email=None, city=None):
+    """Generate automatic tags from keyword matching.
+    Returns list of tags (strings) based on company_name and category."""
+    tags = set()
+    text = ' '.join(filter(None, [
+        (company_name or '').lower(),
+        (category or '').lower(),
+        (email or '').lower().split('@')[0] if email else '',
+    ]))
+
+    # Normalize: remove accents for matching
+    import unicodedata
+    text_norm = unicodedata.normalize('NFD', text)
+    text_norm = ''.join(c for c in text_norm if unicodedata.category(c) != 'Mn')
+
+    for tag, keywords in _AUTO_TAG_RULES:
+        for kw in keywords:
+            kw_norm = unicodedata.normalize('NFD', kw)
+            kw_norm = ''.join(c for c in kw_norm if unicodedata.category(c) != 'Mn')
+            if kw_norm in text_norm:
+                tags.add(tag)
+                break
+
+    return list(tags)
+
+
+def auto_tag_batch(batch_id, conn):
+    """Auto-tag all leads in a batch that have no tags yet.
+    Returns count of leads tagged."""
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT id, company_name, category, email, city FROM leads
+            WHERE batch_id = %s AND (tags IS NULL OR tags = '')
+        """, (batch_id,))
+        rows = cur.fetchall()
+        if not rows:
+            return 0
+
+        tagged = 0
+        for lead_id, company_name, category, email, city in rows:
+            new_tags = auto_tag_lead(company_name, category, email, city)
+            if new_tags:
+                cur.execute("""
+                    UPDATE leads SET tags = %s, updated_at = NOW()
+                    WHERE id = %s
+                """, (','.join(new_tags), lead_id))
+                tagged += 1
+
+        conn.commit()
+        print(f"[Phase3] Auto-tagged {tagged} leads in batch {batch_id}")
+        return tagged
+    except Exception as e:
+        conn.rollback()
+        print(f"[Phase3] Auto-tag error: {e}")
+        return 0
+    finally:
+        cur.close()
+
 
 # ============= Search Engine Functions =============
 
@@ -1586,10 +3333,41 @@ def scrape_all_directories(niche, city, state, session=None):
     all_leads = []
     all_domains = set()
 
+    # Phase 2: wrapper adapters for new scrapers (they return list, not list+domains)
+    def _scrape_empresas_compat(niche, city, state, session):
+        leads = scrape_empresas_com_br(niche, city, state, max_pages=2)
+        domains = set()
+        for l in leads:
+            if l.get('website'):
+                from urllib.parse import urlparse as _up
+                domains.add(_up(l['website']).netloc)
+        return leads, domains
+
+    def _scrape_amarelas_compat(niche, city, state, session):
+        leads = scrape_paginas_amarelas(niche, city, max_pages=2)
+        domains = set()
+        for l in leads:
+            if l.get('website'):
+                from urllib.parse import urlparse as _up
+                domains.add(_up(l['website']).netloc)
+        return leads, domains
+
+    def _scrape_catalogo_compat(niche, city, state, session):
+        leads = scrape_catalogo_br(niche, city, state, max_pages=2)
+        domains = set()
+        for l in leads:
+            if l.get('website'):
+                from urllib.parse import urlparse as _up
+                domains.add(_up(l['website']).netloc)
+        return leads, domains
+
     for scraper_fn, name in [
         (scrape_guiamais, 'GuiaMais'),
         (scrape_telelistas, 'TeleListas'),
         (scrape_apontador, 'Apontador'),
+        (_scrape_empresas_compat, 'Empresas.com.br'),
+        (_scrape_amarelas_compat, 'PaginasAmarelas'),
+        (_scrape_catalogo_compat, 'Catalogo.com.br'),
     ]:
         try:
             leads, domains = scraper_fn(niche, city, state, session)
@@ -1617,155 +3395,496 @@ def scrape_all_directories(niche, city, state, session=None):
     return unique_leads, all_domains
 
 
+# ============= Yahoo HTML scraping (extra source) =============
+
+def _search_yahoo(query, max_pages=2, safety=None):
+    """Search Yahoo using HTML scraping. Extra fallback source beyond DDG/Bing.
+    Returns list of results.
+    Raises QuotaExceededError on rate limit (429/503) — retry-able.
+    Returns empty list on genuine "no results" — NOT retry-able.
+    """
+    results = []
+    ua_list = USER_AGENTS if 'USER_AGENTS' in globals() else [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    ]
+    headers = {'User-Agent': random.choice(ua_list), 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8'}
+    encoded_query = requests_quote(query)
+    for page in range(max_pages):
+        start = page * 10
+        url = f'https://search.yahoo.com/search?p={encoded_query}&b={start + 1}&pz=10'
+        try:
+            resp = http_requests.get(url, headers=headers, timeout=10)
+            if resp.status_code in (429, 503):
+                scraper_log('WARNING', 'yahoo_html', query, f'rate limit status={resp.status_code} page={page}')
+                raise QuotaExceededError(f'Yahoo rate limit HTTP {resp.status_code}')
+            if resp.status_code != 200:
+                scraper_log('WARNING', 'yahoo_html', query, f'status={resp.status_code} page={page}')
+                break
+            soup = BeautifulSoup(resp.text, 'lxml')
+            # Detect CAPTCHA / block page
+            page_text = resp.text.lower()
+            if 'captcha' in page_text or 'are you a human' in page_text or 'robot' in page_text:
+                scraper_log('WARNING', 'yahoo_html', query, f'CAPTCHA detectado page={page}')
+                raise QuotaExceededError('Yahoo CAPTCHA/block detectado')
+            # Updated selectors: primary + fallback for Yahoo layout changes
+            for tag in soup.select('div.algo-sr h3.title a, div#web a.ac-algo, #web li a.d-ib, div.dd a.ac-algo'):
+                href = tag.get('href', '')
+                # Yahoo sometimes wraps URLs; extract actual URL
+                if 'r.search.yahoo.com' in href:
+                    import urllib.parse as _up
+                    qs = _up.urlparse(href).query
+                    params = _up.parse_qs(qs)
+                    href = params.get('RU', params.get('u', [href]))[0]
+                if href.startswith('http') and is_valid_result_url(href):
+                    results.append({'url': href, 'title': tag.get_text(strip=True)})
+            if safety:
+                safety.record_success()
+            time.sleep(random.uniform(2, 4))
+        except QuotaExceededError:
+            raise  # propagate rate limit errors for retry
+        except Exception as e:
+            scraper_log('WARNING', 'yahoo_html', query, f'page={page} erro', exc=e)
+            if safety:
+                safety.record_error('generic')
+            break
+    return results
+
+
 # ============= Multi-Source Search with Fallback =============
 
 def search_with_fallback(query, max_pages=2, safety=None, cursor=None, user_id=None, search_job_id=None):
-    """Multi-source domain search with detailed logging.
-    Priority: Bing API (oficial) -> Google CSE -> DDG scraping -> Bing scraping"""
-    engine_used = 'duckduckgo'
-    results = []
+    """Multi-source domain search — runs ALL sources and aggregates results.
+    Uses tenacity retry with exponential backoff per provider.
+    Logs every attempt/failure to scraper_errors.log.
+    Engines: Bing API → Google CSE → DDG API → DDG HTML → Bing HTML → Yahoo HTML
+    """
+    all_results = []   # accumulate across ALL providers
+    engines_used = []  # track which engines contributed
+    seen_urls = set()  # global dedup across providers
 
-    print(f"\n[WEBSEARCH] Iniciando busca web multi-fonte para: '{query}'")
+    def _add_results(new_results, engine_name):
+        """Merge new results into all_results, deduplicating by URL."""
+        added = 0
+        for r in new_results:
+            url = r.get('url', '').strip().rstrip('/')
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                all_results.append(r)
+                added += 1
+        if added:
+            engines_used.append(engine_name)
+        return added
 
-    # 1. Try Bing Web Search API (official, no CAPTCHA, 1000/month)
-    if not results and cursor and user_id:
+    print(f"\n[WEBSEARCH] Iniciando busca TOTAL multi-fonte para: '{query}'")
+
+    # ── Helper: tenacity retry — retries on ANY error except BlockedError/CaptchaError ──
+    def _with_retry(fn):
+        """3 attempts with exponential backoff. Skips only if BlockedError/CaptchaError."""
+        if _TENACITY_AVAILABLE:
+            from tenacity import retry as _retry, stop_after_attempt, wait_exponential, retry_if_exception
+            decorated = _retry(
+                retry=retry_if_exception(lambda e: not isinstance(e, (BlockedError, CaptchaError))),
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=1, min=3, max=30),
+                before_sleep=lambda rs: scraper_log(
+                    'WARNING', 'retry', query,
+                    f'tentativa {rs.attempt_number} falhou, aguardando...'),
+            )(fn)
+            return decorated
+        # Without tenacity: manual 3-retry loop
+        def _manual_retry(*a, **kw):
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    return fn(*a, **kw)
+                except (BlockedError, CaptchaError):
+                    raise
+                except Exception as exc:
+                    last_exc = exc
+                    scraper_log('WARNING', 'retry', query, f'tentativa {attempt+1} falhou', exc=exc)
+                    if attempt < 2:
+                        time.sleep(3 * (attempt + 1))
+            raise RetryError(f'3 tentativas esgotadas: {last_exc}')
+        return _manual_retry
+
+    # ── SOURCE 1: Bing Web Search API (official, no CAPTCHA) ─────────────────
+    if cursor and user_id:
         bing_config = get_api_config(cursor, user_id, 'bing_api')
         if bing_config:
             bing_credits = get_api_credits_remaining(cursor, user_id, 'bing_api')
             if bing_credits > 0:
-                print(f"[WEBSEARCH] Fonte 1: Bing API oficial ({bing_credits} creditos restantes)...")
-                api_results, error, duration = search_bing_api(query, bing_config['api_key'], max_results=max_pages * 10)
-                if api_results:
+                print(f"[WEBSEARCH] Fonte 1: Bing API oficial ({bing_credits} creditos)...")
+                scraper_log('INFO', 'bing_api', query, f'iniciando (creditos={bing_credits})')
+                try:
+                    _bing_cfg = bing_config  # capture for closure
+                    def _call_bing_api():
+                        api_results, error, duration = search_bing_api(
+                            query, _bing_cfg['api_key'], max_results=max_pages * 10)
+                        if error == 'invalid_key':
+                            raise BlockedError('invalid_key')  # skip — no retry
+                        if error:
+                            raise Exception(f'bing_api: {error}')  # retry-able
+                        if not api_results:
+                            raise QuotaExceededError('sem resultados')
+                        return api_results, duration
+                    api_results, duration = _with_retry(_call_bing_api)()
                     record_api_usage(cursor, user_id, 'bing_api', 1)
-                    engine_used = 'bing_api'
-                    results = api_results
-                    print(f"[WEBSEARCH] Bing API: {len(results)} resultados em {duration}ms!")
+                    added = _add_results(api_results, 'bing_api')
+                    print(f"[WEBSEARCH] Bing API: +{added} resultados em {duration}ms")
+                    scraper_log('INFO', 'bing_api', query, f'ok added={added} duration={duration}ms')
                     if search_job_id:
                         log_search(cursor, search_job_id, 'search_ok',
-                                  message=f'Bing API oficial achou {len(results)} resultados em {duration}ms! Sem CAPTCHA!',
+                                  message=f'Bing API: {added} resultados em {duration}ms',
                                   duration_ms=duration)
-                elif error == 'invalid_key':
+                except BlockedError:
                     cursor.execute('UPDATE api_configs SET is_active = FALSE WHERE user_id = %s AND provider = %s',
                                   (user_id, 'bing_api'))
-                    print(f"[WEBSEARCH] Bing API: chave invalida! Desativada.")
-                    if search_job_id:
-                        log_search(cursor, search_job_id, 'api_error',
-                                  message=f'Bing API: chave invalida, desativada automaticamente')
-                elif error:
-                    print(f"[WEBSEARCH] Bing API falhou: {error}")
-                    if search_job_id:
-                        log_search(cursor, search_job_id, 'api_error',
-                                  message=f'Bing API falhou: {error}')
+                    scraper_log('ERROR', 'bing_api', query, 'chave invalida — desativada')
+                except RetryError as e:
+                    scraper_log('ERROR', 'bing_api', query, '3 tentativas esgotadas', exc=e)
+                    print(f"[WEBSEARCH] Bing API: 3 tentativas falharam — proximo provider")
+                except Exception as e:
+                    scraper_log('ERROR', 'bing_api', query, 'erro inesperado', exc=e)
+                    print(f"[WEBSEARCH] Bing API: erro — {e}")
             else:
-                print(f"[WEBSEARCH] Bing API: sem creditos restantes")
+                print(f"[WEBSEARCH] Bing API: sem creditos")
         else:
             print(f"[WEBSEARCH] Bing API: nao configurada")
 
-    # 2. Try Google Custom Search API (no CAPTCHA, 100/day)
-    if not results and cursor and user_id:
+    # ── SOURCE 2: Google Custom Search API (no CAPTCHA, 100/day) ─────────────
+    if cursor and user_id:
         google_config = get_api_config(cursor, user_id, 'google_cse')
         if google_config and google_config.get('api_secret'):
             google_credits = get_api_credits_remaining(cursor, user_id, 'google_cse')
             if google_credits > 0:
-                print(f"[WEBSEARCH] Fonte 2: Google Custom Search ({google_credits} creditos restantes)...")
-                api_results, error, duration = search_google_custom(
-                    query, google_config['api_key'], google_config['api_secret'], max_results=10)
-                if api_results:
+                print(f"[WEBSEARCH] Fonte 2: Google CSE ({google_credits} creditos)...")
+                scraper_log('INFO', 'google_cse', query, f'iniciando (creditos={google_credits})')
+                try:
+                    _goog_cfg = google_config  # capture for closure
+                    def _call_google_cse():
+                        api_results, error, duration = search_google_custom(
+                            query, _goog_cfg['api_key'], _goog_cfg['api_secret'], max_results=10)
+                        if error == 'invalid_key':
+                            raise BlockedError('invalid_key')
+                        if error:
+                            raise Exception(f'google_cse: {error}')
+                        if not api_results:
+                            raise QuotaExceededError('sem resultados')
+                        return api_results, duration
+                    api_results, duration = _with_retry(_call_google_cse)()
                     record_api_usage(cursor, user_id, 'google_cse', 1)
-                    engine_used = 'google_cse'
-                    results = api_results
-                    print(f"[WEBSEARCH] Google CSE: {len(results)} resultados em {duration}ms!")
+                    added = _add_results(api_results, 'google_cse')
+                    print(f"[WEBSEARCH] Google CSE: +{added} resultados em {duration}ms")
+                    scraper_log('INFO', 'google_cse', query, f'ok added={added} duration={duration}ms')
                     if search_job_id:
                         log_search(cursor, search_job_id, 'search_ok',
-                                  message=f'Google Custom Search achou {len(results)} resultados em {duration}ms!',
+                                  message=f'Google CSE: {added} resultados em {duration}ms',
                                   duration_ms=duration)
-                elif error == 'invalid_key':
+                except BlockedError:
                     cursor.execute('UPDATE api_configs SET is_active = FALSE WHERE user_id = %s AND provider = %s',
                                   (user_id, 'google_cse'))
-                    print(f"[WEBSEARCH] Google CSE: chave invalida! Desativada.")
-                    if search_job_id:
-                        log_search(cursor, search_job_id, 'api_error',
-                                  message=f'Google CSE: chave/cx invalida, desativada automaticamente')
-                elif error:
-                    print(f"[WEBSEARCH] Google CSE falhou: {error}")
-                    if search_job_id:
-                        log_search(cursor, search_job_id, 'api_error',
-                                  message=f'Google CSE falhou: {error}')
+                    scraper_log('ERROR', 'google_cse', query, 'chave invalida — desativada')
+                except RetryError as e:
+                    scraper_log('ERROR', 'google_cse', query, '3 tentativas esgotadas', exc=e)
+                    print(f"[WEBSEARCH] Google CSE: 3 tentativas falharam — proximo provider")
+                except Exception as e:
+                    scraper_log('ERROR', 'google_cse', query, 'erro inesperado', exc=e)
+                    print(f"[WEBSEARCH] Google CSE: erro — {e}")
             else:
-                print(f"[WEBSEARCH] Google CSE: sem creditos restantes hoje")
+                print(f"[WEBSEARCH] Google CSE: sem creditos hoje")
         else:
             print(f"[WEBSEARCH] Google CSE: nao configurada")
 
-    # 3. DDG API (duckduckgo-search library - API JSON, sem HTML scraping)
-    if not results:
-        print(f"[WEBSEARCH] Fonte 3: DuckDuckGo API (biblioteca duckduckgo-search)...")
+    # ── SOURCE 3: DuckDuckGo API (duckduckgo-search library) ─────────────────
+    print(f"[WEBSEARCH] Fonte 3: DuckDuckGo API (biblioteca)...")
+    scraper_log('INFO', 'ddgs_api', query, 'iniciando')
+    try:
+        def _call_ddgs():
+            res = search_duckduckgo_api(query, max_results=max_pages * 10, safety=safety)
+            if not res:
+                raise QuotaExceededError('sem resultados — possivel bloqueio')
+            return res
+        ddg_results = _with_retry(_call_ddgs)()
+        added = _add_results(ddg_results, 'ddgs_api')
+        print(f"[WEBSEARCH] DDG API: +{added} URLs")
+        scraper_log('INFO', 'ddgs_api', query, f'ok added={added}')
         if search_job_id and cursor:
-            log_search(cursor, search_job_id, 'search_attempt',
-                      message=f'APIs oficiais falharam/nao configuradas. Tentando DDG API (biblioteca)...')
-        results = search_duckduckgo_api(query, max_results=max_pages * 10, safety=safety)
-        if results:
-            engine_used = 'ddgs_api'
-            print(f"[WEBSEARCH] DDG API: {len(results)} URLs encontradas!")
-            if search_job_id and cursor:
-                log_search(cursor, search_job_id, 'search_ok',
-                          message=f'DDG API (biblioteca) achou {len(results)} resultados!')
-        else:
-            print(f"[WEBSEARCH] DDG API: sem resultados")
+            log_search(cursor, search_job_id, 'search_ok',
+                      message=f'DDG API: {added} resultados adicionados')
+    except RetryError as e:
+        scraper_log('ERROR', 'ddgs_api', query, '3 tentativas esgotadas', exc=e)
+        print(f"[WEBSEARCH] DDG API: 3 tentativas falharam — proximo provider")
+    except Exception as e:
+        scraper_log('ERROR', 'ddgs_api', query, 'erro inesperado', exc=e)
+        print(f"[WEBSEARCH] DDG API: erro — {e}")
 
-    # 4. DDG HTML scraping fallback
-    if not results:
-        print(f"[WEBSEARCH] Fonte 4: DuckDuckGo HTML scraping (max_pages={max_pages})...")
-        if search_job_id and cursor:
-            log_search(cursor, search_job_id, 'search_attempt',
-                      message=f'DDG API falhou. Tentando DDG HTML scraping...')
-        results = search_duckduckgo(query, max_pages, safety)
-        engine_used = 'duckduckgo'
-        print(f"[WEBSEARCH] DDG scraping resultado: {len(results)} URLs encontradas")
+    # ── SOURCE 4: DuckDuckGo HTML scraping ───────────────────────────────────
+    print(f"[WEBSEARCH] Fonte 4: DuckDuckGo HTML scraping (pages={max_pages})...")
+    scraper_log('INFO', 'ddg_html', query, f'iniciando max_pages={max_pages}')
+    try:
+        def _call_ddg_html():
+            res = search_duckduckgo(query, max_pages, safety)
+            if not res:
+                raise QuotaExceededError('sem resultados')
+            return res
+        ddg_html_results = _with_retry(_call_ddg_html)()
+        added = _add_results(ddg_html_results, 'duckduckgo')
+        print(f"[WEBSEARCH] DDG HTML: +{added} URLs")
+        scraper_log('INFO', 'ddg_html', query, f'ok added={added}')
+    except RetryError as e:
+        scraper_log('ERROR', 'ddg_html', query, '3 tentativas esgotadas', exc=e)
+        print(f"[WEBSEARCH] DDG HTML: 3 tentativas falharam — proximo provider")
+    except Exception as e:
+        scraper_log('ERROR', 'ddg_html', query, 'erro inesperado', exc=e)
+        print(f"[WEBSEARCH] DDG HTML: erro — {e}")
 
-    # 5. Bing scraping fallback
-    if not results:
-        delay = random.uniform(3, 6)
-        print(f"[WEBSEARCH] Fonte 5: Bing scraping (esperando {delay:.1f}s)...")
-        if search_job_id and cursor:
-            log_search(cursor, search_job_id, 'search_attempt',
-                      message=f'Todas as fontes anteriores falharam. Ultima tentativa: Bing scraping...')
-        engine_used = 'bing'
+    # ── SOURCE 5: Bing HTML scraping ──────────────────────────────────────────
+    delay = random.uniform(3, 6)
+    print(f"[WEBSEARCH] Fonte 5: Bing HTML scraping (delay={delay:.1f}s)...")
+    scraper_log('INFO', 'bing_html', query, f'iniciando delay={delay:.1f}s')
+    try:
         time.sleep(delay)
-        results = search_bing(query, max_pages, safety)
-        print(f"[WEBSEARCH] Bing scraping resultado: {len(results)} URLs encontradas")
+        def _call_bing_html():
+            res = search_bing(query, max_pages, safety)
+            if not res:
+                raise QuotaExceededError('sem resultados')
+            return res
+        bing_html_results = _with_retry(_call_bing_html)()
+        added = _add_results(bing_html_results, 'bing')
+        print(f"[WEBSEARCH] Bing HTML: +{added} URLs")
+        scraper_log('INFO', 'bing_html', query, f'ok added={added}')
+    except RetryError as e:
+        scraper_log('ERROR', 'bing_html', query, '3 tentativas esgotadas', exc=e)
+        print(f"[WEBSEARCH] Bing HTML: 3 tentativas falharam — proximo provider")
+    except Exception as e:
+        scraper_log('ERROR', 'bing_html', query, 'erro inesperado', exc=e)
+        print(f"[WEBSEARCH] Bing HTML: erro — {e}")
 
-    # Deduplicate by domain
+    # ── SOURCE 6: Yahoo HTML scraping ─────────────────────────────────────────
+    delay2 = random.uniform(2, 5)
+    print(f"[WEBSEARCH] Fonte 6: Yahoo HTML scraping (delay={delay2:.1f}s)...")
+    scraper_log('INFO', 'yahoo_html', query, f'iniciando delay={delay2:.1f}s')
+    try:
+        time.sleep(delay2)
+        def _call_yahoo():
+            # _search_yahoo raises QuotaExceededError on rate limit (retry-able)
+            # and returns [] on genuine "no results" (NOT retry-able)
+            res = _search_yahoo(query, max_pages, safety)
+            if not res:
+                # Empty result = Yahoo has no results for this query — don't retry
+                scraper_log('INFO', 'yahoo_html', query, 'sem resultados (query sem match no Yahoo)')
+                return []
+            return res
+        yahoo_results = _with_retry(_call_yahoo)()
+        if yahoo_results:
+            added = _add_results(yahoo_results, 'yahoo')
+            print(f"[WEBSEARCH] Yahoo HTML: +{added} URLs")
+            scraper_log('INFO', 'yahoo_html', query, f'ok added={added}')
+        else:
+            print(f"[WEBSEARCH] Yahoo HTML: sem resultados para esta query")
+    except RetryError as e:
+        scraper_log('ERROR', 'yahoo_html', query, '3 tentativas esgotadas (rate limit)', exc=e)
+        print(f"[WEBSEARCH] Yahoo HTML: rate limit — 3 tentativas falharam")
+    except Exception as e:
+        scraper_log('ERROR', 'yahoo_html', query, 'erro inesperado', exc=e)
+        print(f"[WEBSEARCH] Yahoo HTML: erro — {e}")
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+    total = len(all_results)
+    if total == 0:
+        scraper_log('CRITICAL', 'search_with_fallback', query,
+                    f'TODOS os {6} providers falharam — nenhum resultado obtido')
+        print(f"[WEBSEARCH] CRITICO: Todas as 6 fontes falharam para '{query}'")
+        if search_job_id and cursor:
+            log_search(cursor, search_job_id, 'search_failed',
+                      message='Todos os providers falharam — nenhum resultado')
+    else:
+        engines_summary = ', '.join(engines_used) if engines_used else 'nenhum'
+        print(f"[WEBSEARCH] TOTAL: {total} URLs unicas | Engines: {engines_summary}")
+        scraper_log('INFO', 'search_with_fallback', query,
+                    f'total={total} engines={engines_summary}')
+        if search_job_id and cursor:
+            log_search(cursor, search_job_id, 'search_ok',
+                      message=f'Total agregado: {total} URLs de [{engines_summary}]')
+
+    # Deduplicate by domain (keep first occurrence per domain)
     seen_domains = set()
     unique_results = []
-    for r in results:
+    for r in all_results:
         try:
-            domain = urlparse(r['url']).hostname.replace('www.', '')
+            domain = urlparse(r['url']).hostname
+            if domain:
+                domain = domain.replace('www.', '')
             if domain not in seen_domains:
                 seen_domains.add(domain)
                 unique_results.append(r)
         except Exception:
             unique_results.append(r)
 
+    engine_used = engines_used[0] if engines_used else 'none'
     return unique_results, engine_used
 
 
-def calculate_quality_score(lead_data):
-    """Calculate lead quality: basico, medio, or premium."""
-    score = 0
-    if lead_data.get('email'):
-        score += 1
-    if lead_data.get('phone'):
-        score += 1
-    if lead_data.get('whatsapp'):
-        score += 1
-    if lead_data.get('instagram') or lead_data.get('facebook') or lead_data.get('linkedin'):
-        score += 1
-    if lead_data.get('cnpj'):
-        score += 1
+def validate_phone_br(phone):
+    """
+    Valida e normaliza telefone brasileiro.
+    Retorna (phone_normalizado, is_valid).
+    Rejeita DDDs inválidos, números muito curtos/longos e prefixos internacionais.
+    """
+    if not phone:
+        return None, False
+    p = str(phone).strip()
+    # Remove caracteres não numéricos exceto +
+    digits = re.sub(r'[^\d]', '', p)
+    # Remove +55 ou 55 no início
+    if digits.startswith('55') and len(digits) > 11:
+        digits = digits[2:]
+    # Prefixo internacional (00xx) — rejeitar
+    if digits.startswith('00'):
+        return None, False
+    # Comprimento inválido
+    if len(digits) < 8 or len(digits) > 11:
+        return None, False
+    # Extrai DDD (apenas se tem 10 ou 11 dígitos)
+    if len(digits) >= 10:
+        ddd = digits[:2]
+        if ddd not in DDD_VALIDOS_BR:
+            return None, False
+    # Número só com dígitos iguais (11111111) — inválido
+    if len(set(digits)) == 1:
+        return None, False
+    return p, True
 
-    if score >= 4:
+
+def clean_city_name(city):
+    """
+    Remove prefixos de busca que contaminam o campo city.
+    Ex: 'Escritório de Contabilidade em Vila Velha' → 'Vila Velha'
+        'Advogado em São Paulo' → 'São Paulo'
+    """
+    if not city:
+        return city
+    city = city.strip()
+    # Aplica regex de limpeza
+    cleaned = _CITY_GARBAGE_RE.sub('', city).strip()
+    # Se o resultado ficou muito curto ou vazio, mantém o original
+    if len(cleaned) < 3:
+        return city
+    # Remove " - ES", " - SP" etc. no final
+    cleaned = re.sub(r'\s*[-–]\s*[A-Z]{2}$', '', cleaned).strip()
+    return cleaned
+
+
+def is_foreign_company(company_name):
+    """
+    Detecta se a empresa é estrangeira por sufixos legais (Inc, LLC, Ltd, GmbH etc.).
+    Retorna True se parecer empresa estrangeira.
+    """
+    if not company_name:
+        return False
+    return bool(_FOREIGN_COMPANY_RE.search(company_name))
+
+
+def is_irrelevant_email_domain(email):
+    """
+    Verifica se o domínio do email é de um site irrelevante para leads BR
+    (portais de notícias, tech media, empresas internacionais).
+    """
+    if not email or '@' not in email:
+        return False
+    domain = email.split('@')[-1].lower().strip()
+    return domain in IRRELEVANT_EMAIL_DOMAINS
+
+
+def calculate_lead_score_numeric(lead_data):
+    """
+    Calcula score numérico 0-100 para o lead.
+    Leva em conta completude dos dados e qualidade do contato.
+    Retorna int 0-100.
+    """
+    score = 0
+    email = (lead_data.get('email') or '').lower()
+    phone = lead_data.get('phone') or ''
+    whatsapp = lead_data.get('whatsapp') or ''
+    instagram = lead_data.get('instagram') or ''
+    facebook = lead_data.get('facebook') or ''
+    linkedin = lead_data.get('linkedin') or ''
+    website = lead_data.get('website') or ''
+    cnpj = lead_data.get('cnpj') or ''
+    company = lead_data.get('company_name') or ''
+
+    # Email
+    if email:
+        domain = email.split('@')[-1] if '@' in email else ''
+        free_providers = {'gmail.com','hotmail.com','yahoo.com','outlook.com',
+                          'bol.com.br','ig.com.br','uol.com.br','terra.com.br',
+                          'live.com','msn.com','icloud.com','me.com'}
+        generic_prefixes_local = {'contato','info','atendimento','suporte','vendas',
+                                   'comercial','financeiro','rh','marketing','sac',
+                                   'faleconosco','ouvidoria','diretoria','administrativo',
+                                   'recepcao','newsletter','noticias','secretaria'}
+        local = email.split('@')[0] if '@' in email else ''
+
+        if domain in free_providers:
+            score += 8   # Email existe, mas provedor gratuito
+        elif local in generic_prefixes_local:
+            score += 12  # Email corporativo genérico
+        else:
+            score += 20  # Email corporativo pessoal/nominal — mais valioso
+
+        # Bonus TLD brasileiro
+        if domain.endswith('.com.br') or domain.endswith('.med.br') or \
+           domain.endswith('.adv.br') or domain.endswith('.eng.br'):
+            score += 8
+
+    # Telefone com DDD válido
+    if phone:
+        _, valid = validate_phone_br(phone)
+        if valid:
+            score += 15
+        else:
+            score += 3  # Tem telefone mas inválido — pequeno bônus
+
+    # WhatsApp
+    if whatsapp:
+        score += 15
+
+    # Redes sociais
+    if instagram:
+        score += 7
+    if facebook:
+        score += 5
+    if linkedin:
+        score += 8
+
+    # Website próprio
+    if website:
+        if '.com.br' in website or '.med.br' in website or '.adv.br' in website:
+            score += 8
+        else:
+            score += 4
+
+    # CNPJ enriquecido
+    if cnpj:
+        score += 10
+
+    # Nome de empresa limpo (não genérico)
+    if company and len(company) > 3:
+        score += 2
+
+    return min(score, 100)
+
+
+def calculate_quality_score(lead_data):
+    """
+    Calcula tier de qualidade do lead: basico, medio, premium.
+    Usa calculate_lead_score_numeric internamente.
+    """
+    numeric = calculate_lead_score_numeric(lead_data)
+    if numeric >= 65:
         return 'premium'
-    elif score >= 2:
+    elif numeric >= 35:
         return 'medio'
     return 'basico'
 
@@ -1782,6 +3901,7 @@ def log_search(conn_cursor, search_job_id, log_type, url=None, status_code=None,
         print(f"[search_log] Error: {e}")
 
 
+@_persist_thread_errors('search_engines')
 def process_search_job(batch_id, search_jobs_data, user_id):
     """Background thread: run search queries, deep-crawl results, save leads."""
     conn = psycopg2.connect(**DB_CONFIG)
@@ -1799,12 +3919,20 @@ def process_search_job(batch_id, search_jobs_data, user_id):
         for job_idx, job_data in enumerate(search_jobs_data):
             search_job_id = job_data['search_job_id']
             niche = job_data['niche']
-            city = job_data['city']
-            state = job_data['state']
+            city = job_data.get('city') or ''
+            state = job_data.get('state') or ''
+            region = job_data.get('region') or ''
             max_pages = job_data.get('max_pages', 2)
 
             # Update search job status
-            query = f'{niche} {city} {state}'
+            query_parts = [niche]
+            if city:
+                query_parts.append(city)
+            if state:
+                query_parts.append(state)
+            if not city and not state and region and region in SEARCH_REGIONS:
+                query_parts.append(SEARCH_REGIONS[region]['name'])
+            query = ' '.join(query_parts)
             c.execute('UPDATE search_jobs SET status = %s, started_at = %s, query = %s WHERE id = %s',
                       ('processing', datetime.now(), query, search_job_id))
 
@@ -1842,7 +3970,7 @@ def process_search_job(batch_id, search_jobs_data, user_id):
 
                     try:
                         crawl_start = time.time()
-                        crawl_data = deep_crawl_domain(result_url, session)
+                        crawl_data = deep_crawl_domain_phase2(result_url, session)
                         crawl_duration = int((time.time() - crawl_start) * 1000)
 
                         # Calculate quality
@@ -1943,6 +4071,19 @@ def process_search_job(batch_id, search_jobs_data, user_id):
         # Final batch update
         c.execute('SELECT COUNT(*) FROM leads WHERE batch_id = %s', (batch_id,))
         final_count = c.fetchone()[0]
+
+        # Phase 3: Auto-tag + Fuzzy dedup
+        try:
+            tagged = auto_tag_batch(batch_id, conn)
+            print(f"[search] Phase3 auto-tagged {tagged} leads in batch {batch_id}")
+        except Exception as e3:
+            print(f"[search] Phase3 auto-tag error: {e3}")
+        try:
+            dupes = fuzzy_deduplicate_leads(batch_id, conn)
+            print(f"[search] Phase3 dedup: {dupes} duplicates in batch {batch_id}")
+        except Exception as e3:
+            print(f"[search] Phase3 dedup error: {e3}")
+
         c.execute('UPDATE batches SET status = %s, total_leads = %s, finished_at = %s WHERE id = %s',
                   ('completed', final_count, datetime.now(), batch_id))
 
@@ -1959,6 +4100,7 @@ def process_search_job(batch_id, search_jobs_data, user_id):
 
 # ============= API Search Background Job =============
 
+@_persist_thread_errors('api_enrichment')
 def process_api_search_job(batch_id, search_jobs_data, user_id):
     """Background thread: search for domains -> enrich via API -> fallback to scraping.
     Now with SUPER detailed logging for every step!"""
@@ -2141,6 +4283,11 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                             ])).strip()
                             phone = api_lead.get('phone', '') or ''
                             company = org_name or derive_company_name(email)
+
+                            # Intelligent contact name extraction
+                            if not contact_name:
+                                contact_name = derive_contact_name(email)
+
                             lead_data = {'email': email, 'phone': phone, 'company_name': company}
                             quality = calculate_quality_score(lead_data)
                             try:
@@ -2180,7 +4327,7 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                         else:
                             try:
                                 crawl_start = time.time()
-                                crawl_data = deep_crawl_domain(result_url, session)
+                                crawl_data = deep_crawl_domain_phase2(result_url, session)
                                 crawl_duration = int((time.time() - crawl_start) * 1000)
 
                                 quality = calculate_quality_score(crawl_data)
@@ -2304,6 +4451,36 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
         print(f"[JOB] CONCLUIDO! batch={batch_id}, total_leads={final_count}")
         print(f"{'='*60}\n")
 
+        # Phase 3: Auto-tag + Fuzzy dedup
+        try:
+            tagged = auto_tag_batch(batch_id, conn)
+            print(f"[api_search] Phase3 auto-tagged {tagged} leads in batch {batch_id}")
+        except Exception as e3:
+            print(f"[api_search] Phase3 auto-tag error: {e3}")
+        try:
+            dupes = fuzzy_deduplicate_leads(batch_id, conn)
+            print(f"[api_search] Phase3 dedup: {dupes} duplicates in batch {batch_id}")
+        except Exception as e3:
+            print(f"[api_search] Phase3 dedup error: {e3}")
+
+        # Phase 1: Auto-enrich CNPJs found in this batch (background, non-blocking)
+        try:
+            c.execute(
+                '''SELECT b.user_id FROM batches b WHERE b.id = %s''', (batch_id,)
+            )
+            uid_row = c.fetchone()
+            if uid_row:
+                t_enrich = threading.Thread(
+                    target=_run_cnpj_enrichment,
+                    args=(uid_row[0], None),
+                    kwargs={},
+                    daemon=True
+                )
+                t_enrich.start()
+                print(f"[cnpj_enrich] Enriquecimento CNPJ iniciado em background para batch {batch_id}")
+        except Exception as enrich_err:
+            print(f"[cnpj_enrich] Aviso: nao foi possivel iniciar enrichment: {enrich_err}")
+
     except Exception as e:
         print(f"[FATAL] Erro fatal no batch {batch_id}: {e}")
         import traceback
@@ -2338,29 +4515,36 @@ def process_batch(batch_id, urls):
                 if not url.startswith('http'):
                     url = 'https://' + url
 
-                # Deep crawl
-                result = deep_crawl_domain(url, session)
+                # Deep crawl (Phase 2: enhanced with PDF + footer + team member extraction)
+                result = deep_crawl_domain_phase2(url, session)
 
                 # Insert leads for each email found
                 now = datetime.now()
                 first_phone = result['phones'][0] if result['phones'] else None
+                # Phase 2: extra fields
+                email_pattern_val = result.get('email_pattern')
+                team_members_val = json.dumps(result.get('team_members', []), ensure_ascii=False) if result.get('team_members') else None
+                pdf_emails_found = bool(result.get('pdf_emails_found'))
 
                 for email in result['emails']:
                     c.execute(
                         '''INSERT INTO leads
                            (batch_id, company_name, email, phone, website, source_url, source,
                             instagram, facebook, linkedin, twitter, youtube,
-                            whatsapp, cnpj, address, city, state, extracted_at)
+                            whatsapp, cnpj, address, city, state, extracted_at,
+                            email_pattern, team_members, pdf_emails_found)
                            VALUES (%s, %s, %s, %s, %s, %s, %s,
                                    %s, %s, %s, %s, %s,
-                                   %s, %s, %s, %s, %s, %s)
+                                   %s, %s, %s, %s, %s, %s,
+                                   %s, %s, %s)
                            ON CONFLICT (batch_id, email) DO NOTHING''',
                         (batch_id, result['company_name'], email, first_phone,
                          result['website'], url, 'website_crawl',
                          result.get('instagram'), result.get('facebook'),
                          result.get('linkedin'), result.get('twitter'), result.get('youtube'),
                          result.get('whatsapp'), result.get('cnpj'),
-                         result.get('address'), result.get('city'), result.get('state'), now)
+                         result.get('address'), result.get('city'), result.get('state'), now,
+                         email_pattern_val, team_members_val, pdf_emails_found)
                     )
 
                 # If no emails but phones found, still record the company
@@ -2391,6 +4575,19 @@ def process_batch(batch_id, urls):
         # Final count and status
         c.execute('SELECT COUNT(*) FROM leads WHERE batch_id = %s', (batch_id,))
         final_count = c.fetchone()[0]
+
+        # Phase 3: Auto-tag + Fuzzy dedup
+        try:
+            tagged = auto_tag_batch(batch_id, conn)
+            print(f"[batch {batch_id}] Phase3 auto-tagged {tagged} leads")
+        except Exception as e3:
+            print(f"[batch {batch_id}] Phase3 auto-tag error: {e3}")
+        try:
+            dupes = fuzzy_deduplicate_leads(batch_id, conn)
+            print(f"[batch {batch_id}] Phase3 dedup: {dupes} duplicates")
+        except Exception as e3:
+            print(f"[batch {batch_id}] Phase3 dedup error: {e3}")
+
         c.execute(
             'UPDATE batches SET status = %s, total_leads = %s, finished_at = %s WHERE id = %s',
             ('completed', final_count, datetime.now(), batch_id)
@@ -2438,6 +4635,31 @@ def login():
 
     token = create_session(user[0])
     return jsonify({'token': token, 'user_id': user[0], 'is_admin': user[2]})
+
+@app.route('/api/me', methods=['GET'])
+@limiter.limit("60/minute")
+def get_me():
+    """Get current authenticated user info (id, username, is_admin, plan)"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT id, username, is_admin, plan FROM users WHERE id = %s', (user_id,))
+            row = c.fetchone()
+            if not row:
+                return jsonify({'error': 'User not found'}), 404
+            return jsonify({
+                'id': row[0],
+                'username': row[1],
+                'is_admin': row[2],
+                'plan': row[3]
+            }), 200
+    except Exception as e:
+        print(f'[ERROR] /api/me: {e}')
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/scrape', methods=['POST'])
 @limiter.limit("10/hour")
@@ -2639,9 +4861,8 @@ def create_batch():
     thread = threading.Thread(target=process_batch, args=(batch_id, urls), daemon=True)
     thread.start()
 
-    # AUTO-SYNC: Start background thread to sync leads to alexandrequeiroz.com.br
-    sync_thread = threading.Thread(target=auto_sync_new_leads_background, args=(batch_id,), daemon=True)
-    sync_thread.start()
+    # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
+    threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
 
     return jsonify({
         'batch_id': batch_id,
@@ -2950,9 +5171,8 @@ def start_search():
     )
     thread.start()
 
-    # AUTO-SYNC: Start background thread to sync leads to alexandrequeiroz.com.br
-    sync_thread = threading.Thread(target=auto_sync_new_leads_background, args=(batch_id,), daemon=True)
-    sync_thread.start()
+    # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
+    threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
 
     return jsonify({
         'batch_id': batch_id,
@@ -3485,6 +5705,9 @@ def start_api_search():
     )
     thread.start()
 
+    # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
+    threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
+
     return jsonify({
         'batch_id': batch_id,
         'name': batch_name,
@@ -3504,9 +5727,20 @@ LEADS_SELECT = '''SELECT l.id, l.company_name, l.email, l.phone, l.website, l.so
                          l.instagram, l.facebook, l.linkedin, l.twitter, l.youtube,
                          l.whatsapp, l.cnpj, l.address,
                          l.crm_status, l.tags, l.notes, l.contact_name, l.updated_at,
-                         b.name as batch_name, l.batch_id
+                         b.name as batch_name, l.batch_id, COALESCE(l.lead_score, 0) as lead_score
                   FROM leads l JOIN batches b ON l.batch_id = b.id
                   WHERE b.user_id = %s'''
+
+# Semana 4: Shared base — clients see all shared leads, not just their own
+SHARED_LEADS_SELECT = '''SELECT l.id, l.company_name, l.email, l.phone, l.website, l.source_url,
+                                l.city, l.state, l.category, l.extracted_at,
+                                l.instagram, l.facebook, l.linkedin, l.twitter, l.youtube,
+                                l.whatsapp, l.cnpj, l.address,
+                                l.crm_status, l.tags, l.notes, l.contact_name, l.updated_at,
+                                b.name as batch_name, l.batch_id, COALESCE(l.lead_score, 0) as lead_score,
+                                l.source, l.quality_score
+                         FROM leads l JOIN batches b ON l.batch_id = b.id
+                         WHERE b.is_shared = TRUE'''
 
 def lead_row_to_dict(row):
     """Convert a lead row tuple to dict."""
@@ -3521,7 +5755,75 @@ def lead_row_to_dict(row):
         'contact_name': row[21] or '',
         'updated_at': row[22].isoformat() if row[22] else None,
         'batch_name': row[23], 'batch_id': row[24],
+        'lead_score': row[25] if row[25] is not None else 0,
+        'source': row[26] or '', 'quality_score': row[27] or 'basico',
     }
+
+
+# ======= Lead Scoring =======
+
+GENERIC_COMPANY_NAMES = {
+    'sem nome', 'unknown', 'n/a', 'na', 'empresa', 'company', 'test', 'teste',
+    'nome', 'name', 'business', 'negocio', 'negócio', '-', 'null', 'none'
+}
+
+def _calculate_lead_score(lead: dict) -> int:
+    """Calculate a deterministic quality score 0-100 for a lead.
+
+    Scoring rubric:
+      +30  email válido presente
+      +15  nome de empresa presente e não genérico
+      +15  nome de contato (pessoa) presente
+      +10  cidade presente
+      +10  telefone presente
+      +10  website presente
+       +5  estado presente
+       +5  categoria/segmento presente
+    Penalty:
+      -15  nome de empresa genérico ou suspeito
+    Range enforced: 0–100
+    """
+    score = 0
+
+    # Email (+30)
+    email = (lead.get('email') or '').strip()
+    if email and '@' in email and '.' in email.split('@')[-1]:
+        score += 30
+
+    # Company name (+15 or -15)
+    company = (lead.get('company_name') or '').strip()
+    company_lower = company.lower()
+    if company and company_lower not in GENERIC_COMPANY_NAMES and len(company) > 2:
+        score += 15
+    elif company_lower in GENERIC_COMPANY_NAMES:
+        score -= 15
+
+    # Contact name (+15)
+    contact = (lead.get('contact_name') or '').strip()
+    if contact and len(contact) > 2:
+        score += 15
+
+    # City (+10)
+    if (lead.get('city') or '').strip():
+        score += 10
+
+    # Phone (+10)
+    if (lead.get('phone') or '').strip():
+        score += 10
+
+    # Website (+10)
+    if (lead.get('website') or '').strip():
+        score += 10
+
+    # State (+5)
+    if (lead.get('state') or '').strip():
+        score += 5
+
+    # Category (+5)
+    if (lead.get('category') or '').strip():
+        score += 5
+
+    return max(0, min(100, score))
 
 @app.route('/api/leads', methods=['GET'])
 @limiter.limit("30/minute")
@@ -3537,12 +5839,18 @@ def list_leads():
     status = request.args.get('status', '').strip()
     tag = request.args.get('tag', '').strip()
     batch_id = request.args.get('batch_id', '').strip()
+    city = request.args.get('city', '').strip()
+    state = request.args.get('state', '').strip()
+    quality = request.args.get('quality', '').strip()  # premium | medio | basico
+    source_filter = request.args.get('source', '').strip()
+    min_score = request.args.get('min_score', '').strip()
     sort = request.args.get('sort', 'newest')
     page = max(1, int(request.args.get('page', 1)))
     per_page = min(100, max(10, int(request.args.get('per_page', 50))))
 
-    query = LEADS_SELECT
-    params = [user_id]
+    # Semana 4: use shared base — all authenticated users see the central lead pool
+    query = SHARED_LEADS_SELECT
+    params = []
 
     # Filters
     if search:
@@ -3564,6 +5872,29 @@ def list_leads():
         query += ' AND l.batch_id = %s'
         params.append(int(batch_id))
 
+    if city:
+        query += ' AND l.city ILIKE %s'
+        params.append(f'%{city}%')
+
+    if state:
+        query += ' AND l.state ILIKE %s'
+        params.append(f'%{state}%')
+
+    # Filtro por tier de qualidade
+    if quality in ('premium', 'medio', 'basico'):
+        query += ' AND l.quality_score = %s'
+        params.append(quality)
+
+    # Filtro por fonte de captura
+    if source_filter:
+        query += ' AND l.source = %s'
+        params.append(source_filter)
+
+    # Filtro por score mínimo numérico
+    if min_score and min_score.isdigit():
+        query += ' AND COALESCE(l.lead_score, 0) >= %s'
+        params.append(int(min_score))
+
     # Count total
     count_query = f'SELECT COUNT(*) FROM ({query}) sub'
     with get_db() as conn:
@@ -3578,6 +5909,8 @@ def list_leads():
             query += ' ORDER BY l.company_name ASC NULLS LAST'
         elif sort == 'status':
             query += ' ORDER BY l.crm_status ASC, l.company_name ASC'
+        elif sort == 'score':
+            query += ' ORDER BY COALESCE(l.lead_score, 0) DESC'
         elif sort == 'updated':
             query += ' ORDER BY l.updated_at DESC NULLS LAST'
         else:  # newest
@@ -3591,23 +5924,40 @@ def list_leads():
         c.execute(query, params)
         rows = c.fetchall()
 
-        # Get status counts
+        # Get status counts (shared base)
         c.execute('''SELECT COALESCE(l.crm_status, 'novo') as status, COUNT(*)
                      FROM leads l JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s
-                     GROUP BY COALESCE(l.crm_status, 'novo')''', (user_id,))
+                     WHERE b.is_shared = TRUE
+                     GROUP BY COALESCE(l.crm_status, 'novo')''')
         status_counts = {row[0]: row[1] for row in c.fetchall()}
 
-        # Get all unique tags
+        # Get all unique tags (shared base)
         c.execute('''SELECT DISTINCT unnest(string_to_array(l.tags, ','))
                      FROM leads l JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s AND l.tags IS NOT NULL AND l.tags != ''
-                     ORDER BY 1''', (user_id,))
+                     WHERE b.is_shared = TRUE AND l.tags IS NOT NULL AND l.tags != ''
+                     ORDER BY 1''')
         all_tags = [row[0].strip() for row in c.fetchall() if row[0].strip()]
 
     leads = [lead_row_to_dict(row) for row in rows]
 
-    return jsonify({
+    # SaaS: Track usage and check limits
+    plan = _get_user_plan(user_id)
+    limits = _get_plan_limits(plan)
+    is_admin = _is_admin_user(user_id)
+
+    # Admins bypass usage limits entirely
+    if is_admin:
+        usage = {'leads_viewed': 0, 'leads_exported': 0}
+        leads_limit = 999999
+    else:
+        usage = _get_usage_stats(user_id)
+        leads_limit = limits['leads_per_month'] if limits else 100
+
+    # Count leads being viewed on this page
+    leads_count = len(leads)
+
+    # Check if user is approaching or exceeding limit
+    response_data = {
         'leads': leads,
         'total': total,
         'page': page,
@@ -3615,6 +5965,49 @@ def list_leads():
         'total_pages': max(1, (total + per_page - 1) // per_page),
         'status_counts': status_counts,
         'all_tags': all_tags,
+        'plan': plan,
+        'usage': {
+            'leads_viewed': usage['leads_viewed'],
+            'leads_limit': leads_limit,
+            'usage_percent': (usage['leads_viewed'] / leads_limit * 100) if leads_limit > 0 else 0
+        }
+    }
+
+    # Increment view counter (skipped for admins via _increment_usage)
+    if leads_count > 0:
+        _increment_usage(user_id, 'leads_viewed', leads_count)
+
+    return jsonify(response_data)
+
+@app.route('/api/leads/locations/available', methods=['GET'])
+@limiter.limit("60/minute")
+def get_available_locations():
+    """Get all available cities and states for lead filtering."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        c = conn.cursor()
+
+        # Get unique cities from shared base
+        c.execute('''SELECT DISTINCT TRIM(l.city) as city
+                     FROM leads l JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.city IS NOT NULL AND l.city != ''
+                     ORDER BY city''')
+        cities = [row[0] for row in c.fetchall() if row[0]]
+
+        # Get unique states from shared base
+        c.execute('''SELECT DISTINCT TRIM(l.state) as state
+                     FROM leads l JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.state IS NOT NULL AND l.state != ''
+                     ORDER BY state''')
+        states = [row[0] for row in c.fetchall() if row[0]]
+
+    return jsonify({
+        'cities': cities,
+        'states': states,
     })
 
 @app.route('/api/leads/<int:lead_id>', methods=['GET'])
@@ -3628,7 +6021,7 @@ def get_lead(lead_id):
 
     with get_db() as conn:
         c = conn.cursor()
-        c.execute(LEADS_SELECT + ' AND l.id = %s', (user_id, lead_id))
+        c.execute(SHARED_LEADS_SELECT + ' AND l.id = %s', (lead_id,))
         row = c.fetchone()
 
     if not row:
@@ -3831,13 +6224,1297 @@ def bulk_delete_leads():
 
     return jsonify({'message': f'{deleted} leads deleted', 'deleted': deleted})
 
+
+@app.route('/api/leads/delete-all', methods=['POST'])
+@limiter.limit("5/hour")
+def delete_all_leads():
+    """Delete ALL leads for the authenticated user. Irreversible."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    if not data.get('confirm'):
+        return jsonify({'error': 'confirm: true is required'}), 400
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            '''DELETE FROM leads
+               WHERE batch_id IN (SELECT id FROM batches WHERE user_id = %s)''',
+            (user_id,)
+        )
+        deleted = c.rowcount
+
+    return jsonify({'message': f'{deleted} leads deletados', 'deleted': deleted})
+
+
+@app.route('/api/leads/sync-and-delete', methods=['POST'])
+@limiter.limit("3/hour")
+def sync_and_delete_leads():
+    """
+    Sync ALL leads to alexandrequeiroz.com.br CRM (synchronously),
+    then delete all leads for the user. Irreversible.
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    if not data.get('confirm'):
+        return jsonify({'error': 'confirm: true is required'}), 400
+
+    # Step 1: Fetch all leads with email for sync
+    conn = psycopg2.connect(**DB_CONFIG)
+    c = conn.cursor()
+    try:
+        c.execute(
+            '''SELECT company_name, email, phone, website, city, state, source
+               FROM leads
+               WHERE email IS NOT NULL AND email != ''
+               AND batch_id IN (SELECT id FROM batches WHERE user_id = %s)
+               ORDER BY extracted_at DESC''',
+            (user_id,)
+        )
+        rows = c.fetchall()
+        leads_to_sync = [
+            {
+                'company_name': row[0],
+                'email': row[1],
+                'phone': row[2],
+                'website': row[3],
+                'city': row[4],
+                'state': row[5],
+                'source': row[6] or 'extrator-dados',
+            }
+            for row in rows
+        ]
+    finally:
+        c.close()
+        conn.close()
+
+    # Step 2: Sync synchronously (wait for completion before deleting)
+    synced, skipped, errors = 0, 0, 0
+    if leads_to_sync:
+        print(f"[SYNC-DELETE] Syncing {len(leads_to_sync)} leads to CRM before delete...")
+        synced, skipped, errors = sync_leads_batch_to_alexandrequeiroz(
+            leads_to_sync, max_leads=len(leads_to_sync)
+        )
+        print(f"[SYNC-DELETE] Sync done: {synced} created, {skipped} skipped, {errors} errors")
+
+    # Step 3: Delete all leads for user
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            '''DELETE FROM leads
+               WHERE batch_id IN (SELECT id FROM batches WHERE user_id = %s)''',
+            (user_id,)
+        )
+        deleted = c.rowcount
+
+    print(f"[SYNC-DELETE] Deleted {deleted} leads for user {user_id}")
+
+    return jsonify({
+        'message': f'{synced} sincronizados, {skipped} já existiam, {errors} erros. {deleted} leads deletados.',
+        'synced': synced,
+        'skipped': skipped,
+        'errors': errors,
+        'deleted': deleted,
+    })
+
+
+# ============================================================
+# LEAD SANITIZATION ENGINE
+# ============================================================
+
+# Domínios de baixa reputação / spam conhecidos
+SPAM_DOMAINS = {
+    'guerrillamail.com', 'mailinator.com', 'tempmail.com', 'throwaway.email',
+    'sharklasers.com', 'guerrillamailblock.com', 'grr.la', 'guerrillamail.info',
+    'spam4.me', 'trashmail.com', 'yopmail.com', 'dispostable.com',
+    'fakeinbox.com', 'maildrop.cc', 'mailnull.com', 'spamgourmet.com',
+    'trashmail.at', 'mailnesia.com', 'mailnull.com', 'spamhereplease.com',
+    'spamherelots.com', 'dispostable.com',
+}
+
+# Extensões de domínio claramente incorretas (resultado de scraping ruim)
+BAD_DOMAIN_EXTENSIONS = [
+    r'\.com\.brav\b', r'\.com\.brhor\b', r'\.com\.brs\b', r'\.com\.brm\b',
+    r'\.coom\b', r'\.con\b', r'\.com\.b$', r'\.com\.br\.',
+    r'\.net\.bra\b', r'\.org\.bra\b', r'\.cmo\b', r'\.ocm\b',
+    r'\.(com|net|org)\.[a-z]{3,}br\b',  # .com.XYZbr patterns
+]
+
+# Prefixos genéricos (não pessoais) para classificação de tipo de email
+GENERIC_EMAIL_PREFIXES = {
+    'contato', 'contact', 'info', 'atendimento', 'suporte', 'support',
+    'vendas', 'sales', 'comercial', 'financeiro', 'rh', 'recursos-humanos',
+    'marketing', 'adm', 'admin', 'administracao', 'recepcao', 'portaria',
+    'ouvidoria', 'sac', 'faleconosco', 'contatos', 'comunicacao',
+    'newsletter', 'noticias', 'secretaria', 'gestao', 'diretoria',
+    'ti', 'fiscal', 'juridico', 'compras', 'logistica', 'operacional',
+    'cobranca', 'pos-venda', 'posvenda', 'relacionamento',
+}
+
+# Palavras que indicam nome pessoal no email (letras + ponto + letras)
+_PERSONAL_EMAIL_RE = re.compile(r'^[a-z]{2,}\.[a-z]{2,}(@|$)')
+
+
+try:
+    import ftfy as _ftfy
+    _FTFY_AVAILABLE = True
+except ImportError:
+    _ftfy = None
+    _FTFY_AVAILABLE = False
+
+def fix_text_encoding(text):
+    """
+    Corrige problemas comuns de encoding/acentuação em textos scrapeados.
+    Prioriza ftfy (especializado em mojibake), depois fallbacks manuais.
+    """
+    if not text:
+        return text
+
+    # Estratégia 0: ftfy (melhor para mojibake como Ã© -> é, Ã³ -> ó)
+    if _FTFY_AVAILABLE:
+        try:
+            fixed = _ftfy.fix_text(text)
+            if fixed and fixed != text:
+                return fixed.strip()
+        except Exception:
+            pass
+
+    # Estratégia 1: latin-1 bytes reinterpretados como utf-8
+    try:
+        fixed = text.encode('latin-1').decode('utf-8')
+        return fixed
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+
+    # Estratégia 2: cp1252 -> utf-8
+    try:
+        fixed = text.encode('cp1252').decode('utf-8')
+        return fixed
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+
+    # Estratégia 3: remover replacement chars e controles
+    try:
+        import unicodedata
+        normalized = unicodedata.normalize('NFKC', text)
+        cleaned = ''.join(
+            c for c in normalized
+            if unicodedata.category(c) not in ('Cc', 'Cf') or c in '\n\t '
+        )
+        # Remove U+FFFD (replacement char) que indica info perdida
+        cleaned = cleaned.replace('\ufffd', '')
+        return cleaned.strip()
+    except Exception:
+        pass
+
+    return text
+
+
+# ── Nomes genéricos que devem ser substituídos por nome derivado do domínio ──
+_GENERIC_NAMES = {
+    'home', 'index', 'inicio', 'início', 'pagina inicial', 'página inicial',
+    'page', 'main', 'welcome', 'untitled', 'default', 'site', 'website',
+    'null', 'none', 'n/a', 'na', '-', '—', 'sem nome',
+    # Fontes de busca (não são nomes de empresa)
+    'jusbrasil', 'guiamais', 'guia mais', 'telelistas', 'apontador',
+    'yellowpages', 'paginas amarelas', 'páginas amarelas', 'catalogo',
+    'empresas', 'google', 'bing', 'linkedin', 'facebook', 'instagram',
+}
+
+# Conjunções/preposições que ficam minúsculas em title case
+_LOWERCASE_CONJUNCTIONS = {
+    'de', 'da', 'do', 'das', 'dos', 'e', 'em', 'para', 'com', 'por',
+    'na', 'no', 'nas', 'nos', 'a', 'o', 'ao', 'aos', 'à', 'às',
+}
+
+# Siglas de estados + sufixos jurídicos que ficam MAIÚSCULOS
+_UPPERCASE_TOKENS = {
+    'es', 'sp', 'rj', 'mg', 'rs', 'sc', 'pr', 'ba', 'pe', 'ce',
+    'am', 'pa', 'go', 'df', 'rn', 'pb', 'al', 'se', 'pi', 'ma',
+    'to', 'ac', 'ro', 'rr', 'ap', 'mt', 'ms', 'pi',
+    'ltda', 'me', 'eireli', 'sa', 'epp', 'mei', 'ss', 'sl',
+}
+
+
+def smart_title_case(text):
+    """Title case inteligente: respeita conjunções minúsculas, siglas e estados em MAIÚSCULO."""
+    if not text:
+        return text
+    text = text.strip()
+    # Se já tem capitalização mista correta (ex: 'Clínica Saúde'), não mexer
+    # Só corrige se tudo maiúsculo, tudo minúsculo, ou começa com minúscula
+    if not (text.isupper() or text.islower() or (text and text[0].islower())):
+        # Garante pelo menos a primeira letra maiúscula
+        return text[0].upper() + text[1:] if text else text
+
+    tokens = re.split(r'(\s+|-)', text)
+    result = []
+    word_index = 0
+    for tok in tokens:
+        if re.match(r'\s+|-', tok):
+            result.append(tok)
+            continue
+        tok_lower = tok.lower()
+        if tok_lower in _UPPERCASE_TOKENS:
+            result.append(tok.upper())
+        elif word_index > 0 and tok_lower in _LOWERCASE_CONJUNCTIONS:
+            result.append(tok_lower)
+        else:
+            result.append(tok.capitalize())
+        word_index += 1
+    return ''.join(result)
+
+
+def _derive_name_from_domain(domain_str):
+    """Converte slug de domínio em nome legível. Ex: 'bicho-mimado-es' -> 'Bicho Mimado ES'."""
+    if not domain_str:
+        return None
+    # Remove extensões de domínio (.com.br, .net, .org, etc.)
+    slug = re.sub(r'\.(com|net|org|br|io|co|info|biz)(\.\w+)?$', '', domain_str, flags=re.I)
+    slug = slug.strip('/-.')
+    if not slug or len(slug) < 3:
+        return None
+    # Substituir hifens/underscores por espaço
+    name = re.sub(r'[-_]', ' ', slug)
+    return smart_title_case(name)
+
+
+def extract_clean_company_name(name, email=None, website=None):
+    """
+    Pipeline completo de normalização do nome da empresa:
+    1. Fix encoding (mojibake, replacement chars)
+    2. Extrair nome de contexto multi-linha (ex: 'Jusbrasil\\nAdvogados...\\nemail@...')
+    3. Limpar artefatos de título de página (ex: 'Home | Empresa' -> 'Empresa')
+    4. Se nome genérico/vazio, derivar do domínio do email ou website
+    5. Aplicar smart title case
+    """
+    # 1. Fix encoding
+    name = fix_text_encoding(name or '')
+
+    # 2. Extrair de contexto multi-linha
+    if name and ('\n' in name or len(name) > 120):
+        lines = [l.strip() for l in name.split('\n') if l.strip()]
+        candidates = []
+        for line in lines:
+            # Ignorar linhas que são emails, URLs, longas demais, ou contexto de busca
+            if '@' in line:
+                continue
+            if re.match(r'https?://', line, re.I):
+                continue
+            if re.match(r'[\w.-]+\.(com|br|net|org|io|co)(\.\w+)?/?$', line, re.I):
+                continue
+            if len(line) > 80:
+                continue
+            candidates.append(line)
+        name = candidates[0] if candidates else (lines[0] if lines else name)
+
+    # 3. Limpar artefatos de título de página
+    if name:
+        # "Home | Clínica Saúde" -> "Clínica Saúde" (ou vice-versa)
+        # "Index - Empresa ABC"  -> "Empresa ABC"
+        for sep in [' | ', ' - ', ' – ', ' — ', ' :: ', ' » ', ' > ']:
+            if sep in name:
+                parts = [p.strip() for p in name.split(sep) if p.strip()]
+                # Pega a parte que não é genérica
+                non_generic = [p for p in parts if p.lower().strip() not in _GENERIC_NAMES]
+                if non_generic:
+                    name = non_generic[0]
+                    break
+                elif parts:
+                    name = parts[-1]  # pega a última
+                    break
+        # Remove sufixos comuns de títulos de página
+        name = re.sub(r'\s*[-|–]\s*(Home|Index|Início|Welcome|Página Inicial)$', '', name, flags=re.I).strip()
+
+    # 4. Detectar nome genérico/inútil e derivar do email/website
+    name_check = (name or '').strip().lower()
+    is_generic = (
+        not name_check
+        or name_check in _GENERIC_NAMES
+        or len(name_check) <= 2
+        or re.match(r'^[\d\s\-\/\\]+$', name_check)  # só números/símbolos
+    )
+
+    if is_generic:
+        derived = None
+        # Tentar derivar do email
+        if email and '@' in email:
+            domain = email.split('@')[1]
+            slug = domain.split('.')[0]  # altefrezende de altefrezende.com.br
+            derived = _derive_name_from_domain(slug)
+        # Tentar derivar do website
+        if not derived and website:
+            clean_url = re.sub(r'https?://', '', website).split('/')[0]  # remove protocolo e path
+            slug = clean_url.split('.')[0]
+            derived = _derive_name_from_domain(slug)
+        if derived:
+            name = derived
+
+    # 5. Smart title case
+    name = smart_title_case(name or '')
+
+    return name.strip() if name else ''
+
+
+_GARBAGE_NAME_RE = re.compile(
+    r'(clique aqui|saiba mais|leia mais|acesse|entre em contato|fale conosco'
+    r'|nosso site|nossa empresa|telefone|whatsapp|endereço|horário'
+    r'|copyright|todos os direitos|\d{2}/\d{2}/\d{4}'
+    r'|https?://|www\.|\.com|\.br)',
+    re.I
+)
+
+def is_garbage_name(name):
+    """
+    Retorna True se o nome é claramente um fragmento de texto/frase, não um nome de empresa.
+    Casos rejeitados:
+    - Muito curto (< 3 caracteres)
+    - Mais de 6 palavras (provavelmente uma frase)
+    - Contém URLs, datas, palavras de marketing típicas
+    - Contém apenas números e símbolos
+    """
+    if not name:
+        return True
+    name = name.strip()
+    if len(name) < 3:
+        return True
+    # Apenas números / símbolos
+    if re.match(r'^[\d\s\-\/\\\.,:;!?@#$%&*()\[\]]+$', name):
+        return True
+    # Demasiadas palavras = frase
+    word_count = len(name.split())
+    if word_count > 6:
+        return True
+    # Padrões de lixo de scraping
+    if _GARBAGE_NAME_RE.search(name):
+        return True
+    return False
+
+
+def classify_email_type(email):
+    """
+    Classifica o email como 'generico' ou 'pessoal'.
+    Retorna: 'pessoal', 'generico' ou 'desconhecido'
+    """
+    if not email or '@' not in email:
+        return 'desconhecido'
+    local = email.split('@')[0].lower()
+    # Check prefixo genérico
+    if local in GENERIC_EMAIL_PREFIXES:
+        return 'generico'
+    # Padrão nome.sobrenome
+    if _PERSONAL_EMAIL_RE.match(local):
+        return 'pessoal'
+    # Se tem número e texto (joao123, maria.2023)
+    if re.match(r'^[a-z]{2,}[0-9]{1,4}$', local):
+        return 'pessoal'
+    return 'desconhecido'
+
+
+def has_bad_domain_extension(email):
+    """Detecta extensões de domínio incorretas resultantes de scraping ruim."""
+    if not email:
+        return False
+    domain_part = email.split('@')[-1] if '@' in email else email
+    for pattern in BAD_DOMAIN_EXTENSIONS:
+        if re.search(pattern, domain_part):
+            return True
+    return False
+
+
+def is_spam_domain(email):
+    """Detecta domínios de spam/temporários."""
+    if not email or '@' not in email:
+        return False
+    domain = email.split('@')[-1].lower().strip()
+    return domain in SPAM_DOMAINS
+
+
+def sanitize_single_lead(lead_dict):
+    """
+    Aplica todas as regras de sanitização a um lead.
+    Retorna (sanitized_dict, issues_list, is_valid_bool).
+    """
+    issues = []
+    lead = dict(lead_dict)
+
+    # 1a. Normalizar company_name (encoding + extração de contexto + title case + derivação)
+    original_name = lead.get('company_name') or ''
+    clean_name = extract_clean_company_name(
+        original_name,
+        email=lead.get('email'),
+        website=lead.get('website'),
+    )
+    if clean_name and clean_name != original_name:
+        issues.append('company_name_normalized')
+        lead['company_name'] = clean_name
+
+    # 1b. Detectar empresa estrangeira pelo nome (Inc, LLC, Ltd, GmbH...)
+    if is_foreign_company(lead.get('company_name') or ''):
+        issues.append(f'foreign_company:{lead.get("company_name","")[:50]}')
+        lead['crm_status'] = 'descartado'
+        # Marca mas não apaga — deixa auto_sanitize_background decidir
+
+    # 1c. Corrigir encoding de outros campos de texto
+    for field in ('address', 'city', 'state', 'contact_name', 'notes'):
+        val = lead.get(field)
+        if val and isinstance(val, str):
+            fixed = fix_text_encoding(val)
+            if fixed != val:
+                issues.append(f'encoding_corrected:{field}')
+                lead[field] = fixed
+
+    # 1d. Limpar cidade: extrair nome real de strings como "Escritório de X em Vitória"
+    city = lead.get('city') or ''
+    if city:
+        cleaned_city = clean_city_name(city)
+        if cleaned_city != city:
+            issues.append(f'city_cleaned:{city[:40]}→{cleaned_city}')
+            lead['city'] = cleaned_city
+
+    # 1e. Smart title case em city e state
+    for field in ('city', 'state'):
+        val = lead.get(field)
+        if val and isinstance(val, str):
+            cased = smart_title_case(val)
+            if cased != val:
+                lead[field] = cased
+
+    # 2. Validar e sanitizar email
+    email = (lead.get('email') or '').strip().lower()
+    email_valid = False
+    email_type = 'desconhecido'
+
+    if email and not email.endswith(('@directory.local', '@instagram.local', '@linkedin.local')):
+        # 2a. Domínio irrelevante (jornais, tech media, empresas internacionais)
+        if is_irrelevant_email_domain(email):
+            issues.append(f'irrelevant_domain:{email}')
+            lead['email'] = None
+        # 2b. Extensão de domínio ruim (scraping artifact)
+        elif has_bad_domain_extension(email):
+            issues.append(f'bad_domain_extension:{email}')
+            lead['email'] = None
+        # 2c. Domínio de spam/temporário
+        elif is_spam_domain(email):
+            issues.append(f'spam_domain:{email}')
+            lead['email'] = None
+        else:
+            # 2d. Validação de qualidade via score
+            score, is_valid, reason = calculate_email_quality_score(email)
+            if not is_valid:
+                issues.append(f'email_invalid:{reason}:{email[:50]}')
+                lead['email'] = None
+            elif score < 40:
+                issues.append(f'email_low_quality:score={score}:{email[:50]}')
+                lead['email'] = None
+            else:
+                email_valid = True
+                email_type = classify_email_type(email)
+                lead['email_type'] = email_type
+
+    # 3. Validar e normalizar telefone
+    phone = lead.get('phone') or ''
+    if phone:
+        cleaned_phone, phone_valid = validate_phone_br(phone)
+        if not phone_valid:
+            issues.append(f'phone_invalid:{phone[:20]}')
+            lead['phone'] = None
+        else:
+            lead['phone'] = cleaned_phone
+
+    # 4. Recalcular quality_score (tier) e lead_score (numérico 0-100)
+    lead['quality_score'] = calculate_quality_score(lead)
+    lead['lead_score'] = calculate_lead_score_numeric(lead)
+
+    # Lead é válido se tem pelo menos email ou telefone ou rede social
+    has_contact = bool(lead.get('email') or lead.get('phone') or
+                       lead.get('instagram') or lead.get('linkedin') or
+                       lead.get('whatsapp'))
+
+    # Empresa estrangeira sem contato BR = descartar
+    if 'foreign_company' in ' '.join(issues) and not has_contact:
+        return lead, issues, False
+
+    return lead, issues, has_contact
+
+
+@app.route('/api/leads/sanitize', methods=['POST'])
+@limiter.limit("5/minute")
+def sanitize_leads():
+    """
+    Sanitize leads in DB: fix encoding, validate emails, remove duplicates,
+    classify email types, recalculate quality scores.
+    Accepts: { lead_ids: [...] } for selected, or {} for all user leads.
+    Returns: summary report.
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    lead_ids = data.get('lead_ids', [])  # empty = all leads
+
+    with get_db() as conn:
+        c = conn.cursor()
+
+        # Fetch leads to sanitize
+        if lead_ids:
+            placeholders = ','.join(['%s'] * len(lead_ids))
+            c.execute(
+                f'''SELECT l.id, l.company_name, l.email, l.phone, l.website, l.address,
+                           l.city, l.state, l.source, l.instagram, l.linkedin, l.facebook,
+                           l.whatsapp, l.cnpj, l.contact_name, l.notes, l.crm_status,
+                           l.quality_score, l.batch_id
+                    FROM leads l
+                    JOIN batches b ON b.id = l.batch_id
+                    WHERE l.id IN ({placeholders}) AND b.user_id = %s''',
+                lead_ids + [user_id]
+            )
+        else:
+            c.execute(
+                '''SELECT l.id, l.company_name, l.email, l.phone, l.website, l.address,
+                          l.city, l.state, l.source, l.instagram, l.linkedin, l.facebook,
+                          l.whatsapp, l.cnpj, l.contact_name, l.notes, l.crm_status,
+                          l.quality_score, l.batch_id
+                   FROM leads l
+                   JOIN batches b ON b.id = l.batch_id
+                   WHERE b.user_id = %s
+                   ORDER BY l.id''',
+                (user_id,)
+            )
+
+        rows = c.fetchall()
+        cols = ['id', 'company_name', 'email', 'phone', 'website', 'address',
+                'city', 'state', 'source', 'instagram', 'linkedin', 'facebook',
+                'whatsapp', 'cnpj', 'contact_name', 'notes', 'crm_status',
+                'quality_score', 'batch_id']
+        leads_raw = [dict(zip(cols, row)) for row in rows]
+
+        total_analyzed = len(leads_raw)
+        invalid_emails = 0
+        encoding_corrected = 0
+        spam_detected = 0
+        duplicates_removed = 0
+        quality_updated = 0
+        no_contact_removed = 0
+        ids_to_delete = []
+        seen_emails = {}  # email -> lead_id (keep first/best, delete rest)
+
+        # Pass 1: sanitize each lead
+        sanitized_leads = []
+        for lead in leads_raw:
+            original_email = lead.get('email') or ''
+            sanitized, issues, has_contact = sanitize_single_lead(lead)
+
+            if any('encoding_corrected' in i for i in issues):
+                encoding_corrected += 1
+            if any('email_invalid' in i or 'bad_domain' in i or 'email_low_quality' in i for i in issues):
+                invalid_emails += 1
+            if any('spam_domain' in i for i in issues):
+                spam_detected += 1
+
+            # Remove leads without any valid contact method
+            if not has_contact:
+                ids_to_delete.append(lead['id'])
+                no_contact_removed += 1
+                continue
+
+            sanitized_leads.append(sanitized)
+
+        # Pass 2: detect duplicates by normalized email
+        email_map = {}
+        for lead in sanitized_leads:
+            email = (lead.get('email') or '').strip().lower()
+            if not email:
+                continue
+            if email in email_map:
+                # Keep the one with more data (higher quality_score or more fields)
+                existing = email_map[email]
+                existing_score = sum(1 for f in ('phone', 'website', 'instagram', 'whatsapp', 'cnpj') if existing.get(f))
+                new_score = sum(1 for f in ('phone', 'website', 'instagram', 'whatsapp', 'cnpj') if lead.get(f))
+                if new_score > existing_score:
+                    ids_to_delete.append(existing['id'])
+                    email_map[email] = lead
+                else:
+                    ids_to_delete.append(lead['id'])
+                duplicates_removed += 1
+            else:
+                email_map[email] = lead
+
+        # Pass 3: apply updates to DB
+        for lead in sanitized_leads:
+            if lead['id'] in ids_to_delete:
+                continue  # Will be deleted
+            try:
+                new_email = lead.get('email') or None
+                new_quality = lead.get('quality_score', 'basico')
+                new_company = lead.get('company_name') or None
+                new_address = lead.get('address') or None
+                new_city = lead.get('city') or None
+                new_notes = lead.get('notes') or None
+                email_type = lead.get('email_type') or None
+
+                # Build tags addition for email_type
+                existing_tags = (lead.get('notes') or '')
+
+                c.execute(
+                    '''UPDATE leads SET
+                         email = %s,
+                         company_name = %s,
+                         address = %s,
+                         city = %s,
+                         quality_score = %s,
+                         notes = %s,
+                         updated_at = %s
+                       WHERE id = %s''',
+                    (new_email, new_company, new_address, new_city,
+                     new_quality, new_notes, datetime.now(), lead['id'])
+                )
+                quality_updated += 1
+            except Exception as e:
+                print(f"[sanitize] Erro update lead {lead['id']}: {e}")
+
+        # Delete duplicates
+        if ids_to_delete:
+            placeholders = ','.join(['%s'] * len(ids_to_delete))
+            c.execute(
+                f'DELETE FROM leads WHERE id IN ({placeholders})',
+                ids_to_delete
+            )
+
+        conn.commit()
+
+    return jsonify({
+        'success': True,
+        'report': {
+            'analyzed': total_analyzed,
+            'invalid_emails': invalid_emails,
+            'encoding_corrected': encoding_corrected,
+            'spam_detected': spam_detected,
+            'duplicates_removed': duplicates_removed,
+            'no_contact_removed': no_contact_removed,
+            'quality_updated': quality_updated,
+            'ids_deleted': len(ids_to_delete),
+        }
+    })
+
+
+# ============= AI Name/Email Normalizer =============
+
+def _get_llm_key_for_normalize():
+    """Returns (provider, api_key) — tries OpenRouter first, then Groq."""
+    blob = _fetch_secret_blob_from_aws('tools/openrouter')
+    if blob:
+        key = _read_secret_key_from_blob(blob, ['OPENROUTER_API_KEY'])
+        if key:
+            return 'openrouter', key
+    blob = _fetch_secret_blob_from_aws('tools/groq')
+    if blob:
+        key = _read_secret_key_from_blob(blob, ['GROQ_API_KEY'])
+        if key:
+            return 'groq', key
+    return None, None
+
+
+def _call_llm_normalize(prompt, provider, api_key):
+    """Call LLM and return parsed JSON. Raises on failure."""
+    import requests as _req
+    import json as _json
+
+    if provider == 'openrouter':
+        url = 'https://openrouter.ai/api/v1/chat/completions'
+        headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+        payload = {'model': 'deepseek/deepseek-chat', 'messages': [{'role': 'user', 'content': prompt}], 'temperature': 0.1, 'max_tokens': 4000}
+    elif provider == 'groq':
+        url = 'https://api.groq.com/openai/v1/chat/completions'
+        headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+        payload = {'model': 'llama-3.1-8b-instant', 'messages': [{'role': 'user', 'content': prompt}], 'temperature': 0.1, 'max_tokens': 4000}
+    else:
+        raise ValueError(f'Unknown provider: {provider}')
+
+    resp = _req.post(url, headers=headers, json=payload, timeout=45)
+    resp.raise_for_status()
+    resp_json = resp.json()
+    content = resp_json['choices'][0]['message']['content'].strip()
+    usage = resp_json.get('usage', {})
+    # Strip markdown code fences if present
+    if content.startswith('```'):
+        content = re.sub(r'^```[a-z]*\n?', '', content)
+        content = re.sub(r'\n?```$', '', content)
+    import json as _json2
+    parsed = _json2.loads(content)
+    # Attach usage metadata to result
+    if isinstance(parsed, dict):
+        parsed['_usage'] = {
+            'provider': provider,
+            'prompt_tokens': usage.get('prompt_tokens', 0),
+            'completion_tokens': usage.get('completion_tokens', 0),
+            'total_tokens': usage.get('total_tokens', 0),
+        }
+    return parsed
+
+
+def _ai_normalize_batch(leads_batch):
+    """
+    Send a batch of leads to LLM for normalization.
+    Returns (results_list, error_str).
+    results_list items: {id, company_name, email, contact_name}
+    """
+    import json as _json
+
+    provider, api_key = _get_llm_key_for_normalize()
+    if not api_key:
+        return None, 'Chave LLM não disponível (configure OpenRouter ou Groq no AWS SM)'
+
+    leads_input = [
+        {
+            'id': l['id'],
+            'company_name': (l.get('company_name') or '').strip(),
+            'email': (l.get('email') or '').strip(),
+            'contact_name': (l.get('contact_name') or '').strip(),
+        }
+        for l in leads_batch
+    ]
+
+    prompt = f"""Você é um especialista em limpeza e normalização de dados de leads empresariais brasileiros. Siga as instruções abaixo com precisão.
+
+━━ CAMPO: company_name ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Remova sufixos jurídicos: LTDA, ME, EIRELI, S/A, EPP, SS, S.S., LTDA ME, LTDA EPP, S.A., SA, MICRO EMPRESA, MICROEMPRESA, SOCIEDADE SIMPLES.
+2. Substitua hifens usados como separadores por espaços (ex: "Clínica-Saúde" → "Clínica Saúde", "Auto-Peças" → "Auto Peças").
+3. Se o nome for um slogan, frase de marketing ou título de categoria de diretório, substitua pelo nome derivado do domínio do email (se disponível) ou retorne "".
+   Identifique como INVÁLIDO (não é nome de empresa) quando:
+   a) Contém verbos/palavras de marketing: "seja", "venha", "conheça", "bem-vindo", "confira", "clique", "acesse", "saiba mais", "qualidade", "excelência", "ligue", "entre em contato".
+   b) É um título de categoria de diretório: padrão "[Categoria] em [Cidade/Estado]" ou "[Categoria] e [Categoria] em [Cidade]".
+      Exemplos: "Oficinas Mecânicas em Vila Velha", "Restaurantes e Lanchonetes em São Paulo", "Clínicas Odontológicas em Vitória/ES".
+   c) É um título de artigo/listicle com número ordinal ou superlativo: padrão "N Melhores [X] em [Y]", "Top N [X]", "Os Melhores [X] de [Y]", "Lista de [X]", "Melhores [X] em [Y]".
+      Exemplos: "10 Melhores Oficinas Mecânicas em Vila Velha", "Top 5 Restaurantes em SP", "Os Melhores Dentistas de Vitória".
+   d) É uma descrição genérica de segmento sem nome próprio: "Oficina Mecânica", "Restaurante", "Clínica Médica" (sem nome próprio após).
+   e) Contém CNPJ embutido no início ou no meio (padrão XX.XXX.XXX/XXXX-XX): remova o CNPJ e processe o restante normalmente.
+4b. Se o nome começa com um nome próprio de empresa seguido de descrição de categoria+localidade (padrão "[NomeEmpresa] [Categoria] [Cidade/Estado]"), extraia apenas o nome próprio inicial e descarte o restante.
+    Exemplos:
+    - "Financial Contabilidade Escritório de Contabilidade Vitória/ES" → "Financial Contabilidade"
+    - "Sorriso Feliz Clínica Odontológica em Vila Velha ES" → "Sorriso Feliz"
+    - "Auto Center Silva Oficina Mecânica Cariacica" → "Auto Center Silva"
+   - Se houver email disponível: derive o nome a partir do email seguindo este processo:
+     a) Se o domínio for corporativo (não gmail/hotmail/yahoo/outlook/bol/uol/terra): use o domínio (ex: `facilittacont.com.br` → "Facilitta Cont", `w3contabilidade.com.br` → "W3 Contabilidade").
+     b) Se o domínio for pessoal (gmail/hotmail/yahoo/outlook/bol/uol/terra): use o local-part (antes do @), removendo PRIMEIRO os sufixos genéricos no final (contato, info, comercial, vendas, atendimento, faleconosco, email, empresa, comercial01, comercial02) e DEPOIS os prefixos genéricos no início (contato, info, comercial).
+        Exemplo: "ateliepatriciaalmeidacontato@gmail.com" → remove sufixo "contato" → "ateliepatriciaalmeida" → "Ateliê Patricia Almeida"
+        Exemplo: "anizioautopecas@gmail.com" → sem sufixo/prefixo genérico → "Anizio Auto Peças"
+        Exemplo: "contato@gmail.com" → local-part é puramente genérico → retorne ""
+     c) Processo de separação de palavras concatenadas: detecte transições de minúscula→maiúscula (camelCase), pontos, hifens, números entre letras, ou padrões semânticos óbvios (ex: "autocenter" → "Auto Center", "clinicasorriso" → "Clínica Sorriso").
+     d) Aplique Title Case e corrija acentuação óbvia: pecas→peças, clinica→clínica, odonto→Odonto, atelie→Ateliê, joao→João, etc.
+   - Se o email não existir e não houver como derivar nome: retorne "".
+4. Aplique Title Case correto para português: preposições "de", "da", "do", "e", "das", "dos", "no", "na", "em", "com", "por", "para" em minúsculas quando no meio do nome.
+5. Remova fragmentos de URL, CNPJ (padrão XX.XXX.XXX/XXXX-XX), números de telefone, ou texto genérico como "Página Inicial", "Home", "Site", "Empresa", "Nossa Empresa".
+6. Se, após a limpeza, a string estiver vazia ou tiver menos de 2 caracteres, retorne "".
+
+Exemplos:
+- "CLÍNICA SORRISO LTDA" → "Clínica Sorriso"
+- "Auto-Center-Vitória ME" → "Auto Center Vitória"
+- "Oficinas Mecânicas e Mecânicas Automotivas em Vila Velha" + email "anizioautopecas@gmail.com" → "Anizio Auto Peças"
+- "10 Melhores Oficinas Mecânicas em Vila Velha" + email "ativesite@gmail.com" → "Ative Site"
+- "Top 5 Clínicas Odontológicas em Vitória" + email "contato@sorrisoperfeito.com.br" → "Sorriso Perfeito"
+- "Restaurantes em São Paulo" + email "joao@restaurantedobem.com.br" → "Restaurante do Bem"
+- "Escritório de Contabilidade em Vitória-ES" + email "contato@facilittacont.com.br" → "Facilitta Cont"
+- "Escritório de Contabilidade em Vitória/ES" + email "contato@w3contabilidade.com.br" → "W3 Contabilidade"
+- "Financial Contabilidade Escritório de Contabilidade Vitória/ES" → "Financial Contabilidade"
+- "13.122.119/0001-89 Escritório de Contabilidade em Vitória" + email "contato@facilittacont.com.br" → "Facilitta Cont"
+- "Salões de Beleza em Vitória" + email "ateliepatriciaalmeidacontato@gmail.com" → "Ateliê Patricia Almeida"
+- "Seja bem-vindo!" + email "contato@enzoodonto.com.br" → "Enzo Odonto"
+- "12.345.678/0001-90 Restaurante do João" → "Restaurante do João"
+- "Clínicas Odontológicas em Vitória" + sem email → ""
+- "Home" → ""
+
+━━ CAMPO: email ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Remova artefatos de scraping colados antes do email:
+   - Prefixos como "e-mail", "email:", "mailto:", "E-mail:", "Email:" grudados antes do endereço (ex: "e-mailcontato@empresa.com.br" → "contato@empresa.com.br", "mailto:info@site.com" → "info@site.com")
+2. Corrija typos óbvios no domínio:
+   - gmaiil / gmaill / gmai.com → gmail.com
+   - hotmai / hotnail / hotmali → hotmail.com
+   - .cmo / .ocm / .con / .coml → .com
+   - .corn → .com
+   - outloo / outlok → outlook.com
+   - yahooo / yaho → yahoo.com.br
+   - .con.br / .cpm.br → .com.br
+3. Remova espaços dentro do email.
+3. Converta para lowercase.
+4. Retorne "" para emails claramente inválidos:
+   - Sem "@" ou com múltiplos "@"
+   - Domínio sem ponto (ex: "joao@empresa")
+   - Terminações sem sentido (.c, .br1, .com2)
+   - Contém caracteres especiais inválidos fora do padrão RFC
+5. Se já estiver correto, retorne o valor original sem alteração.
+
+Preferência de prefixo (quando houver dúvida): contato@ > comunicacao@ > marketing@ > faleconosco@ > comercial@ > vendas@
+
+━━ CAMPO: contact_name ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Aplique Title Case correto para português.
+2. Mantenha títulos: "Dr.", "Dra.", "Prof.", "Profa.", "Sr.", "Sra.", "Eng.", "Adv."
+3. Se o valor for claramente um nome de empresa ou razão social (não de uma pessoa física), retorne "".
+4. Se o campo estiver vazio, retorne "".
+
+━━ CAMPO ESPECIAL: discard ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Retorne discard=true quando o lead NÃO serve para marketing no Brasil:
+1. Empresa estrangeira sem operação no Brasil: domínio de email internacional (.com sem .br) de empresa claramente americana/europeia/asiática (ex: rollingstone.com, gettyimages.com, pmc.com, wrightsmedia.com, nytimes.com, bbc.co.uk).
+2. Mídia/veículo de imprensa internacional que apareceu por erro de scraping.
+3. Email claramente corporativo de empresa multinacional sem relação com o nicho local brasileiro buscado.
+ATENÇÃO: NÃO descartar emails pessoais (gmail, hotmail, yahoo) nem empresas brasileiras com .com. Só descartar quando o domínio for de empresa estrangeira reconhecida.
+Quando discard=true, preencha discard_reason com uma frase curta em português (ex: "Empresa americana - Rolling Stone EUA").
+
+━━ FORMATO DE SAÍDA ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RETORNE SOMENTE JSON VÁLIDO. Sem markdown, sem texto antes ou depois.
+Inclua todos os leads recebidos. Mantenha os IDs originais.
+
+{{"results": [{{"id": 123, "company_name": "Nome Limpo", "email": "email@dominio.com", "contact_name": "Nome Pessoa", "discard": false, "discard_reason": ""}}]}}
+
+━━ LEADS PARA NORMALIZAR ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{_json.dumps(leads_input, ensure_ascii=False)}"""
+
+    try:
+        result = _call_llm_normalize(prompt, provider, api_key)
+        if result and 'results' in result:
+            usage = result.pop('_usage', {})
+            return result['results'], None, usage
+        return None, 'LLM retornou formato inesperado', {}
+    except Exception as e:
+        # Auto-fallback to Groq if OpenRouter failed
+        if provider == 'openrouter':
+            blob = _fetch_secret_blob_from_aws('tools/groq')
+            if blob:
+                groq_key = _read_secret_key_from_blob(blob, ['GROQ_API_KEY'])
+                if groq_key:
+                    try:
+                        result = _call_llm_normalize(prompt, 'groq', groq_key)
+                        if result and 'results' in result:
+                            usage = result.pop('_usage', {})
+                            return result['results'], None, usage
+                    except Exception as e2:
+                        return None, f'OpenRouter: {e} | Groq: {e2}', {}
+        return None, str(e), {}
+
+
+@app.route('/api/leads/ai-normalize', methods=['POST'])
+@limiter.limit("5/hour")
+def ai_normalize_leads():
+    """
+    AI-powered normalization of company names, emails and contact names.
+    Fixes: legal suffixes, hyphens, slogans, email typos, capitalization.
+    Processes up to 500 leads in batches of 25 per LLM call.
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json(silent=True) or {}
+    lead_ids = data.get('lead_ids')  # Optional list of specific lead IDs
+
+    with get_db() as conn:
+        c = conn.cursor()
+        if lead_ids:
+            placeholders = ','.join(['%s'] * len(lead_ids))
+            c.execute(
+                f'SELECT id, company_name, email, contact_name FROM leads '
+                f'WHERE id IN ({placeholders}) AND batch_id IN '
+                f'(SELECT id FROM batches WHERE user_id = %s)',
+                lead_ids + [user_id]
+            )
+        else:
+            c.execute(
+                'SELECT id, company_name, email, contact_name FROM leads '
+                'WHERE batch_id IN (SELECT id FROM batches WHERE user_id = %s) '
+                'ORDER BY id DESC LIMIT 500',
+                (user_id,)
+            )
+        leads_raw = [{'id': r[0], 'company_name': r[1], 'email': r[2], 'contact_name': r[3]}
+                     for r in c.fetchall()]
+
+    if not leads_raw:
+        return jsonify({'success': True, 'report': {'analyzed': 0, 'normalized': 0, 'name_fixed': 0, 'email_fixed': 0, 'contact_fixed': 0}})
+
+    BATCH_SIZE = 25
+    all_results = []
+    errors = []
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    llm_provider_used = None
+
+    for i in range(0, len(leads_raw), BATCH_SIZE):
+        batch = leads_raw[i:i + BATCH_SIZE]
+        results, err, usage = _ai_normalize_batch(batch)
+        if err:
+            errors.append(err)
+            break
+        if results:
+            all_results.extend(results)
+        if usage:
+            total_prompt_tokens     += usage.get('prompt_tokens', 0)
+            total_completion_tokens += usage.get('completion_tokens', 0)
+            if not llm_provider_used:
+                llm_provider_used = usage.get('provider', 'unknown')
+
+    total_tokens = total_prompt_tokens + total_completion_tokens
+    # Cost estimate: DeepSeek via OpenRouter ~$0.14/M input + $0.28/M output; Groq free
+    if llm_provider_used == 'openrouter':
+        cost_usd = (total_prompt_tokens / 1_000_000 * 0.14) + (total_completion_tokens / 1_000_000 * 0.28)
+    else:
+        cost_usd = 0.0  # Groq free tier
+
+    if not all_results and errors:
+        return jsonify({'error': f'Normalização falhou: {errors[0]}'}), 500
+
+    # Apply updates
+    orig_map = {l['id']: l for l in leads_raw}
+    normalized = name_fixed = email_fixed = contact_fixed = discarded_foreign = 0
+
+    with get_db() as conn:
+        c = conn.cursor()
+        for r in all_results:
+            lead_id = r.get('id')
+            if not lead_id:
+                continue
+            orig = orig_map.get(lead_id, {})
+
+            new_name    = (r.get('company_name') or '').strip() or None
+            new_email   = (r.get('email') or '').strip() or None
+            new_contact = (r.get('contact_name') or '').strip() or None
+
+            orig_name    = (orig.get('company_name') or '').strip()
+            orig_email   = (orig.get('email') or '').strip()
+            orig_contact = (orig.get('contact_name') or '').strip()
+
+            should_discard   = r.get('discard', False)
+            discard_reason   = (r.get('discard_reason') or '').strip()
+
+            changed = False
+            if should_discard:
+                # Mark as descartado + add tag 'lead_internacional'
+                normalized += 1
+                changed = True
+                try:
+                    c.execute(
+                        """UPDATE leads
+                           SET crm_status='descartado',
+                               tags=array(SELECT DISTINCT unnest(COALESCE(tags, ARRAY[]::text[]) || ARRAY['lead_internacional'])),
+                               notes=CASE WHEN notes IS NULL OR notes='' THEN %s ELSE notes || ' | ' || %s END,
+                               updated_at=NOW()
+                           WHERE id=%s""",
+                        (discard_reason or 'Descartado: empresa estrangeira',
+                         discard_reason or 'Descartado: empresa estrangeira',
+                         lead_id)
+                    )
+                    discarded_foreign += 1
+                except Exception as ue:
+                    print(f'[ai-normalize] discard error lead {lead_id}: {ue}')
+                continue
+
+            if new_name is not None and new_name != orig_name:
+                name_fixed += 1
+                changed = True
+            if new_email is not None and new_email != orig_email:
+                email_fixed += 1
+                changed = True
+            if new_contact is not None and new_contact != orig_contact:
+                contact_fixed += 1
+                changed = True
+
+            if changed:
+                normalized += 1
+                try:
+                    c.execute(
+                        'UPDATE leads SET company_name=%s, email=%s, contact_name=%s, updated_at=NOW() WHERE id=%s',
+                        (
+                            new_name    if new_name    is not None else orig.get('company_name'),
+                            new_email   if new_email   is not None else orig.get('email'),
+                            new_contact if new_contact is not None else orig.get('contact_name'),
+                            lead_id,
+                        )
+                    )
+                except Exception as ue:
+                    print(f'[ai-normalize] update error lead {lead_id}: {ue}')
+        conn.commit()
+
+    return jsonify({
+        'success': True,
+        'report': {
+            'analyzed':          len(leads_raw),
+            'normalized':        normalized,
+            'name_fixed':        name_fixed,
+            'email_fixed':       email_fixed,
+            'contact_fixed':     contact_fixed,
+            'discarded_foreign': discarded_foreign,
+            'batches_processed': (len(leads_raw) + BATCH_SIZE - 1) // BATCH_SIZE,
+            'errors':            errors[:3],
+            'tokens': {
+                'prompt':     total_prompt_tokens,
+                'completion': total_completion_tokens,
+                'total':      total_tokens,
+                'provider':   llm_provider_used or 'unknown',
+                'cost_usd':   round(cost_usd, 5),
+            },
+        }
+    })
+
+
+# ============= CNPJ Enrichment Endpoint (Phase 1) =============
+
+def _run_cnpj_enrichment(user_id, lead_ids=None):
+    """
+    Background: enriches leads that have CNPJ but haven't been enriched yet.
+    Fetches BrasilAPI for each unique CNPJ, updates lead fields.
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    c = conn.cursor()
+    try:
+        if lead_ids:
+            placeholders = ','.join(['%s'] * len(lead_ids))
+            c.execute(
+                f'''SELECT l.id, l.cnpj, l.company_name, l.phone, l.address,
+                           l.city, l.state, l.category, l.email, l.extra_data
+                    FROM leads l JOIN batches b ON b.id = l.batch_id
+                    WHERE l.id IN ({placeholders}) AND b.user_id = %s
+                      AND l.cnpj IS NOT NULL AND l.cnpj != ''
+                      AND (l.cnpj_enriched IS NULL OR l.cnpj_enriched = FALSE)''',
+                lead_ids + [user_id]
+            )
+        else:
+            c.execute(
+                '''SELECT l.id, l.cnpj, l.company_name, l.phone, l.address,
+                          l.city, l.state, l.category, l.email, l.extra_data
+                   FROM leads l JOIN batches b ON b.id = l.batch_id
+                   WHERE b.user_id = %s
+                     AND l.cnpj IS NOT NULL AND l.cnpj != ''
+                     AND (l.cnpj_enriched IS NULL OR l.cnpj_enriched = FALSE)
+                   ORDER BY l.id DESC LIMIT 500''',
+                (user_id,)
+            )
+        rows = c.fetchall()
+        enriched_count = 0
+        phone_added = 0
+        category_added = 0
+        email_added = 0
+
+        for row in rows:
+            lead_id, cnpj, company_name, phone, address, city, state, category, email, extra_data = row
+            enrichment = enrich_cnpj_brasilapi(cnpj)
+            if not enrichment:
+                # Mark as attempted even if empty
+                c.execute('UPDATE leads SET cnpj_enriched = TRUE WHERE id = %s', (lead_id,))
+                continue
+
+            # Build update fields — only fill empty ones
+            update_fields = []
+            update_vals = []
+
+            trade_name = enrichment.get('nome_fantasia') or enrichment.get('razao_social')
+            if trade_name:
+                update_fields.append('cnpj_trade_name = %s')
+                update_vals.append(trade_name[:255])
+                # Fill company_name if empty
+                if not company_name or company_name.strip() == '':
+                    update_fields.append('company_name = %s')
+                    update_vals.append(trade_name[:255])
+
+            if enrichment.get('situacao'):
+                update_fields.append('cnpj_status = %s')
+                update_vals.append(enrichment['situacao'][:50])
+
+            if enrichment.get('cnae'):
+                update_fields.append('cnpj_cnae = %s')
+                update_vals.append(enrichment['cnae'][:255])
+                if not category:
+                    update_fields.append('category = %s')
+                    update_vals.append(enrichment['cnae'][:100])
+                    category_added += 1
+
+            if enrichment.get('abertura'):
+                update_fields.append('cnpj_abertura = %s')
+                update_vals.append(str(enrichment['abertura'])[:20])
+
+            if enrichment.get('porte'):
+                update_fields.append('cnpj_porte = %s')
+                update_vals.append(enrichment['porte'][:50])
+
+            if enrichment.get('qsa'):
+                update_fields.append('cnpj_qsa = %s')
+                update_vals.append(', '.join(enrichment['qsa'])[:500])
+
+            if enrichment.get('phone') and not phone:
+                update_fields.append('phone = %s')
+                update_vals.append(enrichment['phone'][:50])
+                phone_added += 1
+
+            if enrichment.get('email_rf') and not email:
+                normalized = normalize_email(enrichment['email_rf'])
+                if normalized:
+                    update_fields.append('email = %s')
+                    update_vals.append(normalized)
+                    email_added += 1
+
+            if enrichment.get('address') and not address:
+                update_fields.append('address = %s')
+                update_vals.append(enrichment['address'][:500])
+
+            if enrichment.get('city') and not city:
+                update_fields.append('city = %s')
+                update_vals.append(enrichment['city'][:100])
+
+            if enrichment.get('state') and not state:
+                update_fields.append('state = %s')
+                update_vals.append(enrichment['state'][:50])
+
+            # Always mark as enriched
+            update_fields.append('cnpj_enriched = TRUE')
+            update_fields.append('updated_at = %s')
+            update_vals.append(datetime.now())
+            update_vals.append(lead_id)
+
+            if len(update_fields) > 2:  # more than just the flags
+                c.execute(
+                    f"UPDATE leads SET {', '.join(update_fields)} WHERE id = %s",
+                    update_vals
+                )
+                enriched_count += 1
+
+            # BrasilAPI rate limit: ~3 req/s, we do 1 per 0.5s = safe
+            time.sleep(0.5)
+
+        print(f"[cnpj_enrich] Done: {enriched_count}/{len(rows)} enriched | phone+{phone_added} | cat+{category_added} | email+{email_added}")
+        return {'enriched': enriched_count, 'total': len(rows), 'phone_added': phone_added,
+                'category_added': category_added, 'email_added': email_added}
+    except Exception as e:
+        print(f"[cnpj_enrich] Error: {e}")
+        return {'error': str(e)}
+    finally:
+        conn.close()
+
+
+@app.route('/api/leads/fuzzy-dedup', methods=['POST'])
+@limiter.limit("10/hour")
+def api_fuzzy_dedup():
+    """Phase 3: Fuzzy-deduplicate leads by company name within a batch.
+    Body: { batch_id: int, threshold: int (optional, default 88) }
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    batch_id = data.get('batch_id')
+    threshold = int(data.get('threshold', 88))
+
+    if not batch_id:
+        return jsonify({'error': 'batch_id required'}), 400
+
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        dupes = fuzzy_deduplicate_leads(batch_id, conn, threshold=threshold)
+        return jsonify({'duplicates_marked': dupes, 'batch_id': batch_id})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/leads/auto-tag', methods=['POST'])
+@limiter.limit("10/hour")
+def api_auto_tag():
+    """Phase 3: Auto-tag leads in a batch using keyword rules.
+    Body: { batch_id: int }
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    batch_id = data.get('batch_id')
+
+    if not batch_id:
+        return jsonify({'error': 'batch_id required'}), 400
+
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        tagged = auto_tag_batch(batch_id, conn)
+        return jsonify({'tagged': tagged, 'batch_id': batch_id})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/leads/enrich-cnpj', methods=['POST'])
+@limiter.limit("10/hour")
+def enrich_leads_cnpj():
+    """
+    Trigger CNPJ enrichment via BrasilAPI for leads with CNPJ not yet enriched.
+    POST body: { lead_ids: [...] } for specific leads, or {} for all user leads.
+    Runs in background thread, returns job estimate immediately.
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    lead_ids = data.get('lead_ids', [])
+    background = data.get('background', True)
+
+    if background:
+        t = threading.Thread(
+            target=_run_cnpj_enrichment,
+            args=(user_id, lead_ids if lead_ids else None),
+            daemon=True
+        )
+        t.start()
+        return jsonify({
+            'status': 'started',
+            'message': 'Enriquecimento CNPJ iniciado em background via BrasilAPI',
+            'lead_ids': lead_ids or 'todos com CNPJ não enriquecido (max 500)',
+        })
+    else:
+        result = _run_cnpj_enrichment(user_id, lead_ids if lead_ids else None)
+        return jsonify({'status': 'done', **result})
+
+
 # ============= Advanced Scraping Methods =============
 
 # Credenciais para scrapers autenticados
-INSTAGRAM_USERNAME = "vaganagringa.dev"
-INSTAGRAM_PASSWORD = "1982Xandeq1982#"
-LINKEDIN_USERNAME = "acq2002@hotmail.com"
-LINKEDIN_PASSWORD = "1982Xandeq1982#"
+INSTAGRAM_USERNAME = resolve_secret_value(
+    'INSTAGRAM_USER',
+    secret_ids=['extratordedados/prod'],
+    env_keys=['INSTAGRAM_USER', 'INSTAGRAM_USERNAME'],
+)
+INSTAGRAM_PASSWORD = resolve_secret_value(
+    'INSTAGRAM_PASS',
+    secret_ids=['extratordedados/prod'],
+    env_keys=['INSTAGRAM_PASS', 'INSTAGRAM_PASSWORD'],
+)
+LINKEDIN_USERNAME = resolve_secret_value(
+    'LINKEDIN_USER',
+    secret_ids=['extratordedados/prod'],
+    env_keys=['LINKEDIN_USER', 'LINKEDIN_USERNAME'],
+)
+LINKEDIN_PASSWORD = resolve_secret_value(
+    'LINKEDIN_PASS',
+    secret_ids=['extratordedados/prod'],
+    env_keys=['LINKEDIN_PASS', 'LINKEDIN_PASSWORD'],
+)
 
 def scrape_google_maps(query, city, state, max_results=20):
     """
@@ -3946,6 +7623,928 @@ def scrape_google_maps(query, city, state, max_results=20):
         print(f"[GoogleMaps] Erro geral: {e}")
 
     print(f"[GoogleMaps] Total de {len(leads)} leads extraídos")
+    return leads
+
+
+# ============================================================
+# LOCAL BUSINESS DATA — RapidAPI (Google Maps via API, sem browser)
+# Free tier: 500 businesses/month — usa max_results=3 por query
+# ============================================================
+
+_rapidapi_key_cache = None
+_rapidapi_key_failed = False  # Evita retry quando AWS SM já falhou nesta sessão
+
+def get_rapidapi_key():
+    """Busca RapidAPI key com fallback robusto: env -> AWS -> cache local -> DB."""
+    global _rapidapi_key_cache, _rapidapi_key_failed
+    if _rapidapi_key_cache:
+        return _rapidapi_key_cache
+    if _rapidapi_key_failed:
+        return None
+    _rapidapi_key_cache = resolve_secret_value(
+        'RAPIDAPI_KEY',
+        secret_ids=['tools/rapidapi', 'extratordedados/prod'],
+        env_keys=['RAPIDAPI_KEY'],
+        db_provider='rapidapi',
+    )
+    if _rapidapi_key_cache:
+        return _rapidapi_key_cache
+    _rapidapi_key_failed = True
+    print(f"[RAPIDAPI] Todas as fontes de key falharam — provider será desabilitado nesta sessão")
+    return None
+
+
+def search_local_business_data(niche, city, state, max_results=3):
+    """
+    Busca empresas locais via Local Business Data (RapidAPI).
+    Free tier: 500 businesses/month — use max_results=3 para conservar quota.
+    Retorna lista de leads compatível com schema do batch.
+    Lança exceção em caso de falha (para _massive_retry capturar e tentar novamente).
+    """
+    api_key = get_rapidapi_key()
+    if not api_key:
+        raise ConfigError("[LOCAL_BIZ] RapidAPI key não disponível — verifique AWS SM tools/rapidapi ou env RAPIDAPI_KEY")
+
+    query = f"{niche} {city} {state} Brasil"
+    url = "https://local-business-data.p.rapidapi.com/search"
+    headers = {
+        "X-RapidAPI-Key": api_key,
+        "X-RapidAPI-Host": "local-business-data.p.rapidapi.com"
+    }
+    params = {
+        "query": query,
+        "limit": max_results,
+        "language": "pt",
+        "country": "br",
+        "extract_emails_and_contacts": "true"
+    }
+
+    resp = http_requests.get(url, headers=headers, params=params, timeout=30)
+
+    if resp.status_code == 429:
+        raise RuntimeError("[LOCAL_BIZ] Quota RapidAPI excedida (429) — aguardando próxima janela")
+    if resp.status_code == 403:
+        raise RuntimeError("[LOCAL_BIZ] Não autorizado (403) — verifique assinatura no RapidAPI")
+    resp.raise_for_status()
+
+    data = resp.json()
+    if data.get('status') != 'OK':
+        msg = (data.get('error') or {}).get('message', 'resposta inesperada')
+        raise RuntimeError(f"[LOCAL_BIZ] API retornou erro: {msg}")
+
+    leads = []
+    for item in data.get('data', []):
+        contacts  = item.get('emails_and_contacts') or {}
+        emails    = contacts.get('emails') or []
+        website   = item.get('website') or ''
+
+        # Se o website é do Instagram, mover para campo instagram
+        instagram = contacts.get('instagram')
+        if not instagram and 'instagram.com' in website.lower():
+            instagram = website
+            website   = ''
+
+        lead = {
+            'company_name': (item.get('name') or '').strip(),
+            'phone':        item.get('phone_number') or '',
+            'website':      website,
+            'address':      item.get('address') or '',
+            'city':         item.get('city') or city,
+            'state':        item.get('state') or state,
+            'category':     item.get('type') or niche,
+            'source':       'local_business_data',
+            'source_url':   item.get('place_link') or '',
+            'instagram':    instagram,
+            'facebook':     contacts.get('facebook'),
+            'twitter':      contacts.get('twitter'),
+            'linkedin':     contacts.get('linkedin'),
+            'youtube':      contacts.get('youtube'),
+            'extra_data':   {
+                'rating':   item.get('rating'),
+                'reviews':  item.get('review_count'),
+                'verified': item.get('verified'),
+                'google_id': item.get('google_id'),
+                'subtypes': item.get('subtypes') or [],
+                'district': item.get('district'),
+                'zipcode':  item.get('zipcode'),
+            },
+        }
+        if emails:
+            lead['email'] = emails[0]
+
+        if lead['company_name']:
+            leads.append(lead)
+
+    print(f"[LOCAL_BIZ] '{query}': {len(leads)} leads retornados")
+    return leads
+
+
+# ============================================================
+# NEW METHODS — Google Email Harvest, Website Crawler,
+#   OpenCNPJ, Serper.dev, Apify Maps
+# ============================================================
+
+EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+
+# Domínios de email inválidos para scraping (noise)
+_NOISE_EMAIL_DOMAINS = {
+    'example.com', 'sentry.io', 'wixpress.com', 'email.com', 'domain.com',
+    'yoursite.com', 'yourdomain.com', 'test.com', 'sample.com',
+    'wordpress.org', 'w3.org', 'schema.org', 'json-ld.org',
+    'googleusercontent.com', 'googleapis.com', 'gstatic.com',
+}
+
+
+def _extract_emails_from_html(html_text):
+    """Extrai emails de um HTML, removendo noise e duplicatas."""
+    raw = set(EMAIL_RE.findall(html_text.lower()))
+    valid = []
+    for em in raw:
+        domain = em.split('@')[1] if '@' in em else ''
+        if domain in _NOISE_EMAIL_DOMAINS:
+            continue
+        if domain.endswith(('.png', '.jpg', '.gif', '.svg', '.css', '.js')):
+            continue
+        if len(em) > 100 or len(em) < 6:
+            continue
+        valid.append(em)
+    return list(set(valid))
+
+
+def _crawl_single_url_for_emails(url, timeout=12):
+    """Faz GET em uma URL e retorna lista de emails encontrados."""
+    try:
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        resp = http_requests.get(url, timeout=timeout, verify=False, headers=headers,
+                                 allow_redirects=True)
+        if resp.status_code != 200:
+            return []
+        return _extract_emails_from_html(resp.text)
+    except Exception:
+        return []
+
+
+def _crawl_site_deep(base_url, max_pages=5):
+    """Crawl profundo: homepage + páginas de contato/sobre para extrair emails."""
+    from urllib.parse import urljoin, urlparse
+    found_emails = set()
+    visited = set()
+    # Priorizar páginas de contato
+    contact_paths = [
+        '', '/contato', '/contact', '/sobre', '/about', '/about-us',
+        '/fale-conosco', '/quem-somos', '/contatos', '/contact-us',
+    ]
+    parsed = urlparse(base_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
+    pages_crawled = 0
+    for path in contact_paths:
+        if pages_crawled >= max_pages:
+            break
+        url = urljoin(base, path)
+        if url in visited:
+            continue
+        visited.add(url)
+        pages_crawled += 1
+        emails = _crawl_single_url_for_emails(url)
+        found_emails.update(emails)
+        time.sleep(random.uniform(1, 2))
+
+    return list(found_emails)
+
+
+# ---- METHOD 1: Google Email Harvest (Playwright) ----
+def google_email_harvest(niche, city, state, max_results=20):
+    """
+    Playwright: busca no Google com dorks para encontrar emails.
+    1. Busca: "@gmail.com" OR "@hotmail.com" [niche] [city] [state]
+    2. Extrai emails dos snippets do SERP (sem clicar)
+    3. Visita os top resultados e extrai emails de cada site
+    Retorna lista de leads compatíveis com schema do batch.
+    """
+    from playwright.sync_api import sync_playwright as _sp
+
+    dork_queries = [
+        f'"@gmail.com" OR "@hotmail.com" OR "@outlook.com" {niche} {city} {state}',
+        f'{niche} {city} {state} email contato site:.com.br',
+        f'{niche} {city} email telefone',
+    ]
+
+    all_leads = []
+    seen_emails = set()
+
+    with _sp() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=random.choice(USER_AGENTS),
+            viewport={'width': 1280, 'height': 800}
+        )
+        page = ctx.new_page()
+
+        for qi, dork in enumerate(dork_queries):
+            if len(all_leads) >= max_results:
+                break
+            try:
+                search_url = f'https://www.google.com/search?q={dork}&num=20&hl=pt-BR'
+                page.goto(search_url, timeout=20000, wait_until='domcontentloaded')
+                time.sleep(random.uniform(2, 4))
+
+                # Extrair emails dos snippets do SERP
+                serp_html = page.content()
+                serp_emails = _extract_emails_from_html(serp_html)
+                for em in serp_emails:
+                    if em not in seen_emails and len(all_leads) < max_results:
+                        seen_emails.add(em)
+                        all_leads.append({
+                            'email': em,
+                            'company_name': '',
+                            'city': city,
+                            'state': state,
+                            'category': niche,
+                            'source': 'google_email_harvest',
+                            'source_url': 'google.com/search',
+                        })
+
+                # Extrair URLs dos resultados e visitar cada uma
+                links = page.eval_on_selector_all(
+                    'div#search a[href^="http"]',
+                    '(els) => els.map(e => e.href).filter(h => !h.includes("google.") && !h.includes("youtube.") && !h.includes("facebook.") && !h.includes("instagram."))'
+                )
+
+                for link in links[:15]:
+                    if len(all_leads) >= max_results:
+                        break
+                    try:
+                        if not is_valid_result_url(link):
+                            continue
+                        site_emails = _crawl_single_url_for_emails(link)
+                        for em in site_emails:
+                            if em not in seen_emails:
+                                seen_emails.add(em)
+                                all_leads.append({
+                                    'email': em,
+                                    'company_name': '',
+                                    'website': link,
+                                    'city': city,
+                                    'state': state,
+                                    'category': niche,
+                                    'source': 'google_email_harvest',
+                                    'source_url': link,
+                                })
+                        time.sleep(random.uniform(1, 3))
+                    except Exception:
+                        continue
+
+                # Delay entre queries para evitar CAPTCHA
+                if qi < len(dork_queries) - 1:
+                    time.sleep(random.uniform(8, 15))
+
+            except Exception as e:
+                print(f"[GOOGLE_HARVEST] Erro na query {qi+1}: {e}")
+                continue
+
+        browser.close()
+
+    print(f"[GOOGLE_HARVEST] '{niche} {city}': {len(all_leads)} leads")
+    return all_leads
+
+
+# ---- METHOD 2: Website Email Crawler (Deep Crawl) ----
+def search_and_crawl_for_emails(niche, city, state, max_sites=15):
+    """
+    Busca DuckDuckGo por [niche] [city] contato, visita cada site
+    e faz deep crawl em /contato, /sobre, /about para extrair emails.
+    Retorna lista de leads.
+    """
+    query = f"{niche} {city} {state} contato email"
+    results = search_duckduckgo(query, max_pages=2) or []
+
+    all_leads = []
+    seen_emails = set()
+    sites_crawled = 0
+
+    for result in results:
+        if sites_crawled >= max_sites:
+            break
+        url = result.get('url', '')
+        if not url or not is_valid_result_url(url):
+            continue
+
+        sites_crawled += 1
+        emails = _crawl_site_deep(url, max_pages=4)
+        for em in emails:
+            if em not in seen_emails:
+                seen_emails.add(em)
+                all_leads.append({
+                    'email': em,
+                    'company_name': result.get('title', ''),
+                    'website': url,
+                    'city': city,
+                    'state': state,
+                    'category': niche,
+                    'source': 'website_email_crawler',
+                    'source_url': url,
+                })
+        time.sleep(random.uniform(2, 5))
+
+    print(f"[WEB_CRAWLER] '{niche} {city}': {len(all_leads)} leads de {sites_crawled} sites")
+    return all_leads
+
+
+# ---- METHOD 3: OpenCNPJ Search ----
+_opencnpj_cache = {}
+
+def search_opencnpj_by_directory(niche, city, state, max_results=20):
+    """
+    Estratégia: busca empresas nos diretórios CNPJ (cnpj.biz, listacnae).
+    Depois enriquece cada CNPJ via OpenCNPJ API para pegar email/telefone registrado.
+    OpenCNPJ é 100% grátis (50 req/seg).
+    """
+    leads = []
+    seen_cnpjs = set()
+
+    # Fase 1: Coletar CNPJs via busca na web
+    query = f"cnpj {niche} {city} {state} site:cnpj.biz OR site:listacnae.com.br"
+    results = search_duckduckgo(query, max_pages=1) or []
+
+    cnpj_pattern = re.compile(r'\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}')
+    collected_cnpjs = []
+
+    for result in results[:10]:
+        url = result.get('url', '')
+        if not url:
+            continue
+        try:
+            headers = {'User-Agent': random.choice(USER_AGENTS)}
+            resp = http_requests.get(url, timeout=10, verify=False, headers=headers)
+            if resp.status_code == 200:
+                found = cnpj_pattern.findall(resp.text)
+                for cnpj_raw in found:
+                    cnpj_clean = re.sub(r'[.\-/]', '', cnpj_raw)
+                    if len(cnpj_clean) == 14 and cnpj_clean not in seen_cnpjs:
+                        seen_cnpjs.add(cnpj_clean)
+                        collected_cnpjs.append(cnpj_clean)
+            time.sleep(random.uniform(1, 2))
+        except Exception:
+            continue
+
+    print(f"[OPENCNPJ] Coletados {len(collected_cnpjs)} CNPJs para '{niche} {city}'")
+
+    # Fase 2: Enriquecer cada CNPJ via OpenCNPJ API
+    for cnpj in collected_cnpjs[:max_results]:
+        if cnpj in _opencnpj_cache:
+            data = _opencnpj_cache[cnpj]
+        else:
+            try:
+                resp = http_requests.get(
+                    f'https://publica.cnpj.ws/cnpj/{cnpj}',
+                    timeout=10,
+                    headers={'Accept': 'application/json'}
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    _opencnpj_cache[cnpj] = data
+                elif resp.status_code == 429:
+                    print(f"[OPENCNPJ] Rate limited — aguardando 5s")
+                    time.sleep(5)
+                    continue
+                else:
+                    continue
+            except Exception:
+                continue
+
+        email = (data.get('estabelecimento') or {}).get('email') or ''
+        phone1 = (data.get('estabelecimento') or {}).get('telefone1') or ''
+        phone2 = (data.get('estabelecimento') or {}).get('telefone2') or ''
+        nome = data.get('razao_social') or (data.get('estabelecimento') or {}).get('nome_fantasia') or ''
+        est = data.get('estabelecimento') or {}
+        cidade = est.get('cidade', {}).get('nome', city) if isinstance(est.get('cidade'), dict) else city
+        uf = est.get('estado', {}).get('sigla', state) if isinstance(est.get('estado'), dict) else state
+        website = est.get('dominio') or ''
+
+        # Montar telefone
+        ddd1 = (data.get('estabelecimento') or {}).get('ddd1') or ''
+        phone = f"({ddd1}){phone1}" if ddd1 and phone1 else phone1 or phone2
+
+        if email or phone:
+            leads.append({
+                'company_name': nome,
+                'email': email.lower() if email else '',
+                'phone': phone,
+                'website': website,
+                'address': est.get('logradouro', ''),
+                'city': cidade,
+                'state': uf,
+                'category': niche,
+                'source': 'cnpj_open',
+                'source_url': f'https://publica.cnpj.ws/cnpj/{cnpj}',
+                'extra_data': {'cnpj': cnpj},
+            })
+        time.sleep(random.uniform(0.3, 0.8))
+
+    print(f"[OPENCNPJ] '{niche} {city}': {len(leads)} leads com email/telefone")
+    return leads
+
+
+# ---- METHOD 4: Serper.dev Google Search API ----
+_serper_api_key_cache = None
+_serper_key_failed = False
+
+def _get_serper_key():
+    """Busca Serper.dev API key com fallback robusto: env -> AWS -> cache local -> DB."""
+    global _serper_api_key_cache, _serper_key_failed
+    if _serper_api_key_cache:
+        return _serper_api_key_cache
+    if _serper_key_failed:
+        return None
+    _serper_api_key_cache = resolve_secret_value(
+        'SERPER_API_KEY',
+        secret_ids=['tools/serper', 'extratordedados/prod'],
+        env_keys=['SERPER_API_KEY'],
+        db_provider='serper',
+    )
+    if _serper_api_key_cache:
+        return _serper_api_key_cache
+    _serper_key_failed = True
+    return None
+
+
+def serper_email_search(niche, city, state, max_results=20):
+    """
+    Serper.dev: 2500 buscas grátis/mês. Retorna resultados estruturados do Google.
+    Busca por emails nos snippets e visita os top sites.
+    """
+    api_key = _get_serper_key()
+    if not api_key:
+        raise ConfigError("[SERPER] API key não disponível — cadastre em serper.dev (grátis) e salve em AWS SM tools/serper")
+
+    queries = [
+        f'{niche} {city} {state} email contato',
+        f'"@" {niche} {city} {state}',
+    ]
+
+    all_leads = []
+    seen_emails = set()
+
+    for query in queries:
+        if len(all_leads) >= max_results:
+            break
+        try:
+            resp = http_requests.post(
+                'https://google.serper.dev/search',
+                json={'q': query, 'gl': 'br', 'hl': 'pt-br', 'num': 20},
+                headers={'X-API-KEY': api_key, 'Content-Type': 'application/json'},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                raise RuntimeError("[SERPER] Quota mensal esgotada (429)")
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Extrair emails dos snippets
+            for item in data.get('organic', []):
+                snippet = (item.get('snippet') or '') + ' ' + (item.get('title') or '')
+                snippet_emails = _extract_emails_from_html(snippet)
+                for em in snippet_emails:
+                    if em not in seen_emails and len(all_leads) < max_results:
+                        seen_emails.add(em)
+                        all_leads.append({
+                            'email': em,
+                            'company_name': item.get('title', ''),
+                            'website': item.get('link', ''),
+                            'city': city,
+                            'state': state,
+                            'category': niche,
+                            'source': 'serper_google',
+                            'source_url': item.get('link', ''),
+                        })
+
+            # Visitar URLs sem email no snippet
+            for item in data.get('organic', []):
+                if len(all_leads) >= max_results:
+                    break
+                link = item.get('link', '')
+                if not link or not is_valid_result_url(link):
+                    continue
+                site_emails = _crawl_single_url_for_emails(link)
+                for em in site_emails:
+                    if em not in seen_emails:
+                        seen_emails.add(em)
+                        all_leads.append({
+                            'email': em,
+                            'company_name': item.get('title', ''),
+                            'website': link,
+                            'city': city,
+                            'state': state,
+                            'category': niche,
+                            'source': 'serper_google',
+                            'source_url': link,
+                        })
+                time.sleep(random.uniform(0.5, 1.5))
+
+        except Exception as e:
+            if '429' in str(e) or 'quota' in str(e).lower():
+                raise
+            print(f"[SERPER] Erro na query: {e}")
+            continue
+
+    print(f"[SERPER] '{niche} {city}': {len(all_leads)} leads")
+    return all_leads
+
+
+# ---- METHOD 5: Apify Google Maps with Emails ----
+def apify_google_maps_search(niche, city, state, max_results=20):
+    """
+    Apify Google Maps Scraper: roda o actor compass/crawler-google-places.
+    Free tier: $5/mês de crédito (~1250 businesses/mês).
+    Extrai nome, telefone, website, email, endereço, rating.
+    """
+    apify_token = resolve_secret_value(
+        'APIFY_TOKEN',
+        secret_ids=['extratordedados/prod', 'tools/apify'],
+        env_keys=['APIFY_TOKEN', 'APIFY_API_KEY'],
+        db_provider='apify',
+    )
+    if not apify_token:
+        raise ConfigError("[APIFY] Token não disponível — configure em env, cache local ou AWS SM")
+
+    query = f"{niche} em {city} {state}"
+    run_input = {
+        "searchStringsArray": [query],
+        "maxCrawledPlacesPerSearch": max_results,
+        "language": "pt",
+        "countryCode": "br",
+        "includeWebResults": False,
+        "exportPlaceUrls": False,
+        "deeperCityScrape": False,
+        "scrapeContacts": True,
+    }
+
+    # Iniciar actor run (sincrono — espera resultado)
+    actor_id = 'lukaskrivka~google-maps-with-contact-details'
+    start_url = f'https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items'
+    resp = http_requests.post(
+        start_url,
+        params={'token': apify_token, 'timeout': 120},
+        json=run_input,
+        timeout=150,
+    )
+
+    if resp.status_code == 402:
+        raise RuntimeError("[APIFY] Créditos esgotados (402)")
+    if resp.status_code == 404:
+        raise ConfigError("[APIFY] Actor não encontrado — verifique ID")
+    resp.raise_for_status()
+
+    items = resp.json() if isinstance(resp.json(), list) else []
+    leads = []
+    for item in items:
+        emails = []
+        # Tentar extrair email do campo contact
+        if item.get('email'):
+            emails.append(item['email'])
+        if item.get('emails'):
+            emails.extend(item['emails'] if isinstance(item['emails'], list) else [])
+
+        lead = {
+            'company_name': (item.get('title') or item.get('name') or '').strip(),
+            'phone': item.get('phone') or '',
+            'website': item.get('website') or item.get('url') or '',
+            'email': emails[0] if emails else '',
+            'address': item.get('address') or item.get('street') or '',
+            'city': item.get('city') or city,
+            'state': state,
+            'category': item.get('categoryName') or niche,
+            'source': 'apify_maps',
+            'source_url': item.get('url') or item.get('placeUrl') or '',
+            'extra_data': {
+                'rating': item.get('totalScore') or item.get('rating'),
+                'reviews': item.get('reviewsCount'),
+                'google_id': item.get('placeId'),
+            },
+        }
+
+        # Se tem website mas não tem email, crawl rápido
+        if lead['website'] and not lead['email']:
+            site_emails = _crawl_single_url_for_emails(lead['website'])
+            if site_emails:
+                lead['email'] = site_emails[0]
+
+        if lead['company_name']:
+            leads.append(lead)
+
+    print(f"[APIFY_MAPS] '{query}': {len(leads)} leads ({sum(1 for l in leads if l.get('email'))} com email)")
+    return leads
+
+
+# ---- METHOD 6: ReceitaWS CNPJ Search ----
+def search_receita_ws(niche, city, state, max_results=10):
+    """
+    ReceitaWS: busca empresas ativas via API pública da Receita Federal.
+    Endpoint search: https://receitaws.com.br/v1/search (3 req/min free)
+    Enriquece cada CNPJ via publica.cnpj.ws para pegar email/telefone oficial.
+    """
+    leads = []
+    seen_cnpjs = set()
+
+    # Slugify state para ReceitaWS (espera sigla de 2 letras)
+    state_uf = state.upper()[:2] if state else ''
+    city_clean = city.strip()
+
+    queries = [
+        {'query': niche, 'uf': state_uf, 'municipio': city_clean},
+    ]
+
+    for q_params in queries:
+        if len(leads) >= max_results:
+            break
+        try:
+            resp = http_requests.get(
+                'https://receitaws.com.br/v1/search',
+                params={**q_params, 'status': 'A'},
+                timeout=15,
+                headers={'Accept': 'application/json'},
+            )
+            if resp.status_code == 429:
+                print(f"[RECEITA_WS] Rate limit — aguardando 20s")
+                time.sleep(20)
+                continue
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            cnpjs_found = []
+            # Resposta pode ser lista de CNPJs ou dict com 'activities'
+            if isinstance(data, list):
+                for item in data:
+                    cnpj = item.get('cnpj') or item.get('CNPJ') or ''
+                    cnpj_clean = re.sub(r'[.\-/]', '', cnpj)
+                    if len(cnpj_clean) == 14 and cnpj_clean not in seen_cnpjs:
+                        seen_cnpjs.add(cnpj_clean)
+                        cnpjs_found.append(cnpj_clean)
+            elif isinstance(data, dict):
+                for item in data.get('activities', []) + data.get('companies', []):
+                    cnpj = item.get('cnpj') or item.get('CNPJ') or ''
+                    cnpj_clean = re.sub(r'[.\-/]', '', str(cnpj))
+                    if len(cnpj_clean) == 14 and cnpj_clean not in seen_cnpjs:
+                        seen_cnpjs.add(cnpj_clean)
+                        cnpjs_found.append(cnpj_clean)
+
+            # Enriquecer cada CNPJ via publica.cnpj.ws
+            for cnpj in cnpjs_found[:max_results]:
+                if len(leads) >= max_results:
+                    break
+                try:
+                    enrich = http_requests.get(
+                        f'https://publica.cnpj.ws/cnpj/{cnpj}',
+                        timeout=10,
+                        headers={'Accept': 'application/json'},
+                    )
+                    if enrich.status_code == 429:
+                        time.sleep(5)
+                        continue
+                    if enrich.status_code != 200:
+                        continue
+                    d = enrich.json()
+                    est = d.get('estabelecimento') or {}
+                    email = est.get('email') or ''
+                    ddd1 = est.get('ddd1') or ''
+                    tel1 = est.get('telefone1') or ''
+                    phone = f"({ddd1}){tel1}" if ddd1 and tel1 else tel1
+                    nome = d.get('razao_social') or est.get('nome_fantasia') or ''
+                    cidade = est.get('cidade', {}).get('nome', city) if isinstance(est.get('cidade'), dict) else city
+                    uf = est.get('estado', {}).get('sigla', state) if isinstance(est.get('estado'), dict) else state
+                    website = est.get('dominio') or ''
+                    if email or phone:
+                        leads.append({
+                            'company_name': nome,
+                            'email': email.lower() if email else '',
+                            'phone': phone,
+                            'website': website,
+                            'address': est.get('logradouro', ''),
+                            'city': cidade,
+                            'state': uf,
+                            'category': niche,
+                            'source': 'receita_ws',
+                            'source_url': f'https://publica.cnpj.ws/cnpj/{cnpj}',
+                            'extra_data': {'cnpj': cnpj},
+                        })
+                    time.sleep(random.uniform(0.5, 1.0))
+                except Exception as e:
+                    print(f"[RECEITA_WS] Enrich CNPJ {cnpj} erro: {e}")
+                    continue
+
+            # Rate limit: 3 req/min no search endpoint
+            time.sleep(20)
+        except Exception as e:
+            print(f"[RECEITA_WS] Erro na busca: {e}")
+            continue
+
+    print(f"[RECEITA_WS] '{niche} {city}': {len(leads)} leads")
+    return leads
+
+
+# ---- METHOD 7: OLX Service Ads Scraper ----
+_OLX_STATE_SLUGS = {
+    'AC': 'acre', 'AL': 'alagoas', 'AP': 'amapa', 'AM': 'amazonas',
+    'BA': 'bahia', 'CE': 'ceara', 'DF': 'distrito-federal', 'ES': 'espirito-santo',
+    'GO': 'goias', 'MA': 'maranhao', 'MT': 'mato-grosso', 'MS': 'mato-grosso-do-sul',
+    'MG': 'minas-gerais', 'PA': 'para', 'PB': 'paraiba', 'PR': 'parana',
+    'PE': 'pernambuco', 'PI': 'piaui', 'RJ': 'rio-de-janeiro', 'RN': 'rio-grande-do-norte',
+    'RS': 'rio-grande-do-sul', 'RO': 'rondonia', 'RR': 'roraima', 'SC': 'santa-catarina',
+    'SP': 'sao-paulo', 'SE': 'sergipe', 'TO': 'tocantins',
+}
+
+def scrape_olx_ads(niche, city, state, max_results=20):
+    """
+    OLX Service Ads: scrapa anúncios de serviços no OLX.
+    Extrai números WhatsApp (wa.me links) e telefone de anúncios.
+    Usa requests + BeautifulSoup (sem Playwright).
+    """
+    state_uf = state.upper()[:2] if state else ''
+    state_slug = _OLX_STATE_SLUGS.get(state_uf, state_uf.lower())
+    city_q = city.strip().lower().replace(' ', '+')
+    niche_q = niche.strip().lower().replace(' ', '+')
+
+    url = f"https://www.olx.com.br/servicos/estado-{state_slug}?q={niche_q}+{city_q}"
+    leads = []
+    wa_pattern = re.compile(r'wa\.me/(\d+)', re.IGNORECASE)
+    phone_pattern = re.compile(r'(?:\+55\s?)?(?:\(?\d{2}\)?\s?)(?:9\s?)?\d{4}[-\s]?\d{4}')
+
+    try:
+        headers = {'User-Agent': random.choice(USER_AGENTS), 'Accept-Language': 'pt-BR,pt;q=0.9'}
+        resp = http_requests.get(url, headers=headers, timeout=15, verify=False)
+        if resp.status_code != 200:
+            print(f"[OLX_ADS] HTTP {resp.status_code} para {url}")
+            return leads
+
+        soup = BeautifulSoup(resp.text, 'lxml')
+
+        # Links de anúncios individuais
+        ad_links = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if '/servicos/' in href and 'olx.com.br' in href and href not in ad_links:
+                ad_links.append(href)
+            if len(ad_links) >= max_results:
+                break
+
+        print(f"[OLX_ADS] Encontrados {len(ad_links)} anúncios para '{niche} {city}'")
+
+        seen_wa = set()
+        for ad_url in ad_links[:max_results]:
+            try:
+                ad_resp = http_requests.get(ad_url, headers=headers, timeout=10, verify=False)
+                if ad_resp.status_code != 200:
+                    continue
+
+                page_text = ad_resp.text
+                ad_soup = BeautifulSoup(page_text, 'lxml')
+
+                # Extrair título/empresa
+                title_el = ad_soup.find('h1') or ad_soup.find('title')
+                company = title_el.get_text(strip=True)[:100] if title_el else ''
+
+                # Buscar wa.me links
+                wa_numbers = wa_pattern.findall(page_text)
+                phones = phone_pattern.findall(page_text)
+
+                wa_formatted = None
+                if wa_numbers:
+                    raw = wa_numbers[0]
+                    # Garantir formato 55 + número
+                    if not raw.startswith('55'):
+                        raw = '55' + raw
+                    wa_formatted = f"https://wa.me/{raw}"
+                    phone_from_wa = raw[2:] if raw.startswith('55') else raw
+                else:
+                    phone_from_wa = None
+
+                phone_clean = phones[0] if phones else phone_from_wa
+
+                if (wa_formatted or phone_clean) and wa_formatted not in seen_wa:
+                    seen_wa.add(wa_formatted)
+                    leads.append({
+                        'company_name': company,
+                        'phone': phone_clean,
+                        'whatsapp': wa_formatted,
+                        'city': city,
+                        'state': state,
+                        'category': niche,
+                        'source': 'olx_ads',
+                        'source_url': ad_url,
+                    })
+
+                time.sleep(random.uniform(2, 4))
+            except Exception as e:
+                print(f"[OLX_ADS] Erro ao processar anúncio: {e}")
+                continue
+
+    except Exception as e:
+        print(f"[OLX_ADS] Erro geral: {e}")
+
+    print(f"[OLX_ADS] '{niche} {city}': {len(leads)} leads com WhatsApp/telefone")
+    return leads
+
+
+# ---- METHOD 8: WhatsApp Dorks via Serper ----
+def search_whatsapp_dorks(niche, city, state, max_results=15):
+    """
+    WhatsApp Discovery via Serper dorks.
+    Busca por links wa.me/55 relacionados ao nicho e cidade.
+    Extrai números WhatsApp formatados.
+    """
+    api_key = _get_serper_key()
+    if not api_key:
+        raise ConfigError("[WA_DORKS] Serper API key não disponível")
+
+    dorks = [
+        f'"wa.me/55" "{niche}" "{city}"',
+        f'site:wa.me "55" {niche} {city}',
+        f'whatsapp {niche} {city} {state} contato',
+    ]
+
+    wa_pattern = re.compile(r'wa\.me/(\d+)', re.IGNORECASE)
+    leads = []
+    seen_wa = set()
+
+    for dork in dorks:
+        if len(leads) >= max_results:
+            break
+        try:
+            resp = http_requests.post(
+                'https://google.serper.dev/search',
+                json={'q': dork, 'gl': 'br', 'hl': 'pt-br', 'num': 20},
+                headers={'X-API-KEY': api_key, 'Content-Type': 'application/json'},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                raise RuntimeError("[WA_DORKS] Quota Serper esgotada (429)")
+            resp.raise_for_status()
+            data = resp.json()
+
+            for item in data.get('organic', []):
+                # Extrair wa.me do snippet + link
+                text = (item.get('snippet') or '') + ' ' + (item.get('link') or '')
+                wa_numbers = wa_pattern.findall(text)
+                for raw in wa_numbers:
+                    if not raw.startswith('55'):
+                        raw = '55' + raw
+                    wa_url = f"https://wa.me/{raw}"
+                    if wa_url not in seen_wa and len(leads) < max_results:
+                        seen_wa.add(wa_url)
+                        leads.append({
+                            'company_name': item.get('title', ''),
+                            'whatsapp': wa_url,
+                            'phone': raw[2:] if raw.startswith('55') else raw,
+                            'website': item.get('link', ''),
+                            'city': city,
+                            'state': state,
+                            'category': niche,
+                            'source': 'whatsapp_dorks',
+                            'source_url': item.get('link', ''),
+                        })
+
+            # Crawl top URLs que podem ter wa.me links embutidos
+            for item in data.get('organic', [])[:5]:
+                if len(leads) >= max_results:
+                    break
+                link = item.get('link', '')
+                if not link or not is_valid_result_url(link):
+                    continue
+                try:
+                    headers = {'User-Agent': random.choice(USER_AGENTS)}
+                    page_resp = http_requests.get(link, headers=headers, timeout=8, verify=False)
+                    if page_resp.status_code == 200:
+                        found = wa_pattern.findall(page_resp.text)
+                        for raw in found:
+                            if not raw.startswith('55'):
+                                raw = '55' + raw
+                            wa_url = f"https://wa.me/{raw}"
+                            if wa_url not in seen_wa and len(leads) < max_results:
+                                seen_wa.add(wa_url)
+                                leads.append({
+                                    'company_name': item.get('title', ''),
+                                    'whatsapp': wa_url,
+                                    'phone': raw[2:] if raw.startswith('55') else raw,
+                                    'website': link,
+                                    'city': city,
+                                    'state': state,
+                                    'category': niche,
+                                    'source': 'whatsapp_dorks',
+                                    'source_url': link,
+                                })
+                except Exception:
+                    pass
+                time.sleep(random.uniform(0.5, 1.5))
+
+            time.sleep(random.uniform(1, 2))
+        except Exception as e:
+            if '429' in str(e) or 'quota' in str(e).lower():
+                raise
+            print(f"[WA_DORKS] Erro no dork: {e}")
+            continue
+
+    print(f"[WA_DORKS] '{niche} {city}': {len(leads)} leads com WhatsApp")
     return leads
 
 
@@ -4472,30 +9071,65 @@ GENERIC_EMAIL_PROVIDERS = {
 }
 
 def derive_company_name(email):
-    """Derive a company/contact name from an email address.
-    For business domains: uses the domain name (e.g., contato@acme.com.br -> Acme)
-    For generic providers: uses the local part (e.g., joao.silva@gmail.com -> Joao Silva)
+    """Derive a company name from an email address domain.
+    Aggressively cleans common corporate suffixes and symbols.
     """
     if not email or '@' not in email:
         return ''
-    local_part, domain = email.lower().split('@', 1)
-    if not domain:
+    _, domain = email.lower().split('@', 1)
+    if not domain or domain in GENERIC_EMAIL_PROVIDERS:
         return ''
 
-    def normalize(raw):
-        import re as _re
-        name = _re.sub(r'\d+$', '', raw)           # remove trailing numbers
-        name = _re.sub(r'[._\-]+', ' ', name)      # dots/underscores/hyphens -> spaces
-        name = _re.sub(r'\s+', ' ', name).strip()   # collapse spaces
-        if not name:
-            return ''
-        return ' '.join(w.capitalize() for w in name.split())
+    # Get main domain part (e.g. acme.com.br -> acme)
+    name = domain.split('.')[0]
 
-    if domain in GENERIC_EMAIL_PROVIDERS:
-        return normalize(local_part)
-    else:
-        domain_name = domain.split('.')[0]
-        return normalize(domain_name)
+    import re as _re
+    name = _re.sub(r'\d+$', '', name)           # remove trailing numbers
+    name = _re.sub(r'[._\-]+', ' ', name)      # dots/underscores/hyphens -> spaces
+    name = name.upper()
+
+    # Advanced cleaning: Remove corporate suffixes
+    for suffix in CORPORATE_SUFFIXES:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)].strip()
+            break
+
+    name = _re.sub(r'\s+', ' ', name).strip()   # collapse spaces
+    if not name or len(name) < 2:
+        return ''
+
+    return ' '.join(w.capitalize() for w in name.split())
+
+def derive_contact_name(email):
+    """Derive a human contact name from the local part of an email.
+    Example: joao.silva@gmail.com -> Joao Silva
+    Returns empty string if it looks like a generic/department email.
+    """
+    if not email or '@' not in email:
+        return ''
+    local_part, _ = email.lower().split('@', 1)
+
+    # Skip department/generic prefixes
+    import re as _re
+    for pattern in EMAIL_LOW_QUALITY_PATTERNS:
+        if _re.search(pattern, local_part + '@'):
+            return ''
+
+    # Basic cleaning
+    name = _re.sub(r'\d+$', '', local_part)
+    name = _re.sub(r'[._\-]+', ' ', name)
+    name = _re.sub(r'\s+', ' ', name).strip()
+
+    if not name or len(name) < 3:
+        return ''
+
+    # Heuristic: human names usually have at least one space if they use dots/underscores
+    # or follow common baptismal name lengths.
+    words = name.split()
+    if len(words) == 1 and len(words[0]) < 4: # too short for a name
+        return ''
+
+    return ' '.join(w.capitalize() for w in words)
 
 
 # ============= Import Leads from Text Extraction =============
@@ -4539,6 +9173,10 @@ def import_leads():
             whatsapp = (c.get('whatsapp') or phone or '').strip()
             contact_name = (c.get('contact_name') or '').strip()
 
+            # Intelligent contact name extraction
+            if not contact_name and email:
+                contact_name = derive_contact_name(email)
+
             if not email and not phone:
                 skipped += 1
                 continue
@@ -4565,6 +9203,9 @@ def import_leads():
         cur.execute("UPDATE batches SET total_urls = %s WHERE id = %s", (imported, batch_id))
         conn.commit()
 
+        # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
+        threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
+
         return jsonify({
             'batch_id': batch_id,
             'imported': imported,
@@ -4577,6 +9218,192 @@ def import_leads():
     finally:
         cur.close()
         conn.close()
+
+
+# ============= Lead Scoring (Semana 2) =============
+
+@app.route('/api/leads/enrich-score', methods=['POST'])
+@limiter.limit("5/hour")
+def enrich_lead_score():
+    """Recalculate lead_score for all leads of the current user (admin) or a batch.
+    Admin: recalculates all leads in the system.
+    Client: recalculates their own leads.
+    """
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        data = request.json or {}
+        lead_ids = data.get('lead_ids')  # optional: limit to specific IDs
+
+        with get_db() as conn:
+            c = conn.cursor()
+
+            # Check if admin
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (user_id,))
+            row = c.fetchone()
+            is_admin = row and row[0]
+
+            # Build query to fetch leads to score
+            if lead_ids:
+                placeholders = ','.join(['%s'] * len(lead_ids))
+                if is_admin:
+                    c.execute(f'''SELECT l.id, l.company_name, l.email, l.phone, l.website,
+                                         l.city, l.state, l.category, l.contact_name, l.whatsapp
+                                  FROM leads l WHERE l.id IN ({placeholders})''', lead_ids)
+                else:
+                    c.execute(f'''SELECT l.id, l.company_name, l.email, l.phone, l.website,
+                                         l.city, l.state, l.category, l.contact_name, l.whatsapp
+                                  FROM leads l JOIN batches b ON l.batch_id = b.id
+                                  WHERE b.user_id = %s AND l.id IN ({placeholders})''',
+                              [user_id] + list(lead_ids))
+            elif is_admin:
+                c.execute('''SELECT l.id, l.company_name, l.email, l.phone, l.website,
+                                    l.city, l.state, l.category, l.contact_name, l.whatsapp
+                             FROM leads l''')
+            else:
+                c.execute('''SELECT l.id, l.company_name, l.email, l.phone, l.website,
+                                    l.city, l.state, l.category, l.contact_name, l.whatsapp
+                             FROM leads l JOIN batches b ON l.batch_id = b.id
+                             WHERE b.user_id = %s''', (user_id,))
+
+            rows = c.fetchall()
+            updated = 0
+            for row in rows:
+                lead_dict = {
+                    'id': row[0], 'company_name': row[1], 'email': row[2],
+                    'phone': row[3], 'website': row[4], 'city': row[5],
+                    'state': row[6], 'category': row[7], 'contact_name': row[8],
+                    'whatsapp': row[9]
+                }
+                score = _calculate_lead_score(lead_dict)
+                c.execute('UPDATE leads SET lead_score = %s WHERE id = %s', (score, row[0]))
+                updated += 1
+
+            conn.commit()
+            print(f'[INFO] enrich_lead_score: updated {updated} leads (user_id={user_id}, is_admin={is_admin})')
+            return jsonify({'updated': updated, 'message': f'{updated} leads com score atualizado'}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/leads/enrich-score: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ============= Saved Filters (Semana 2) =============
+
+SAVED_FILTERS_LIMIT = {'free': 0, 'pro': 5, 'enterprise': 20}
+
+@app.route('/api/leads/saved-filters', methods=['GET'])
+def list_saved_filters():
+    """List saved filters for the current user"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute(
+                'SELECT id, name, filters, created_at FROM saved_filters WHERE user_id = %s ORDER BY created_at DESC',
+                (user_id,)
+            )
+            filters = []
+            for row in c.fetchall():
+                filters.append({
+                    'id': row[0],
+                    'name': row[1],
+                    'filters': row[2],
+                    'created_at': row[3].isoformat() if row[3] else None
+                })
+            return jsonify({'filters': filters}), 200
+    except Exception as e:
+        print(f'[ERROR] GET /api/leads/saved-filters: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leads/saved-filters', methods=['POST'])
+def create_saved_filter():
+    """Save a filter combination for the current user"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        data = request.json or {}
+        name = (data.get('name') or '').strip()
+        filters = data.get('filters')
+
+        if not name:
+            return jsonify({'error': 'Filter name is required'}), 400
+        if not filters:
+            return jsonify({'error': 'Filters payload is required'}), 400
+        if len(name) > 100:
+            return jsonify({'error': 'Filter name too long (max 100 chars)'}), 400
+
+        with get_db() as conn:
+            c = conn.cursor()
+
+            # Check plan limit
+            plan = _get_user_plan(user_id, conn)
+            max_filters = SAVED_FILTERS_LIMIT.get(plan, 0)
+            if max_filters == 0:
+                return jsonify({'error': 'Seu plano não permite filtros salvos. Faça upgrade para Pro ou Enterprise.', 'upgrade_required': True}), 403
+
+            c.execute('SELECT COUNT(*) FROM saved_filters WHERE user_id = %s', (user_id,))
+            count = c.fetchone()[0]
+            if count >= max_filters:
+                return jsonify({'error': f'Limite de {max_filters} filtros salvos atingido para o plano {plan.title()}. Remova um filtro ou faça upgrade.', 'limit_reached': True}), 403
+
+            # Upsert by name
+            c.execute('''
+                INSERT INTO saved_filters (user_id, name, filters)
+                VALUES (%s, %s, %s::jsonb)
+                ON CONFLICT (user_id, name)
+                DO UPDATE SET filters = EXCLUDED.filters
+                RETURNING id, name, filters, created_at
+            ''', (user_id, name, json.dumps(filters)))
+            row = c.fetchone()
+            conn.commit()
+
+            return jsonify({
+                'filter': {
+                    'id': row[0],
+                    'name': row[1],
+                    'filters': row[2],
+                    'created_at': row[3].isoformat() if row[3] else None
+                }
+            }), 201
+    except Exception as e:
+        print(f'[ERROR] POST /api/leads/saved-filters: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leads/saved-filters/<int:filter_id>', methods=['DELETE'])
+def delete_saved_filter(filter_id):
+    """Delete a saved filter (owner only)"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute(
+                'DELETE FROM saved_filters WHERE id = %s AND user_id = %s RETURNING id',
+                (filter_id, user_id)
+            )
+            deleted = c.fetchone()
+            if not deleted:
+                return jsonify({'error': 'Filter not found'}), 404
+            conn.commit()
+            return jsonify({'deleted': True}), 200
+    except Exception as e:
+        print(f'[ERROR] DELETE /api/leads/saved-filters/{filter_id}: {e}')
+        return jsonify({'error': str(e)}), 500
 
 
 # ============= Export for Marketing =============
@@ -4593,6 +9420,20 @@ def export_leads():
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
 
+    # SaaS: Check export limit
+    plan = _get_user_plan(user_id)
+    limits = _get_plan_limits(plan)
+    usage = _get_usage_stats(user_id)
+
+    if usage['leads_exported'] >= limits['exports_per_month']:
+        return jsonify({
+            'error': f'Export limit reached for {plan} plan',
+            'limit': limits['exports_per_month'],
+            'used': usage['leads_exported'],
+            'plan': plan,
+            'message': f'You have reached your monthly export limit ({limits["exports_per_month"]} exports). Upgrade your plan to export more.'
+        }), 403
+
     fmt = request.args.get('format', 'csv').strip().lower()
     if fmt not in ('csv', 'mailchimp', 'whatsapp', 'whatsapp_txt', 'vcard', 'json'):
         return jsonify({'error': 'Invalid format. Use: csv, mailchimp, whatsapp, whatsapp_txt, vcard, json'}), 400
@@ -4604,8 +9445,9 @@ def export_leads():
     batch_id = request.args.get('batch_id', '').strip()
     ids = request.args.get('ids', '').strip()
 
-    query = LEADS_SELECT
-    params = [user_id]
+    # Semana 4: export from shared base
+    query = SHARED_LEADS_SELECT
+    params = []
 
     if ids:
         id_list = [int(x) for x in ids.split(',') if x.strip().isdigit()]
@@ -4643,6 +9485,9 @@ def export_leads():
 
     if not leads:
         return jsonify({'error': 'No leads to export'}), 404
+
+    # SaaS: Increment export counter
+    _increment_usage(user_id, 'leads_exported', 1)
 
     # --- Format: CSV (generic, all fields) ---
     if fmt == 'csv':
@@ -4804,10 +9649,298 @@ EMAIL;TYPE=INTERNET:{l.get('email', '')}'''
             headers={'Content-Disposition': 'attachment; filename=leads_export.json'}
         )
 
+
+# ============= Send Leads to CRM (Extrator → DIAX CRM) =============
+
+@app.route('/api/leads/send-to-crm', methods=['POST'])
+@limiter.limit("10/minute")
+def send_leads_to_crm():
+    """
+    Send selected leads or filtered leads to DIAX CRM.
+    Accepts lead_ids, filters, CRM URL and token.
+    Returns: {success, sent_count, failed_count, errors}
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    lead_ids = data.get('lead_ids', [])
+    filters = data.get('filters', {}) if isinstance(data.get('filters', {}), dict) else {}
+    crm_api_url = data.get('crm_api_url', '').strip()
+    crm_auth_token = data.get('crm_auth_token', '').strip()
+
+    # Validation
+    if not crm_api_url or not crm_auth_token:
+        _log_send_to_crm_failure(
+            user_id=user_id,
+            filters=filters,
+            lead_ids=lead_ids,
+            crm_api_url=crm_api_url,
+            error_message='CRM URL and token are required',
+            status_code=400,
+            stage='validation',
+            source='backend',
+        )
+        return jsonify({'success': False, 'error': 'CRM URL and token are required'}), 400
+
+    # SSRF Prevention: validate CRM URL
+    parsed = urlparse(crm_api_url)
+    hostname = parsed.hostname or ''
+    if not (hostname == 'localhost' or hostname == '127.0.0.1' or parsed.scheme == 'https'):
+        _log_send_to_crm_failure(
+            user_id=user_id,
+            filters=filters,
+            lead_ids=lead_ids,
+            crm_api_url=crm_api_url,
+            error_message='Invalid CRM URL. Only http://localhost, http://127.0.0.1, or https:// URLs are allowed',
+            status_code=400,
+            stage='validation',
+            source='backend',
+        )
+        return jsonify({
+            'success': False,
+            'error': 'Invalid CRM URL. Only http://localhost, http://127.0.0.1, or https:// URLs are allowed'
+        }), 400
+
+    # Build query to fetch leads
+    query = SHARED_LEADS_SELECT
+    params = []
+
+    if lead_ids:
+        id_list = [int(x) for x in lead_ids if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
+        if id_list:
+            query += f' AND l.id IN ({",".join(["%s"] * len(id_list))})'
+            params.extend(id_list)
+    else:
+        # Apply filters if no specific lead_ids
+        search = filters.get('search', '').strip()
+        status = filters.get('status', '').strip()
+        tag = filters.get('tag', '').strip()
+        city = filters.get('city', '').strip()
+        state = filters.get('state', '').strip()
+
+        if search:
+            query += ''' AND (l.company_name ILIKE %s OR l.email ILIKE %s
+                         OR l.phone ILIKE %s OR l.website ILIKE %s
+                         OR l.contact_name ILIKE %s OR l.cnpj ILIKE %s)'''
+            like = f'%{search}%'
+            params.extend([like, like, like, like, like, like])
+
+        if status and status in CRM_STATUSES:
+            query += ' AND l.crm_status = %s'
+            params.append(status)
+
+        if tag:
+            query += ' AND l.tags ILIKE %s'
+            params.append(f'%{tag}%')
+
+        if city:
+            query += ' AND l.city ILIKE %s'
+            params.append(f'%{city}%')
+
+        if state:
+            query += ' AND l.state ILIKE %s'
+            params.append(f'%{state}%')
+
+    query += ' ORDER BY l.extracted_at DESC LIMIT 500'
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(query, params)
+        rows = c.fetchall()
+
+    if not rows:
+        _log_send_to_crm_failure(
+            user_id=user_id,
+            filters=filters,
+            lead_ids=lead_ids,
+            crm_api_url=crm_api_url,
+            error_message='No leads found matching criteria',
+            status_code=404,
+            stage='load_leads',
+            source='backend',
+        )
+        return jsonify({
+            'success': False,
+            'error': 'No leads found matching criteria',
+            'sent_count': 0,
+            'failed_count': 0
+        }), 404
+
+    leads = [lead_row_to_dict(row) for row in rows]
+
+    # Deduplicate by email
+    seen_emails = {}
+    unique_leads = []
+    for lead in leads:
+        email = (lead.get('email') or '').strip().lower()
+        if email and email not in seen_emails:
+            seen_emails[email] = True
+            unique_leads.append(lead)
+
+    if not unique_leads:
+        _log_send_to_crm_failure(
+            user_id=user_id,
+            filters=filters,
+            lead_ids=lead_ids,
+            crm_api_url=crm_api_url,
+            error_message='No leads with valid emails found',
+            status_code=404,
+            stage='prepare_payload',
+            total_leads=len(leads),
+            source='backend',
+        )
+        return jsonify({
+            'success': False,
+            'error': 'No leads with valid emails found',
+            'sent_count': 0,
+            'failed_count': 0
+        }), 404
+
+    # Format leads for CRM API
+    customers = []
+    for lead in unique_leads:
+        contact_name = lead.get('contact_name') or lead.get('company_name') or 'Lead'
+        email = (lead.get('email') or '').strip()
+        phone = lead.get('phone') or None
+        whatsapp = lead.get('whatsapp') or None
+        company_name = lead.get('company_name') or 'N/A'
+        tags = lead.get('tags') or ''
+        notes = lead.get('notes') or ''
+
+        # Combine notes with tags for the CRM notes field
+        combined_notes = f"{notes}{',' if notes and tags else ''}{tags}"
+
+        customer = {
+            'name': contact_name[:100],  # Limit to 100 chars
+            'email': email,
+            'phone': phone,
+            'whatsApp': whatsapp,
+            'companyName': company_name[:100],
+            'notes': combined_notes[:500] if combined_notes else '',
+            'tags': tags
+        }
+        customers.append(customer)
+
+    # Send to CRM API
+    # The CRM endpoint expects flat JSON: { "customers": [...], "source": <int> }
+    # 'source' is an integer enum (0 = default/import). Sending it as a string
+    # causes JSON binding to fail entirely, which is why previous attempts
+    # produced "request field is required" (the [FromBody] parameter went null).
+    payload = {
+        'customers': customers,
+        'source': 0,
+    }
+
+    headers = {
+        'Authorization': f'Bearer {crm_auth_token}',
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        crm_endpoint = f'{crm_api_url}/api/v1/customers/import'
+        response = http_requests.post(
+            crm_endpoint,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        if response.status_code in [200, 201, 202]:
+            result = response.json()
+            sent_count = result.get('created', len(customers))
+            failed_count = result.get('failed', 0)
+            return jsonify({
+                'success': True,
+                'sent_count': sent_count,
+                'failed_count': failed_count,
+                'total_leads': len(unique_leads),
+                'message': f'Successfully sent {sent_count} leads to CRM'
+            }), 200
+        else:
+            error_msg = response.text[:200] if response.text else f'HTTP {response.status_code}'
+            _log_send_to_crm_failure(
+                user_id=user_id,
+                filters=filters,
+                lead_ids=lead_ids,
+                crm_api_url=crm_api_url,
+                error_message=f'CRM API error: {error_msg}',
+                status_code=response.status_code,
+                stage='crm_api_request',
+                response_body=response.text,
+                total_leads=len(unique_leads),
+                source='backend',
+            )
+            return jsonify({
+                'success': False,
+                'error': f'CRM API error: {error_msg}',
+                'sent_count': 0,
+                'failed_count': len(unique_leads)
+            }), response.status_code
+
+    except Exception as e:
+        error_str = str(e)[:200]
+        _log_send_to_crm_failure(
+            user_id=user_id,
+            filters=filters,
+            lead_ids=lead_ids,
+            crm_api_url=crm_api_url,
+            error_message=f'Failed to send leads to CRM: {error_str}',
+            exc=e,
+            status_code=500,
+            stage='crm_api_request',
+            total_leads=len(unique_leads),
+            source='backend',
+        )
+        return jsonify({
+            'success': False,
+            'error': f'Failed to send leads to CRM: {error_str}',
+            'sent_count': 0,
+            'failed_count': len(unique_leads)
+        }), 500
+
+
+@app.route('/api/client-logs/send-to-crm-error', methods=['POST'])
+@limiter.limit("30/minute")
+def client_log_send_to_crm_error():
+    """Persist frontend send-to-CRM failures into system_logs."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    filters = data.get('filters', {}) if isinstance(data.get('filters', {}), dict) else {}
+    lead_ids = data.get('lead_ids', [])
+    crm_api_url = (data.get('crm_api_url') or '').strip()
+    error_message = (data.get('error') or 'Frontend send-to-CRM error').strip()
+    stack = (data.get('stack') or '').strip()
+    stage = (data.get('stage') or 'frontend').strip()
+    status_code = data.get('status_code')
+
+    _log_send_to_crm_failure(
+        user_id=user_id,
+        filters=filters,
+        lead_ids=lead_ids,
+        crm_api_url=crm_api_url,
+        error_message=error_message,
+        stack_text=stack,
+        status_code=status_code,
+        stage=stage,
+        response_body=data.get('response_data'),
+        total_leads=data.get('total_leads'),
+        source='frontend',
+    )
+
+    return jsonify({'ok': True}), 202
+
+
 @app.route('/api/analytics', methods=['GET'])
 @limiter.limit("30/minute")
 def get_analytics():
-    """Dashboard analytics: stats, trends, quality metrics."""
+    """Dashboard analytics: shared base metrics for SaaS clients."""
     token = get_auth_header()
     user_id = verify_token(token)
 
@@ -4817,105 +9950,104 @@ def get_analytics():
     with get_db() as conn:
         c = conn.cursor()
 
-        # Total leads (from batches)
-        c.execute('SELECT COALESCE(SUM(total_leads), 0) FROM batches WHERE user_id = %s', (user_id,))
-        total_batch_leads = c.fetchone()[0]
-
-        # Total leads from individual jobs
-        c.execute('SELECT COALESCE(SUM(results_count), 0) FROM jobs WHERE user_id = %s', (user_id,))
-        total_job_leads = c.fetchone()[0]
-
-        total_leads = total_batch_leads + total_job_leads
-
-        # Total batches
-        c.execute('SELECT COUNT(*) FROM batches WHERE user_id = %s', (user_id,))
-        total_batches = c.fetchone()[0]
-
-        # Completed vs failed batches
-        c.execute("SELECT COUNT(*) FROM batches WHERE user_id = %s AND status = 'completed'", (user_id,))
-        completed_batches = c.fetchone()[0]
-
-        c.execute("SELECT COUNT(*) FROM batches WHERE user_id = %s AND status = 'failed'", (user_id,))
-        failed_batches = c.fetchone()[0]
-
-        # Unique emails from leads table
-        c.execute('''SELECT COUNT(DISTINCT l.email) FROM leads l
+        # Total leads in shared base
+        c.execute('''SELECT COUNT(*) FROM leads l
                      JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s''', (user_id,))
-        unique_emails = c.fetchone()[0]
+                     WHERE b.is_shared = TRUE''')
+        total_leads = c.fetchone()[0]
 
-        # Leads this week
+        # Average lead score
+        c.execute('''SELECT COALESCE(AVG(COALESCE(l.lead_score, 0)), 0) FROM leads l
+                     JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.lead_score IS NOT NULL AND l.lead_score > 0''')
+        avg_score = round(float(c.fetchone()[0]), 1)
+
+        # Total distinct cities
+        c.execute('''SELECT COUNT(DISTINCT TRIM(l.city)) FROM leads l
+                     JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.city IS NOT NULL AND l.city != '' ''')
+        total_cities = c.fetchone()[0]
+
+        # Total distinct categories
+        c.execute('''SELECT COUNT(DISTINCT TRIM(l.category)) FROM leads l
+                     JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.category IS NOT NULL AND l.category != '' ''')
+        total_categories = c.fetchone()[0]
+
+        # Leads added this week
         week_ago = datetime.now() - timedelta(days=7)
         c.execute('''SELECT COUNT(*) FROM leads l
                      JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s AND l.extracted_at >= %s''', (user_id, week_ago))
+                     WHERE b.is_shared = TRUE AND l.extracted_at >= %s''', (week_ago,))
         leads_this_week = c.fetchone()[0]
 
-        # Leads this month
-        month_ago = datetime.now() - timedelta(days=30)
-        c.execute('''SELECT COUNT(*) FROM leads l
-                     JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s AND l.extracted_at >= %s''', (user_id, month_ago))
-        leads_this_month = c.fetchone()[0]
-
-        # Leads by day (last 30 days) - for LineChart
-        c.execute('''SELECT DATE(l.extracted_at) as day, COUNT(*) as count
+        # Top cities (top 8)
+        c.execute('''SELECT TRIM(l.city) as city, COUNT(*) as cnt
                      FROM leads l JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s AND l.extracted_at >= %s
-                     GROUP BY DATE(l.extracted_at) ORDER BY day''', (user_id, month_ago))
-        leads_by_day_raw = c.fetchall()
+                     WHERE b.is_shared = TRUE AND l.city IS NOT NULL AND l.city != ''
+                     GROUP BY TRIM(l.city) ORDER BY cnt DESC LIMIT 8''')
+        top_cities = [{'name': row[0], 'count': row[1]} for row in c.fetchall()]
 
-        # Fill missing days with 0
-        leads_by_day = []
-        day_map = {row[0].isoformat(): row[1] for row in leads_by_day_raw}
-        for i in range(30, -1, -1):
-            d = (datetime.now() - timedelta(days=i)).date()
-            leads_by_day.append({'date': d.isoformat(), 'leads': day_map.get(d.isoformat(), 0)})
+        # Top states (top 8)
+        c.execute('''SELECT TRIM(l.state) as state, COUNT(*) as cnt
+                     FROM leads l JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.state IS NOT NULL AND l.state != ''
+                     GROUP BY TRIM(l.state) ORDER BY cnt DESC LIMIT 8''')
+        top_states = [{'name': row[0], 'count': row[1]} for row in c.fetchall()]
 
-        # Top batches by leads (top 10) - for BarChart
-        c.execute('''SELECT name, total_leads FROM batches
-                     WHERE user_id = %s AND total_leads > 0
-                     ORDER BY total_leads DESC LIMIT 10''', (user_id,))
-        top_batches = [{'name': row[0][:30], 'leads': row[1]} for row in c.fetchall()]
+        # Top categories (top 8)
+        c.execute('''SELECT TRIM(l.category) as cat, COUNT(*) as cnt
+                     FROM leads l JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE AND l.category IS NOT NULL AND l.category != ''
+                     GROUP BY TRIM(l.category) ORDER BY cnt DESC LIMIT 8''')
+        top_categories = [{'name': row[0], 'count': row[1]} for row in c.fetchall()]
 
-        # Data quality: leads with email only, with phone, with both
+        # Latest leads (10 most recent)
+        c.execute('''SELECT l.id, l.company_name, l.email, l.city, l.state,
+                            l.category, COALESCE(l.lead_score, 0) as lead_score, l.extracted_at
+                     FROM leads l JOIN batches b ON l.batch_id = b.id
+                     WHERE b.is_shared = TRUE
+                     ORDER BY l.extracted_at DESC LIMIT 10''')
+        latest_rows = c.fetchall()
+        latest_leads = [
+            {
+                'id': row[0],
+                'company_name': row[1] or '',
+                'email': row[2] or '',
+                'city': row[3] or '',
+                'state': row[4] or '',
+                'category': row[5] or '',
+                'lead_score': row[6],
+                'extracted_at': row[7].isoformat() if row[7] else '',
+            }
+            for row in latest_rows
+        ]
+
+        # Score distribution
         c.execute('''SELECT
-                       COUNT(*) FILTER (WHERE l.phone IS NOT NULL AND l.phone != '') as with_phone,
-                       COUNT(*) FILTER (WHERE l.phone IS NULL OR l.phone = '') as email_only,
-                       COUNT(*) FILTER (WHERE l.whatsapp IS NOT NULL AND l.whatsapp != '') as with_whatsapp,
-                       COUNT(*) FILTER (WHERE l.cnpj IS NOT NULL AND l.cnpj != '') as with_cnpj,
-                       COUNT(*) FILTER (WHERE l.instagram IS NOT NULL AND l.instagram != ''
-                                        OR l.facebook IS NOT NULL AND l.facebook != ''
-                                        OR l.linkedin IS NOT NULL AND l.linkedin != '') as with_social
+                       COUNT(*) FILTER (WHERE COALESCE(l.lead_score, 0) >= 70) as high,
+                       COUNT(*) FILTER (WHERE COALESCE(l.lead_score, 0) >= 40 AND COALESCE(l.lead_score, 0) < 70) as medium,
+                       COUNT(*) FILTER (WHERE COALESCE(l.lead_score, 0) < 40) as low
                      FROM leads l JOIN batches b ON l.batch_id = b.id
-                     WHERE b.user_id = %s''', (user_id,))
-        quality_row = c.fetchone()
-        with_phone = quality_row[0] if quality_row else 0
-        email_only = quality_row[1] if quality_row else 0
-        with_whatsapp = quality_row[2] if quality_row else 0
-        with_cnpj = quality_row[3] if quality_row else 0
-        with_social = quality_row[4] if quality_row else 0
-
-    success_rate = round((completed_batches / total_batches * 100)) if total_batches > 0 else 0
+                     WHERE b.is_shared = TRUE''')
+        score_row = c.fetchone()
+        score_distribution = {
+            'high': score_row[0] if score_row else 0,
+            'medium': score_row[1] if score_row else 0,
+            'low': score_row[2] if score_row else 0,
+        }
 
     return jsonify({
         'total_leads': total_leads,
-        'total_batches': total_batches,
-        'unique_emails': unique_emails,
+        'avg_score': avg_score,
+        'total_cities': total_cities,
+        'total_categories': total_categories,
         'leads_this_week': leads_this_week,
-        'leads_this_month': leads_this_month,
-        'completed_batches': completed_batches,
-        'failed_batches': failed_batches,
-        'success_rate': success_rate,
-        'leads_by_day': leads_by_day,
-        'top_batches': top_batches,
-        'data_quality': {
-            'with_phone': with_phone,
-            'email_only': email_only,
-            'with_whatsapp': with_whatsapp,
-            'with_cnpj': with_cnpj,
-            'with_social': with_social,
-        },
+        'top_cities': top_cities,
+        'top_states': top_states,
+        'top_categories': top_categories,
+        'latest_leads': latest_leads,
+        'score_distribution': score_distribution,
     })
 
 @app.route('/api/batch/<int:batch_id>', methods=['DELETE'])
@@ -5002,15 +10134,16 @@ Endpoint para busca massiva usando TODOS os métodos disponíveis
 # Add this after line ~3400 (after /api/search-api endpoint)
 
 @app.route('/api/search/massive', methods=['POST'])
-@limiter.limit("1/hour")  # Limit massivo é menor
+@limiter.limit("10/hour")  # 10 buscas massivas por hora
 def start_massive_search():
     """
     Start a massive search using ALL available methods:
     - API Enrichment (Hunter.io/Snov.io)
-    - Search Engines (DuckDuckGo/Bing)
+    - Search Engines (DuckDuckGo/Bing/Yahoo - 6 fontes)
     - Google Maps Playwright
-    - Instagram Business
-    - LinkedIn Companies
+    - Diretórios BR (GuiaMais, TeleListas, Apontador)
+    - Instagram Business (Instaloader)
+    - LinkedIn Companies (Playwright)
     """
     token = get_auth_header()
     user_id = verify_token(token)
@@ -5026,8 +10159,11 @@ def start_massive_search():
     region_id = (data.get('region') or '').strip()
     city = (data.get('city') or '').strip()
     state = (data.get('state') or '').strip()
-    methods = data.get('methods', ['api_enrichment', 'search_engines', 'google_maps'])  # Métodos selecionados
+    # Todos os métodos ativos por padrão
+    methods = data.get('methods', ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data'])
     max_pages = min(3, max(1, int(data.get('max_pages', 2))))
+    # Semana 7: admin draft mode — batch starts unpublished (is_shared=FALSE)
+    is_draft = bool(data.get('is_draft', False))
 
     if not niches or len(niches) == 0:
         return jsonify({'error': 'Pelo menos um nicho é obrigatório'}), 400
@@ -5059,18 +10195,33 @@ def start_massive_search():
     with get_db() as conn:
         c = conn.cursor()
 
-        # Calculate total jobs
+        # Calculate total jobs — mirrors the exact slices used in each method's loop
         total_jobs = 0
         if 'api_enrichment' in methods:
-            total_jobs += len(niches) * len(cities_to_search)
+            total_jobs += min(3, len(niches)) * min(1, len(cities_to_search))
         if 'search_engines' in methods:
-            total_jobs += len(niches)
+            total_jobs += min(3, len(niches))
         if 'google_maps' in methods:
-            total_jobs += len(niches) * len(cities_to_search)
+            total_jobs += min(2, len(niches)) * min(2, len(cities_to_search))
+        if 'directories' in methods:
+            total_jobs += min(5, len(niches)) * min(5, len(cities_to_search))
+        if 'instagram' in methods:
+            total_jobs += min(2, len(niches)) * min(2, len(cities_to_search))
+        if 'linkedin' in methods:
+            total_jobs += min(2, len(niches)) * min(2, len(cities_to_search))
+        if 'local_business_data' in methods:
+            total_jobs += min(5, len(niches)) * min(3, len(cities_to_search))
+        if 'receita_ws' in methods:
+            total_jobs += min(3, len(niches)) * min(3, len(cities_to_search))
+        if 'olx_ads' in methods:
+            total_jobs += min(3, len(niches)) * min(3, len(cities_to_search))
+        if 'whatsapp_dorks' in methods:
+            total_jobs += min(3, len(niches)) * min(2, len(cities_to_search))
 
+        is_shared_val = not is_draft  # draft → is_shared=FALSE; normal → TRUE
         c.execute(
-            'INSERT INTO batches (user_id, name, status, total_urls, created_at) VALUES (%s, %s, %s, %s, %s) RETURNING id',
-            (user_id, batch_name, 'pending', total_jobs, datetime.now())
+            'INSERT INTO batches (user_id, name, status, total_urls, created_at, is_shared) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id',
+            (user_id, batch_name, 'pending', total_jobs, datetime.now(), is_shared_val)
         )
         batch_id = c.fetchone()[0]
 
@@ -5097,7 +10248,7 @@ def start_massive_search():
                     })
 
         # ===========================================================
-        # METHOD 2: SEARCH ENGINES (DuckDuckGo / Bing)
+        # METHOD 2: SEARCH ENGINES (DuckDuckGo / Bing / Yahoo - 6 fontes)
         # ===========================================================
         search_engine_jobs = []
         if 'search_engines' in methods:
@@ -5111,20 +10262,19 @@ def start_massive_search():
                 search_engine_jobs.append({
                     'search_job_id': search_job_id,
                     'niche': niche,
+                    'city': None,
+                    'state': None,
                     'region': region_id,
                     'max_pages': max_pages,
                 })
 
         # ===========================================================
-        # METHOD 3: GOOGLE MAPS (via existing endpoint)
-        # Note: Google Maps não usa search_jobs, cria jobs separados
-        # Vamos apenas salvar referência para tracking
+        # METHOD 3: GOOGLE MAPS (Playwright)
         # ===========================================================
         google_maps_jobs = []
         if 'google_maps' in methods:
             for niche in niches[:2]:  # Max 2 para não saturar
                 for city_data in cities_to_search[:2]:  # Max 2 cidades
-                    # Criar entry de tracking
                     c.execute(
                         '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, max_pages, status, engine, created_at)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
@@ -5139,6 +10289,185 @@ def start_massive_search():
                         'state': city_data['state'],
                     })
 
+        # ===========================================================
+        # METHOD 4: DIRETÓRIOS BR (GuiaMais, TeleListas, Apontador)
+        # ===========================================================
+        directory_jobs = []
+        if 'directories' in methods:
+            for niche in niches[:5]:  # Até 5 nichos (mais rápido que Playwright)
+                for city_data in cities_to_search[:5]:  # Até 5 cidades
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'directories', datetime.now())
+                    )
+                    search_job_id = c.fetchone()[0]
+                    directory_jobs.append({
+                        'search_job_id': search_job_id,
+                        'niche': niche,
+                        'city': city_data['city'],
+                        'state': city_data['state'],
+                    })
+
+        # ===========================================================
+        # METHOD 5: INSTAGRAM BUSINESS (Instaloader)
+        # ===========================================================
+        instagram_jobs = []
+        if 'instagram' in methods:
+            for niche in niches[:2]:  # Max 2 por rate limit do Instagram
+                for city_data in cities_to_search[:2]:  # Max 2 cidades
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'instagram', datetime.now())
+                    )
+                    search_job_id = c.fetchone()[0]
+                    instagram_jobs.append({
+                        'search_job_id': search_job_id,
+                        'niche': niche,
+                        'city': city_data['city'],
+                        'state': city_data['state'],
+                    })
+
+        # ===========================================================
+        # METHOD 6: LINKEDIN COMPANIES (Playwright)
+        # ===========================================================
+        linkedin_jobs = []
+        if 'linkedin' in methods:
+            for niche in niches[:2]:  # Max 2 — LinkedIn tem anti-scraping forte
+                for city_data in cities_to_search[:2]:  # Max 2 cidades
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'linkedin', datetime.now())
+                    )
+                    search_job_id = c.fetchone()[0]
+                    linkedin_jobs.append({
+                        'search_job_id': search_job_id,
+                        'niche': niche,
+                        'city': city_data['city'],
+                        'state': city_data['state'],
+                    })
+
+        # ===========================================================
+        # METHOD 7: LOCAL BUSINESS DATA (RapidAPI) — Google Maps via API
+        # Free tier: 500 businesses/month → limita niches[:5] x cities[:3]
+        # ===========================================================
+        local_business_data_jobs = []
+        if 'local_business_data' in methods:
+            for niche in niches[:5]:
+                for city_data in cities_to_search[:3]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'local_business_data', datetime.now())
+                    )
+                    search_job_id = c.fetchone()[0]
+                    local_business_data_jobs.append({
+                        'search_job_id': search_job_id,
+                        'niche': niche,
+                        'city': city_data['city'],
+                        'state': city_data['state'],
+                    })
+
+        # ===========================================================
+        # NEW METHODS 8-12
+        # ===========================================================
+        google_email_harvest_jobs = []
+        if 'google_email_harvest' in methods:
+            for niche in niches[:3]:
+                for city_data in cities_to_search[:3]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'google_email_harvest', datetime.now()))
+                    google_email_harvest_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
+        website_email_crawler_jobs = []
+        if 'website_email_crawler' in methods:
+            for niche in niches[:5]:
+                for city_data in cities_to_search[:5]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'website_email_crawler', datetime.now()))
+                    website_email_crawler_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
+        cnpj_open_jobs = []
+        if 'cnpj_open' in methods:
+            for niche in niches[:3]:
+                for city_data in cities_to_search[:3]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'cnpj_open', datetime.now()))
+                    cnpj_open_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
+        serper_google_jobs = []
+        if 'serper_google' in methods:
+            for niche in niches[:5]:
+                for city_data in cities_to_search[:3]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'serper_google', datetime.now()))
+                    serper_google_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
+        apify_maps_jobs = []
+        if 'apify_maps' in methods:
+            for niche in niches[:3]:
+                for city_data in cities_to_search[:2]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'apify_maps', datetime.now()))
+                    apify_maps_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
+        receita_ws_jobs = []
+        if 'receita_ws' in methods:
+            for niche in niches[:3]:
+                for city_data in cities_to_search[:3]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'receita_ws', datetime.now()))
+                    receita_ws_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
+        olx_ads_jobs = []
+        if 'olx_ads' in methods:
+            for niche in niches[:3]:
+                for city_data in cities_to_search[:3]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'olx_ads', datetime.now()))
+                    olx_ads_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
+        whatsapp_dorks_jobs = []
+        if 'whatsapp_dorks' in methods:
+            for niche in niches[:3]:
+                for city_data in cities_to_search[:2]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'whatsapp_dorks', datetime.now()))
+                    whatsapp_dorks_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
+        # Bug 2 fix: mark batch as 'processing' now that all jobs are queued
+        c.execute("UPDATE batches SET status='processing' WHERE id=%s", (batch_id,))
+
     # ============================================================
     # START BACKGROUND THREADS FOR EACH METHOD
     # ============================================================
@@ -5152,7 +10481,7 @@ def start_massive_search():
         )
         thread1.start()
 
-    # Thread 2: Search Engines
+    # Thread 2: Search Engines (6 fontes: Bing API, Google CSE, DDG API, DDG HTML, Bing HTML, Yahoo HTML)
     if search_engine_jobs:
         thread2 = threading.Thread(
             target=process_search_job,
@@ -5161,7 +10490,7 @@ def start_massive_search():
         )
         thread2.start()
 
-    # Thread 3: Google Maps (precisa ser chamado via requests internos)
+    # Thread 3: Google Maps (Playwright)
     if google_maps_jobs:
         thread3 = threading.Thread(
             target=process_google_maps_massive,
@@ -5170,104 +10499,1282 @@ def start_massive_search():
         )
         thread3.start()
 
-    # AUTO-SYNC: Start background thread to sync leads to alexandrequeiroz.com.br
-    sync_thread = threading.Thread(target=auto_sync_new_leads_background, args=(batch_id,), daemon=True)
-    sync_thread.start()
+    # Thread 4: Diretórios BR (GuiaMais, TeleListas, Apontador)
+    if directory_jobs:
+        thread4 = threading.Thread(
+            target=process_directories_massive,
+            args=(batch_id, directory_jobs, user_id),
+            daemon=True
+        )
+        thread4.start()
+
+    # Thread 5: Instagram Business (Instaloader)
+    if instagram_jobs:
+        thread5 = threading.Thread(
+            target=process_instagram_massive,
+            args=(batch_id, instagram_jobs, user_id),
+            daemon=True
+        )
+        thread5.start()
+
+    # Thread 6: LinkedIn Companies (Playwright)
+    if linkedin_jobs:
+        thread6 = threading.Thread(
+            target=process_linkedin_massive,
+            args=(batch_id, linkedin_jobs, user_id),
+            daemon=True
+        )
+        thread6.start()
+
+    # Thread 7: Local Business Data (RapidAPI — Google Maps via API)
+    if local_business_data_jobs:
+        thread7 = threading.Thread(
+            target=process_local_business_data_massive,
+            args=(batch_id, local_business_data_jobs, user_id),
+            daemon=True
+        )
+        thread7.start()
+
+    # Thread 8: Google Email Harvest (Playwright dorks)
+    if google_email_harvest_jobs:
+        threading.Thread(target=process_google_email_harvest_massive,
+                         args=(batch_id, google_email_harvest_jobs, user_id), daemon=True).start()
+
+    # Thread 9: Website Email Crawler (DDG + deep crawl)
+    if website_email_crawler_jobs:
+        threading.Thread(target=process_website_email_crawler_massive,
+                         args=(batch_id, website_email_crawler_jobs, user_id), daemon=True).start()
+
+    # Thread 10: OpenCNPJ (CNPJ directories + API enrichment)
+    if cnpj_open_jobs:
+        threading.Thread(target=process_cnpj_open_massive,
+                         args=(batch_id, cnpj_open_jobs, user_id), daemon=True).start()
+
+    # Thread 11: Serper.dev Google API (2500 free/month)
+    if serper_google_jobs:
+        threading.Thread(target=process_serper_google_massive,
+                         args=(batch_id, serper_google_jobs, user_id), daemon=True).start()
+
+    # Thread 12: Apify Google Maps ($5 free/month)
+    if apify_maps_jobs:
+        threading.Thread(target=process_apify_maps_massive,
+                         args=(batch_id, apify_maps_jobs, user_id), daemon=True).start()
+
+    # Thread 13: ReceitaWS CNPJ Search (3 req/min free)
+    if receita_ws_jobs:
+        threading.Thread(target=process_receita_ws_massive,
+                         args=(batch_id, receita_ws_jobs, user_id), daemon=True).start()
+
+    # Thread 14: OLX Service Ads (WhatsApp harvesting)
+    if olx_ads_jobs:
+        threading.Thread(target=process_olx_ads_massive,
+                         args=(batch_id, olx_ads_jobs, user_id), daemon=True).start()
+
+    # Thread 15: WhatsApp Dorks via Serper
+    if whatsapp_dorks_jobs:
+        threading.Thread(target=process_whatsapp_dorks_massive,
+                         args=(batch_id, whatsapp_dorks_jobs, user_id), daemon=True).start()
+
+    # Bug 4 fix: monitor thread marks batch 'completed' when all jobs finish
+    monitor_thread = threading.Thread(target=_monitor_batch_completion, args=(batch_id,), daemon=True)
+    monitor_thread.start()
+
+    # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
+    threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
 
     return jsonify({
         'batch_id': batch_id,
         'name': batch_name,
         'total_jobs': total_jobs,
         'methods': {
-            'api_enrichment': len(api_enrichment_jobs),
-            'search_engines': len(search_engine_jobs),
-            'google_maps': len(google_maps_jobs),
+            'api_enrichment':     len(api_enrichment_jobs),
+            'search_engines':     len(search_engine_jobs),
+            'google_maps':        len(google_maps_jobs),
+            'directories':        len(directory_jobs),
+            'instagram':          len(instagram_jobs),
+            'linkedin':           len(linkedin_jobs),
+            'local_business_data': len(local_business_data_jobs),
+            'google_email_harvest': len(google_email_harvest_jobs),
+            'website_email_crawler': len(website_email_crawler_jobs),
+            'cnpj_open': len(cnpj_open_jobs),
+            'serper_google': len(serper_google_jobs),
+            'apify_maps': len(apify_maps_jobs),
+            'receita_ws': len(receita_ws_jobs),
+            'olx_ads': len(olx_ads_jobs),
+            'whatsapp_dorks': len(whatsapp_dorks_jobs),
         },
         'status': 'processing',
         'message': f'Busca massiva iniciada com {total_jobs} jobs em {len(methods)} métodos'
     })
 
 
+@_persist_thread_errors('google_maps')
 def process_google_maps_massive(batch_id, jobs_data, user_id, token):
-    """Process Google Maps jobs for massive search."""
-    with get_db() as conn:
-        c = conn.cursor()
+    """
+    Process Google Maps jobs for massive search.
+    - Retry 3x por job com backoff exponencial
+    - Log de erros em scraper_errors.log
+    - NUNCA para: sempre itera todos os jobs até o fim
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[GOOGLE_MAPS] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'google_maps', f'batch={batch_id}',
+                f'Iniciando scraping massivo Google Maps. {len(jobs_data)} jobs.')
 
-        for job_data in jobs_data:
+    try:
+        c = conn.cursor()
+        total_saved = 0
+
+        for job_idx, job_data in enumerate(jobs_data):
             search_job_id = job_data['search_job_id']
             niche = job_data['niche']
             city = job_data['city']
             state = job_data['state']
+            query = f"{niche} {city} {state}"
+
+            print(f"[GOOGLE_MAPS] Job {job_idx+1}/{len(jobs_data)}: {query}")
 
             try:
-                # Update status to running
-                c.execute(
-                    'UPDATE search_jobs SET status = %s, started_at = %s WHERE id = %s',
-                    ('running', datetime.now(), search_job_id)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, c=city, s=state: scrape_google_maps(n, c, s, max_results=20),
+                    provider='google_maps',
+                    query=query
                 )
-                conn.commit()
 
-                # Chamar scraper de Google Maps internamente
-                # (Playwright já implementado em outro endpoint)
-                results = scrape_google_maps_playwright(f"{niche} {city} {state}", max_places=20)
-
-                if results and len(results) > 0:
-                    # Inserir leads no batch
-                    for result in results:
-                        email = result.get('email', '')
-                        phone = result.get('phone', '')
-                        website = result.get('website', '')
-
-                        if email or phone or website:
-                            c.execute(
-                                '''INSERT INTO leads (batch_id, company_name, email, phone, website, city, state, source, extracted_at)
-                                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                   ON CONFLICT (batch_id, email) DO NOTHING''',
-                                (batch_id, result.get('name', 'Lead sem nome'), email, phone, website,
-                                 city, state, 'google_maps', datetime.now())
-                            )
-
-                    conn.commit()
-
-                    # Update status to completed
-                    c.execute(
-                        'UPDATE search_jobs SET status = %s, finished_at = %s, total_leads = %s WHERE id = %s',
-                        ('completed', datetime.now(), len(results), search_job_id)
-                    )
-                    conn.commit()
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'google_maps', city, state, 'GOOGLE_MAPS')
+                    total_saved += leads_saved
+                    status = 'completed'
+                    err_msg = None
+                    print(f"[GOOGLE_MAPS] Job {job_idx+1} OK: {leads_saved} leads salvos")
+                    scraper_log('INFO', 'google_maps', query, f'Job concluído: {leads_saved} leads')
                 else:
-                    # No results
-                    c.execute(
-                        'UPDATE search_jobs SET status = %s, finished_at = %s, total_leads = %s WHERE id = %s',
-                        ('completed', datetime.now(), 0, search_job_id)
-                    )
-                    conn.commit()
+                    leads_saved = 0
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados após 3 tentativas'
+                    print(f"[GOOGLE_MAPS] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved, err_msg, search_job_id))
+                except Exception:
+                    pass
 
             except Exception as e:
-                # Error handling
-                c.execute(
-                    'UPDATE search_jobs SET status = %s, error_message = %s, finished_at = %s WHERE id = %s',
-                    ('failed', str(e)[:500], datetime.now(), search_job_id)
-                )
-                conn.commit()
+                scraper_log('ERROR', 'google_maps', query, f'Erro inesperado no job: {e}', e)
+                print(f"[GOOGLE_MAPS] Erro inesperado job {search_job_id}: {e}")
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
 
             # Delay entre jobs para evitar rate limit
             time.sleep(10)
 
-        # Update batch final status
-        c.execute(
-            '''SELECT COUNT(*) FROM search_jobs
-               WHERE batch_id = %s AND status IN ('pending', 'running')''',
-            (batch_id,)
-        )
-        remaining = c.fetchone()[0]
+        scraper_log('INFO', 'google_maps', f'batch={batch_id}',
+                    f'Thread finalizada. Total salvo: {total_saved} leads.')
+        print(f"[GOOGLE_MAPS] Thread finalizada. batch={batch_id}, total={total_saved} leads")
 
-        if remaining == 0:
+    except Exception as e:
+        scraper_log('CRITICAL', 'google_maps', f'batch={batch_id}',
+                    f'Erro crítico na thread: {e}', e)
+        print(f"[GOOGLE_MAPS] ERRO CRÍTICO: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# MASSIVE SEARCH PROCESSOR — Local Business Data (RapidAPI)
+# ============================================================
+
+@_persist_thread_errors('local_business_data')
+def process_local_business_data_massive(batch_id, jobs_data, user_id):
+    """
+    Processa jobs via Local Business Data API (RapidAPI).
+    Princípios de resiliência:
+      - Retry 3x com backoff via _massive_retry por job
+      - NUNCA lança exceção para fora — itera todos os jobs até o fim
+      - Se quota excedida, marca restantes como skipped e encerra graciosamente
+      - Loga cada falha no scraper_errors.log
+    Free tier: 500 businesses/month → usa max_results=3 por query.
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[LOCAL_BIZ] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'local_business_data', f'batch={batch_id}',
+                f'Iniciando scraping via RapidAPI Local Business Data. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved    = 0
+        quota_exceeded = False
+
+        for job_idx, job_data in enumerate(jobs_data):
+
+            search_job_id = job_data['search_job_id']
+            niche  = job_data['niche']
+            city   = job_data['city']
+            state  = job_data['state']
+            query  = f"{niche} {city} {state}"
+
+            # Parar graciosamente se quota esgotada (não desperdiçar tentativas)
+            if quota_exceeded:
+                print(f"[LOCAL_BIZ] Quota excedida — marcando job {search_job_id} como skipped")
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', 'quota_exceeded', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+                continue
+
+            print(f"[LOCAL_BIZ] Job {job_idx+1}/{len(jobs_data)}: {query}")
+
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: search_local_business_data(n, ci, s, max_results=3),
+                    provider='local_business_data',
+                    query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(
+                        c, conn, batch_id, result, 'local_business_data', city, state, 'LOCAL_BIZ'
+                    )
+                    total_saved += leads_saved
+                    status  = 'completed'
+                    err_msg = None
+                    print(f"[LOCAL_BIZ] Job {job_idx+1} OK: {leads_saved} leads salvos")
+                    scraper_log('INFO', 'local_business_data', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    leads_saved = 0
+                    status  = 'failed'
+                    err_str = str(err)[:500] if err else 'Sem resultados após 3 tentativas'
+                    err_msg = err_str
+                    # Detectar quota excedida ou config ausente para não desperdiçar chamadas restantes
+                    if err and ('quota' in str(err).lower() or '429' in str(err) or isinstance(err, ConfigError)):
+                        quota_exceeded = True
+                        reason = 'Config ausente (API key)' if isinstance(err, ConfigError) else 'Quota RapidAPI excedida'
+                        scraper_log('WARNING', 'local_business_data', query,
+                                    f'{reason} — parando thread graciosamente')
+                    print(f"[LOCAL_BIZ] Job {job_idx+1} FALHOU: {err_msg}")
+                    scraper_log('WARNING', 'local_business_data', query, f'Job falhou: {err_msg}')
+
+                try:
+                    c.execute(
+                        'UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                        (status, datetime.now(), leads_saved, err_msg, search_job_id)
+                    )
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'local_business_data', query, f'Erro inesperado no job: {e}', e)
+                print(f"[LOCAL_BIZ] Erro inesperado job {search_job_id}: {e}")
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            # Delay menor que Google Maps (API é mais estável)
+            time.sleep(5)
+
+        scraper_log('INFO', 'local_business_data', f'batch={batch_id}',
+                    f'Thread finalizada. Total salvo: {total_saved} leads.')
+        print(f"[LOCAL_BIZ] Thread finalizada. batch={batch_id}, total={total_saved} leads")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'local_business_data', f'batch={batch_id}',
+                    f'Erro crítico na thread: {e}', e)
+        print(f"[LOCAL_BIZ] ERRO CRÍTICO: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# MASSIVE SEARCH PROCESSORS — Diretórios / Instagram / LinkedIn
+# ============================================================
+
+def _massive_retry(fn, provider, query, max_attempts=3):
+    """
+    Retry helper para os processadores massivos.
+    Tenta até max_attempts vezes com backoff exponencial.
+    Nunca lança exceção para fora — SEMPRE retorna (resultado_ou_None, erro_ou_None).
+    Loga cada falha em scraper_errors.log.
+    ConfigError e BlockedError não são retried — falham imediatamente.
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = fn()
+            return result, None
+        except (ConfigError, BlockedError) as exc:
+            # Erros de configuração ou bloqueio — retry não vai resolver
+            scraper_log('ERROR', provider, query,
+                        f'Falha não-retryable (tentativa {attempt}): {exc}', exc)
+            return None, exc
+        except Exception as exc:
+            last_exc = exc
+            scraper_log('WARNING', provider, query,
+                        f'Tentativa {attempt}/{max_attempts} falhou: {exc}', exc)
+            if attempt < max_attempts:
+                wait = 5 * attempt  # 5s, 10s, 15s
+                print(f"[{provider.upper()}] Aguardando {wait}s antes da tentativa {attempt+1}...")
+                time.sleep(wait)
+    # Todas tentativas esgotadas
+    scraper_log('ERROR', provider, query,
+                f'Todas {max_attempts} tentativas falharam. Último erro: {last_exc}', last_exc)
+    return None, last_exc
+
+
+def _save_leads_to_batch(c, conn, batch_id, leads, source, city, state, provider):
+    """Salva lista de leads no batch. Retorna quantidade salva. Nunca lança exceção."""
+    saved = 0
+    now = datetime.now()
+    for lead in leads:
+        try:
+            email = normalize_email(lead.get('email', '')) if lead.get('email') else None
+            phone = lead.get('phone') or None
+            website = lead.get('website') or None
+            address = lead.get('address') or None
+            instagram_url = lead.get('instagram') or None
+            linkedin_url = lead.get('linkedin') or None
+            whatsapp = lead.get('whatsapp') or None
+
+            # Requer pelo menos UM campo de contato real (não aceita leads só com nome)
+            if not email and not phone and not instagram_url and not linkedin_url and not whatsapp:
+                continue
+
+            # Limpar e validar nome da empresa antes de salvar
+            raw_company = lead.get('company_name') or ''
+            company = extract_clean_company_name(raw_company, email=email, website=website)
+            if is_garbage_name(company):
+                company = None
+            company = company or f'Lead {source}'
+
+            # Dedup email placeholder quando não há email real
+            if email:
+                dedup_email = email
+            elif instagram_url:
+                dedup_email = f"ig_{re.sub(r'[^a-z0-9]', '', instagram_url.lower()[-35:])}@instagram.local"
+            elif linkedin_url:
+                dedup_email = f"li_{re.sub(r'[^a-z0-9]', '', linkedin_url.lower()[-35:])}@linkedin.local"
+            elif phone:
+                dedup_email = f"phone_{re.sub(r'[^0-9]', '', phone)[:15]}@{source}.local"
+            else:
+                dedup_email = f"{source}_{re.sub(r'[^a-z0-9]', '', company.lower()[:30])}_{saved}@{source}.local"
+
             c.execute(
-                'UPDATE batches SET status = %s WHERE id = %s',
-                ('completed', batch_id)
+                '''INSERT INTO leads (batch_id, company_name, email, phone, website, address,
+                                      instagram, linkedin, whatsapp, city, state, source, extracted_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (batch_id, email) DO NOTHING''',
+                (batch_id, company, dedup_email, phone, website, address,
+                 instagram_url, linkedin_url, whatsapp, city, state, source, now)
             )
-            conn.commit()
+            # Bug 3 fix: only count rows actually inserted (rowcount=0 means ON CONFLICT skipped)
+            if c.rowcount == 1:
+                saved += 1
+        except Exception as e:
+            print(f"[{provider.upper()}] Erro ao salvar lead: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    return saved
+
+
+@_persist_thread_errors('directories')
+def process_directories_massive(batch_id, jobs_data, user_id):
+    """
+    Background thread: scrape GuiaMais, TeleListas e Apontador para cada nicho/cidade.
+    - Retry 3x por job com backoff exponencial
+    - Log de erros em scraper_errors.log
+    - NUNCA para: sempre itera todos os jobs até o fim
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[DIRECTORIES] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'directories', f'batch={batch_id}',
+                f'Iniciando scraping de diretórios BR. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        session = http_requests.Session()
+        total_saved = 0
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche = job_data['niche']
+            city = job_data['city']
+            state = job_data['state']
+            query = f"{niche} {city} {state}"
+
+            print(f"[DIRECTORIES] Job {job_idx+1}/{len(jobs_data)}: {query}")
+
+            # Nunca para — cada job tem seu próprio try/except independente
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                # Retry automático com backoff
+                result, err = _massive_retry(
+                    lambda: scrape_all_directories(niche, city, state, session),
+                    provider='directories',
+                    query=query
+                )
+
+                if result is not None:
+                    leads, _domains = result
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, leads, 'directories', city, state, 'DIRECTORIES')
+                    total_saved += leads_saved
+                    status = 'completed'
+                    err_msg = None
+                    print(f"[DIRECTORIES] Job {job_idx+1} OK: {leads_saved} leads salvos")
+                    scraper_log('INFO', 'directories', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    # Falhou após 3 tentativas — registra e continua
+                    leads_saved = 0
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados após 3 tentativas'
+                    print(f"[DIRECTORIES] Job {job_idx+1} FALHOU após 3 tentativas: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                # Captura qualquer erro inesperado — não para a thread
+                scraper_log('ERROR', 'directories', query, f'Erro inesperado no job: {e}', e)
+                print(f"[DIRECTORIES] Erro inesperado job {search_job_id}: {e}")
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            # Delay entre jobs — sempre executado mesmo após erro
+            time.sleep(random.uniform(3, 7))
+
+        scraper_log('INFO', 'directories', f'batch={batch_id}',
+                    f'Thread finalizada. Total salvo: {total_saved} leads.')
+        print(f"[DIRECTORIES] Thread finalizada. batch={batch_id}, total={total_saved} leads")
+
+    except Exception as e:
+        # Erro crítico na thread inteira — loga mas não re-raise
+        scraper_log('CRITICAL', 'directories', f'batch={batch_id}',
+                    f'Erro crítico na thread: {e}', e)
+        print(f"[DIRECTORIES] ERRO CRÍTICO: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@_persist_thread_errors('instagram')
+def process_instagram_massive(batch_id, jobs_data, user_id):
+    """
+    Background thread: scrape Instagram Business profiles para cada nicho/cidade.
+    - Retry 3x por job com backoff exponencial
+    - Log de erros em scraper_errors.log
+    - NUNCA para: sempre itera todos os jobs até o fim
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[INSTAGRAM] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'instagram', f'batch={batch_id}',
+                f'Iniciando scraping massivo Instagram. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche = job_data['niche']
+            city = job_data['city']
+            state = job_data['state']
+            query = f"{niche} {city} {state}"
+
+            print(f"[INSTAGRAM] Job {job_idx+1}/{len(jobs_data)}: {query}")
+
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda: scrape_instagram_business(niche, city, state, max_results=30),
+                    provider='instagram',
+                    query=query
+                )
+
+                if result is not None:
+                    leads = result
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, leads, 'instagram', city, state, 'INSTAGRAM')
+                    total_saved += leads_saved
+                    status = 'completed'
+                    err_msg = None
+                    print(f"[INSTAGRAM] Job {job_idx+1} OK: {leads_saved} leads salvos")
+                    scraper_log('INFO', 'instagram', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    leads_saved = 0
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados após 3 tentativas'
+                    print(f"[INSTAGRAM] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'instagram', query, f'Erro inesperado no job: {e}', e)
+                print(f"[INSTAGRAM] Erro inesperado job {search_job_id}: {e}")
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            # Delay longo — Instagram tem rate limiting muito agressivo
+            time.sleep(random.uniform(30, 60))
+
+        scraper_log('INFO', 'instagram', f'batch={batch_id}',
+                    f'Thread finalizada. Total salvo: {total_saved} leads.')
+        print(f"[INSTAGRAM] Thread finalizada. batch={batch_id}, total={total_saved} leads")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'instagram', f'batch={batch_id}',
+                    f'Erro crítico na thread: {e}', e)
+        print(f"[INSTAGRAM] ERRO CRÍTICO: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@_persist_thread_errors('linkedin')
+def process_linkedin_massive(batch_id, jobs_data, user_id):
+    """
+    Background thread: scrape LinkedIn Companies para cada nicho/cidade.
+    - Retry 3x por job com backoff exponencial
+    - Log de erros em scraper_errors.log
+    - NUNCA para: sempre itera todos os jobs até o fim
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[LINKEDIN] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'linkedin', f'batch={batch_id}',
+                f'Iniciando scraping massivo LinkedIn. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche = job_data['niche']
+            city = job_data['city']
+            state = job_data['state']
+            query = f"{niche} {city} {state}"
+
+            print(f"[LINKEDIN] Job {job_idx+1}/{len(jobs_data)}: {query}")
+
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda: scrape_linkedin_companies(niche, city, state, max_results=20),
+                    provider='linkedin',
+                    query=query
+                )
+
+                if result is not None:
+                    leads = result
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, leads, 'linkedin', city, state, 'LINKEDIN')
+                    total_saved += leads_saved
+                    status = 'completed'
+                    err_msg = None
+                    print(f"[LINKEDIN] Job {job_idx+1} OK: {leads_saved} leads salvos")
+                    scraper_log('INFO', 'linkedin', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    leads_saved = 0
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados após 3 tentativas'
+                    print(f"[LINKEDIN] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'linkedin', query, f'Erro inesperado no job: {e}', e)
+                print(f"[LINKEDIN] Erro inesperado job {search_job_id}: {e}")
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            # Delay longo — LinkedIn tem detecção de bot muito agressiva
+            time.sleep(random.uniform(60, 120))
+
+        scraper_log('INFO', 'linkedin', f'batch={batch_id}',
+                    f'Thread finalizada. Total salvo: {total_saved} leads.')
+        print(f"[LINKEDIN] Thread finalizada. batch={batch_id}, total={total_saved} leads")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'linkedin', f'batch={batch_id}',
+                    f'Erro crítico na thread: {e}', e)
+        print(f"[LINKEDIN] ERRO CRÍTICO: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# NEW MASSIVE PROCESSORS — 5 novos métodos
+# ============================================================
+
+@_persist_thread_errors('google_email_harvest')
+def process_google_email_harvest_massive(batch_id, jobs_data, user_id):
+    """Google Email Harvest via Playwright — busca dorks de email no Google."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[GOOGLE_HARVEST] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'google_email_harvest', f'batch={batch_id}',
+                f'Iniciando Google Email Harvest. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche, city, state = job_data['niche'], job_data['city'], job_data['state']
+            query = f"{niche} {city} {state}"
+
+            print(f"[GOOGLE_HARVEST] Job {job_idx+1}/{len(jobs_data)}: {query}")
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: google_email_harvest(n, ci, s, max_results=20),
+                    provider='google_email_harvest', query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'google_email_harvest', city, state, 'GOOGLE_HARVEST')
+                    total_saved += leads_saved
+                    status, err_msg = 'completed', None
+                    print(f"[GOOGLE_HARVEST] Job {job_idx+1} OK: {leads_saved} leads")
+                    scraper_log('INFO', 'google_email_harvest', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados'
+                    print(f"[GOOGLE_HARVEST] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved if result else 0, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'google_email_harvest', query, f'Erro: {e}', e)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(10, 20))
+
+        scraper_log('INFO', 'google_email_harvest', f'batch={batch_id}',
+                    f'Thread finalizada. Total: {total_saved} leads.')
+        print(f"[GOOGLE_HARVEST] Finalizado. batch={batch_id}, total={total_saved}")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'google_email_harvest', f'batch={batch_id}', f'Erro crítico: {e}', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@_persist_thread_errors('website_email_crawler')
+def process_website_email_crawler_massive(batch_id, jobs_data, user_id):
+    """Website Email Crawler — busca DDG + deep crawl de cada site."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[WEB_CRAWLER] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'website_email_crawler', f'batch={batch_id}',
+                f'Iniciando Website Email Crawler. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche, city, state = job_data['niche'], job_data['city'], job_data['state']
+            query = f"{niche} {city} {state}"
+
+            print(f"[WEB_CRAWLER] Job {job_idx+1}/{len(jobs_data)}: {query}")
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: search_and_crawl_for_emails(n, ci, s, max_sites=15),
+                    provider='website_email_crawler', query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'website_email_crawler', city, state, 'WEB_CRAWLER')
+                    total_saved += leads_saved
+                    status, err_msg = 'completed', None
+                    print(f"[WEB_CRAWLER] Job {job_idx+1} OK: {leads_saved} leads")
+                    scraper_log('INFO', 'website_email_crawler', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados'
+                    print(f"[WEB_CRAWLER] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved if result else 0, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'website_email_crawler', query, f'Erro: {e}', e)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(5, 10))
+
+        scraper_log('INFO', 'website_email_crawler', f'batch={batch_id}',
+                    f'Thread finalizada. Total: {total_saved} leads.')
+        print(f"[WEB_CRAWLER] Finalizado. batch={batch_id}, total={total_saved}")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'website_email_crawler', f'batch={batch_id}', f'Erro crítico: {e}', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@_persist_thread_errors('cnpj_open')
+def process_cnpj_open_massive(batch_id, jobs_data, user_id):
+    """OpenCNPJ — busca CNPJs em diretórios e enriquece via API gratuita."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[OPENCNPJ] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'cnpj_open', f'batch={batch_id}',
+                f'Iniciando OpenCNPJ enrichment. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche, city, state = job_data['niche'], job_data['city'], job_data['state']
+            query = f"{niche} {city} {state}"
+
+            print(f"[OPENCNPJ] Job {job_idx+1}/{len(jobs_data)}: {query}")
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: search_opencnpj_by_directory(n, ci, s, max_results=15),
+                    provider='cnpj_open', query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'cnpj_open', city, state, 'OPENCNPJ')
+                    total_saved += leads_saved
+                    status, err_msg = 'completed', None
+                    print(f"[OPENCNPJ] Job {job_idx+1} OK: {leads_saved} leads")
+                    scraper_log('INFO', 'cnpj_open', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados'
+                    print(f"[OPENCNPJ] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved if result else 0, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'cnpj_open', query, f'Erro: {e}', e)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(3, 6))
+
+        scraper_log('INFO', 'cnpj_open', f'batch={batch_id}',
+                    f'Thread finalizada. Total: {total_saved} leads.')
+        print(f"[OPENCNPJ] Finalizado. batch={batch_id}, total={total_saved}")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'cnpj_open', f'batch={batch_id}', f'Erro crítico: {e}', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@_persist_thread_errors('serper_google')
+def process_serper_google_massive(batch_id, jobs_data, user_id):
+    """Serper.dev — Google Search API (2500 buscas grátis/mês)."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[SERPER] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'serper_google', f'batch={batch_id}',
+                f'Iniciando Serper Google Search. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+        quota_exceeded = False
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche, city, state = job_data['niche'], job_data['city'], job_data['state']
+            query = f"{niche} {city} {state}"
+
+            if quota_exceeded:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', 'quota_exceeded', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+                continue
+
+            print(f"[SERPER] Job {job_idx+1}/{len(jobs_data)}: {query}")
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: serper_email_search(n, ci, s, max_results=15),
+                    provider='serper_google', query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'serper_google', city, state, 'SERPER')
+                    total_saved += leads_saved
+                    status, err_msg = 'completed', None
+                    print(f"[SERPER] Job {job_idx+1} OK: {leads_saved} leads")
+                    scraper_log('INFO', 'serper_google', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados'
+                    if err and ('quota' in str(err).lower() or '429' in str(err) or isinstance(err, ConfigError)):
+                        quota_exceeded = True
+                    print(f"[SERPER] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved if result else 0, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'serper_google', query, f'Erro: {e}', e)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(2, 4))
+
+        scraper_log('INFO', 'serper_google', f'batch={batch_id}',
+                    f'Thread finalizada. Total: {total_saved} leads.')
+        print(f"[SERPER] Finalizado. batch={batch_id}, total={total_saved}")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'serper_google', f'batch={batch_id}', f'Erro crítico: {e}', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@_persist_thread_errors('apify_maps')
+def process_apify_maps_massive(batch_id, jobs_data, user_id):
+    """Apify Google Maps Scraper — free tier $5/mês (~1250 businesses)."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[APIFY_MAPS] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'apify_maps', f'batch={batch_id}',
+                f'Iniciando Apify Maps. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+        quota_exceeded = False
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche, city, state = job_data['niche'], job_data['city'], job_data['state']
+            query = f"{niche} {city} {state}"
+
+            if quota_exceeded:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', 'quota_exceeded', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+                continue
+
+            print(f"[APIFY_MAPS] Job {job_idx+1}/{len(jobs_data)}: {query}")
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: apify_google_maps_search(n, ci, s, max_results=15),
+                    provider='apify_maps', query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'apify_maps', city, state, 'APIFY_MAPS')
+                    total_saved += leads_saved
+                    status, err_msg = 'completed', None
+                    print(f"[APIFY_MAPS] Job {job_idx+1} OK: {leads_saved} leads")
+                    scraper_log('INFO', 'apify_maps', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados'
+                    if err and ('402' in str(err) or 'crédito' in str(err).lower() or isinstance(err, ConfigError)):
+                        quota_exceeded = True
+                    print(f"[APIFY_MAPS] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved if result else 0, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'apify_maps', query, f'Erro: {e}', e)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(5, 10))
+
+        scraper_log('INFO', 'apify_maps', f'batch={batch_id}',
+                    f'Thread finalizada. Total: {total_saved} leads.')
+        print(f"[APIFY_MAPS] Finalizado. batch={batch_id}, total={total_saved}")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'apify_maps', f'batch={batch_id}', f'Erro crítico: {e}', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@_persist_thread_errors('receita_ws')
+def process_receita_ws_massive(batch_id, jobs_data, user_id):
+    """ReceitaWS — busca empresas ativas via API Receita Federal + enriquece CNPJ."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[RECEITA_WS] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'receita_ws', f'batch={batch_id}',
+                f'Iniciando ReceitaWS search. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche, city, state = job_data['niche'], job_data['city'], job_data['state']
+            query = f"{niche} {city} {state}"
+
+            print(f"[RECEITA_WS] Job {job_idx+1}/{len(jobs_data)}: {query}")
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: search_receita_ws(n, ci, s, max_results=10),
+                    provider='receita_ws', query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'receita_ws', city, state, 'RECEITA_WS')
+                    total_saved += leads_saved
+                    status, err_msg = 'completed', None
+                    print(f"[RECEITA_WS] Job {job_idx+1} OK: {leads_saved} leads")
+                    scraper_log('INFO', 'receita_ws', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados'
+                    print(f"[RECEITA_WS] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved if result else 0, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'receita_ws', query, f'Erro: {e}', e)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            # Rate limit: 3 req/min no search endpoint ReceitaWS
+            time.sleep(random.uniform(20, 25))
+
+        scraper_log('INFO', 'receita_ws', f'batch={batch_id}',
+                    f'Thread finalizada. Total: {total_saved} leads.')
+        print(f"[RECEITA_WS] Finalizado. batch={batch_id}, total={total_saved}")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'receita_ws', f'batch={batch_id}', f'Erro crítico: {e}', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@_persist_thread_errors('olx_ads')
+def process_olx_ads_massive(batch_id, jobs_data, user_id):
+    """OLX Ads — scrapa anúncios de serviços no OLX para extrair WhatsApp/telefone."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[OLX_ADS] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'olx_ads', f'batch={batch_id}',
+                f'Iniciando OLX Ads scraping. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche, city, state = job_data['niche'], job_data['city'], job_data['state']
+            query = f"{niche} {city} {state}"
+
+            print(f"[OLX_ADS] Job {job_idx+1}/{len(jobs_data)}: {query}")
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: scrape_olx_ads(n, ci, s, max_results=20),
+                    provider='olx_ads', query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'olx_ads', city, state, 'OLX_ADS')
+                    total_saved += leads_saved
+                    status, err_msg = 'completed', None
+                    print(f"[OLX_ADS] Job {job_idx+1} OK: {leads_saved} leads")
+                    scraper_log('INFO', 'olx_ads', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados'
+                    print(f"[OLX_ADS] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved if result else 0, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'olx_ads', query, f'Erro: {e}', e)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(5, 10))
+
+        scraper_log('INFO', 'olx_ads', f'batch={batch_id}',
+                    f'Thread finalizada. Total: {total_saved} leads.')
+        print(f"[OLX_ADS] Finalizado. batch={batch_id}, total={total_saved}")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'olx_ads', f'batch={batch_id}', f'Erro crítico: {e}', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@_persist_thread_errors('whatsapp_dorks')
+def process_whatsapp_dorks_massive(batch_id, jobs_data, user_id):
+    """WhatsApp Dorks — descobre números WhatsApp via Serper dorks."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[WA_DORKS] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'whatsapp_dorks', f'batch={batch_id}',
+                f'Iniciando WhatsApp Dorks. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved = 0
+        quota_exceeded = False
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche, city, state = job_data['niche'], job_data['city'], job_data['state']
+            query = f"{niche} {city} {state}"
+
+            if quota_exceeded:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', 'quota_exceeded', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+                continue
+
+            print(f"[WA_DORKS] Job {job_idx+1}/{len(jobs_data)}: {query}")
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda n=niche, ci=city, s=state: search_whatsapp_dorks(n, ci, s, max_results=15),
+                    provider='whatsapp_dorks', query=query
+                )
+
+                if result is not None:
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, result, 'whatsapp_dorks', city, state, 'WA_DORKS')
+                    total_saved += leads_saved
+                    status, err_msg = 'completed', None
+                    print(f"[WA_DORKS] Job {job_idx+1} OK: {leads_saved} leads")
+                    scraper_log('INFO', 'whatsapp_dorks', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    status = 'failed'
+                    err_msg = str(err)[:500] if err else 'Sem resultados'
+                    if err and ('429' in str(err) or 'quota' in str(err).lower() or isinstance(err, ConfigError)):
+                        quota_exceeded = True
+                    print(f"[WA_DORKS] Job {job_idx+1} FALHOU: {err_msg}")
+
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                              (status, datetime.now(), leads_saved if result else 0, err_msg, search_job_id))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'whatsapp_dorks', query, f'Erro: {e}', e)
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(3, 6))
+
+        scraper_log('INFO', 'whatsapp_dorks', f'batch={batch_id}',
+                    f'Thread finalizada. Total: {total_saved} leads.')
+        print(f"[WA_DORKS] Finalizado. batch={batch_id}, total={total_saved}")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'whatsapp_dorks', f'batch={batch_id}', f'Erro crítico: {e}', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -5406,10 +11913,25 @@ def enrich_with_external_apis():
     company_name = data.get('company_name', '').strip()
     domain = data.get('domain', '').strip()
 
-    # API keys (can be stored in DB or env vars)
-    apollo_key = os.environ.get('APOLLO_API_KEY')
-    pdl_key = os.environ.get('PDL_API_KEY')
-    findthatlead_key = os.environ.get('FINDTHATLEAD_API_KEY')
+    # API keys with fallback: env -> AWS -> cache local -> DB
+    apollo_key = resolve_secret_value(
+        'APOLLO_API_KEY',
+        secret_ids=['extratordedados/prod'],
+        env_keys=['APOLLO_API_KEY'],
+        db_provider='apollo',
+    )
+    pdl_key = resolve_secret_value(
+        'PDL_API_KEY',
+        secret_ids=['extratordedados/prod'],
+        env_keys=['PDL_API_KEY'],
+        db_provider='pdl',
+    )
+    findthatlead_key = resolve_secret_value(
+        'FINDTHATLEAD_API_KEY',
+        secret_ids=['extratordedados/prod'],
+        env_keys=['FINDTHATLEAD_API_KEY'],
+        db_provider='findthatlead',
+    )
 
     results = []
 
@@ -5443,8 +11965,27 @@ Add this code to app.py after line ~300 (after DB connection pool setup)
 # ============= Alexandre Queiroz API Sync =============
 
 ALEXANDREQUEIROZ_API = 'https://api.alexandrequeiroz.com.br'
-ALEXANDREQUEIROZ_EMAIL = 'admin@alexandrequeiroz.com.br'
-ALEXANDREQUEIROZ_PASSWORD = '1982Xandeq1982#'
+
+def _load_crm_credentials():
+    """Load CRM credentials with fallback: env -> AWS -> cache local."""
+    email = resolve_secret_value(
+        'CRM_EMAIL',
+        secret_ids=['extratordedados/prod'],
+        env_keys=['CRM_EMAIL'],
+        default='admin@alexandrequeiroz.com.br',
+    )
+    password = resolve_secret_value(
+        'CRM_PASS',
+        secret_ids=['extratordedados/prod'],
+        env_keys=['CRM_PASS'],
+        default='',
+    )
+    if password:
+        return email, password
+    print("[SYNC] CRM credentials unavailable in env, AWS, and local cache")
+    return email, password
+
+ALEXANDREQUEIROZ_EMAIL, ALEXANDREQUEIROZ_PASSWORD = _load_crm_credentials()
 
 # Global token cache (expires in 6 hours)
 _alexandrequeiroz_token = None
@@ -5494,10 +12035,16 @@ def sync_lead_to_alexandrequeiroz(lead_data):
     if not token:
         return False, "Failed to obtain API token", None
 
+    # Sanitize before sending to CRM
+    sanitized, issues, has_contact = sanitize_single_lead(lead_data)
+    if not has_contact:
+        return False, f"Lead descartado: {'; '.join(issues[:3])}", None
+    lead_data = sanitized
+
     # Extract and validate data
     email = (lead_data.get('email') or '').strip()
     if not email or '@' not in email:
-        return False, "Invalid email", None
+        return False, "Email inválido após sanitização", None
 
     company_name = lead_data.get('company_name') or lead_data.get('name') or 'Lead sem nome'
     phone = lead_data.get('phone') or None
@@ -5535,7 +12082,7 @@ def sync_lead_to_alexandrequeiroz(lead_data):
     try:
         # First, check if lead already exists (GET with email filter)
         check_response = http_requests.get(
-            f'{ALEXANDREQUEIROZ_API}/api/v1/customers',
+            f'{ALEXANDREQUEIROZ_API}/api/v1/leads',
             headers=headers,
             params={'search': email, 'pageSize': 1},
             timeout=10
@@ -5555,7 +12102,7 @@ def sync_lead_to_alexandrequeiroz(lead_data):
 
         # Lead doesn't exist, create it
         create_response = http_requests.post(
-            f'{ALEXANDREQUEIROZ_API}/api/v1/customers',
+            f'{ALEXANDREQUEIROZ_API}/api/v1/leads',
             headers=headers,
             json=payload,
             timeout=15
@@ -5606,6 +12153,227 @@ def sync_leads_batch_to_alexandrequeiroz(leads_list, max_leads=100):
     return synced, skipped, errors
 
 
+@_persist_thread_errors('monitor')
+def _monitor_batch_completion(batch_id):
+    """
+    Bug 4 fix: Background thread that polls search_jobs and marks the batch as
+    'completed' once every job reaches a terminal state (completed/failed/quota_exceeded).
+    This allows auto_sync_new_leads_background to detect completion and proceed.
+    """
+    print(f"[MONITOR] Watching batch {batch_id} for completion")
+    conn = psycopg2.connect(**DB_CONFIG)
+    c = conn.cursor()
+    try:
+        terminal = ('completed', 'failed', 'quota_exceeded')
+        max_wait = 1800  # 30 minutes max
+        elapsed = 0
+        while elapsed < max_wait:
+            time.sleep(15)
+            elapsed += 15
+            c.execute(
+                "SELECT COUNT(*) FROM search_jobs WHERE batch_id=%s AND status NOT IN %s",
+                (batch_id, terminal)
+            )
+            row = c.fetchone()
+            if row and row[0] == 0:
+                # All jobs done → mark batch completed
+                try:
+                    c.execute(
+                        "UPDATE batches SET status='completed' WHERE id=%s AND status='processing'",
+                        (batch_id,)
+                    )
+                    conn.commit()
+                    print(f"[MONITOR] Batch {batch_id} marked as completed")
+                except Exception as e:
+                    print(f"[MONITOR] Error marking batch completed: {e}")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                return
+        print(f"[MONITOR] Timeout waiting for batch {batch_id} — marking completed anyway")
+        try:
+            c.execute(
+                "UPDATE batches SET status='completed' WHERE id=%s AND status='processing'",
+                (batch_id,)
+            )
+            conn.commit()
+        except Exception as e:
+            print(f"[MONITOR] Error on timeout completion: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[MONITOR] Monitor thread error for batch {batch_id}: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def auto_sanitize_background(batch_id):
+    """
+    Background thread: aguarda o batch completar, sanitiza os leads e em seguida
+    dispara o auto_sync_new_leads_background.
+    Substitui o antigo sync_thread direto — pipeline: sanitize → sync.
+    """
+    print(f"[SANITIZE] Starting auto-sanitize for batch {batch_id}")
+    time.sleep(5)
+
+    conn = psycopg2.connect(**DB_CONFIG)
+    c = conn.cursor()
+
+    try:
+        # Aguarda até 15 min pelo batch completar
+        max_wait = 900
+        elapsed = 0
+        while elapsed < max_wait:
+            c.execute('SELECT status FROM batches WHERE id = %s', (batch_id,))
+            row = c.fetchone()
+            if not row:
+                print(f"[SANITIZE] Batch {batch_id} not found, aborting")
+                return
+            status = row[0]
+            if status == 'completed':
+                break
+            elif status == 'failed':
+                print(f"[SANITIZE] Batch {batch_id} failed, aborting sanitize")
+                return
+            time.sleep(10)
+            elapsed += 10
+
+        # Busca todos os leads do batch
+        c.execute(
+            '''SELECT id, company_name, email, phone, website, address,
+                      city, state, source, instagram, linkedin, facebook,
+                      whatsapp, cnpj, contact_name, notes, crm_status,
+                      quality_score, batch_id
+               FROM leads
+               WHERE batch_id = %s
+               ORDER BY id''',
+            (batch_id,)
+        )
+        rows = c.fetchall()
+        if not rows:
+            print(f"[SANITIZE] No leads found for batch {batch_id}, skipping")
+        else:
+            cols = ['id', 'company_name', 'email', 'phone', 'website', 'address',
+                    'city', 'state', 'source', 'instagram', 'linkedin', 'facebook',
+                    'whatsapp', 'cnpj', 'contact_name', 'notes', 'crm_status',
+                    'quality_score', 'batch_id']
+            leads_raw = [dict(zip(cols, row)) for row in rows]
+            total = len(leads_raw)
+
+            ids_to_delete = []
+            seen_emails = {}
+            domain_counts = {}  # domínio → lista de (lead_id, lead_score)
+            sanitized_leads = []
+
+            # Pass 1: sanitizar cada lead
+            for lead in leads_raw:
+                sanitized, issues, has_contact = sanitize_single_lead(lead)
+                if not has_contact:
+                    ids_to_delete.append(lead['id'])
+                    continue
+                sanitized_leads.append(sanitized)
+
+            # Pass 2: dedup por email exato dentro do batch
+            after_email_dedup = []
+            for sanitized in sanitized_leads:
+                email = (sanitized.get('email') or '').strip().lower()
+                if email:
+                    if email in seen_emails:
+                        existing = seen_emails[email]
+                        existing_score = existing.get('lead_score') or 0
+                        new_score = sanitized.get('lead_score') or 0
+                        if new_score > existing_score:
+                            ids_to_delete.append(existing['id'])
+                            seen_emails[email] = sanitized
+                        else:
+                            ids_to_delete.append(sanitized['id'])
+                        continue
+                    else:
+                        seen_emails[email] = sanitized
+                after_email_dedup.append(sanitized)
+
+            # Pass 3: limite por domínio de email (máx MAX_LEADS_PER_EMAIL_DOMAIN por batch)
+            final_leads = []
+            for sanitized in after_email_dedup:
+                email = (sanitized.get('email') or '').strip().lower()
+                domain = email.split('@')[-1] if '@' in email else '__no_email__'
+                lead_score = sanitized.get('lead_score') or 0
+
+                if domain not in domain_counts:
+                    domain_counts[domain] = []
+                domain_counts[domain].append((sanitized['id'], lead_score, sanitized))
+
+            for domain, entries in domain_counts.items():
+                if domain == '__no_email__' or len(entries) <= MAX_LEADS_PER_EMAIL_DOMAIN:
+                    final_leads.extend(e[2] for e in entries)
+                else:
+                    # Ordenar por score desc, manter os melhores
+                    entries.sort(key=lambda x: x[1], reverse=True)
+                    kept = entries[:MAX_LEADS_PER_EMAIL_DOMAIN]
+                    dropped = entries[MAX_LEADS_PER_EMAIL_DOMAIN:]
+                    final_leads.extend(e[2] for e in kept)
+                    ids_to_delete.extend(e[0] for e in dropped)
+                    print(f"[SANITIZE] Domain limit: {domain} → kept {len(kept)}, dropped {len(dropped)}")
+
+            # Pass 4: atualizar leads válidos (com lead_score numérico)
+            updated = 0
+            for lead in final_leads:
+                try:
+                    c.execute(
+                        '''UPDATE leads SET
+                            company_name = %s, email = %s, phone = %s, website = %s,
+                            address = %s, city = %s, state = %s, contact_name = %s,
+                            quality_score = %s, lead_score = %s
+                           WHERE id = %s''',
+                        (
+                            lead.get('company_name'), lead.get('email'), lead.get('phone'),
+                            lead.get('website'), lead.get('address'), lead.get('city'),
+                            lead.get('state'), lead.get('contact_name'),
+                            lead.get('quality_score'), lead.get('lead_score', 0),
+                            lead['id']
+                        )
+                    )
+                    updated += 1
+                except Exception as e:
+                    print(f"[SANITIZE] Error updating lead {lead['id']}: {e}")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+
+            # Pass 5: deletar leads inválidos/duplicados/excedentes
+            deleted = 0
+            if ids_to_delete:
+                unique_ids = list(set(ids_to_delete))
+                try:
+                    c.execute('DELETE FROM leads WHERE id = ANY(%s)', (unique_ids,))
+                    deleted = len(unique_ids)
+                except Exception as e:
+                    print(f"[SANITIZE] Error deleting leads: {e}")
+
+            conn.commit()
+            print(f"[SANITIZE] ✅ Batch {batch_id}: {total} analisados, {updated} atualizados, {deleted} removidos")
+
+    except Exception as e:
+        print(f"[SANITIZE] ❌ Error in auto-sanitize for batch {batch_id}: {e}")
+    finally:
+        try:
+            c.close()
+            conn.close()
+        except Exception:
+            pass
+
+    # Dispara sync após sanitização
+    auto_sync_new_leads_background(batch_id)
+
+
+@_persist_thread_errors('sync')
 def auto_sync_new_leads_background(batch_id):
     """
     Background thread to automatically sync new leads from a batch
@@ -5693,3 +12461,2036 @@ def auto_sync_new_leads_background(batch_id):
 #
 # Example:
 # threading.Thread(target=auto_sync_new_leads_background, args=(batch_id,), daemon=True).start()
+
+
+@app.route('/api/crm/sync-all', methods=['POST'])
+@limiter.limit("2 per hour")
+def crm_sync_all():
+    """
+    Manual endpoint to sync ALL leads (with email) to alexandrequeiroz.com.br CRM.
+    Checks for duplicates before creating.
+    Runs in background thread to avoid timeout.
+    """
+    user = verify_token(get_auth_header())
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    conn = psycopg2.connect(**DB_CONFIG)
+    c = conn.cursor()
+
+    try:
+        # Count total leads with email
+        c.execute("SELECT COUNT(*) FROM leads WHERE email IS NOT NULL AND email != ''")
+        total = c.fetchone()[0]
+
+        if total == 0:
+            return jsonify({'message': 'No leads with email found', 'total': 0}), 200
+
+        # Fetch all leads with email
+        c.execute(
+            '''SELECT company_name, email, phone, website, city, state, source
+               FROM leads
+               WHERE email IS NOT NULL AND email != ''
+               ORDER BY extracted_at DESC'''
+        )
+        rows = c.fetchall()
+
+        leads_to_sync = [
+            {
+                'company_name': row[0],
+                'email': row[1],
+                'phone': row[2],
+                'website': row[3],
+                'city': row[4],
+                'state': row[5],
+                'source': row[6] or 'extrator-dados',
+            }
+            for row in rows
+        ]
+
+    finally:
+        c.close()
+        conn.close()
+
+    def _run_sync(leads):
+        print(f"[SYNC] Manual sync-all started: {len(leads)} leads")
+        synced, skipped, errors = sync_leads_batch_to_alexandrequeiroz(leads, max_leads=len(leads))
+        print(f"[SYNC] Manual sync-all done: {synced} created, {skipped} skipped, {errors} errors")
+
+    threading.Thread(target=_run_sync, args=(leads_to_sync,), daemon=True).start()
+
+    return jsonify({
+        'message': f'Sync started for {len(leads_to_sync)} leads',
+        'total_leads': len(leads_to_sync),
+        'status': 'running'
+    }), 202
+
+
+@app.route('/api/crm/status', methods=['GET'])
+def crm_status():
+    """Check CRM connection status."""
+    user = verify_token(get_auth_header())
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    token = get_alexandrequeiroz_token()
+    if not token:
+        return jsonify({'connected': False, 'error': 'Failed to authenticate with CRM'}), 200
+
+    try:
+        import requests as _req
+        r = _req.get(
+            f'{ALEXANDREQUEIROZ_API}/api/v1/leads',
+            headers={'Authorization': f'Bearer {token}'},
+            params={'pageSize': 1},
+            timeout=8
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return jsonify({
+                'connected': True,
+                'total_crm_leads': data.get('totalCount', 0),
+                'crm_url': ALEXANDREQUEIROZ_API
+            })
+        else:
+            return jsonify({'connected': False, 'error': f'CRM returned {r.status_code}'})
+    except Exception as e:
+        return jsonify({'connected': False, 'error': str(e)})
+
+
+# ============= Daily Automated Pipeline =============
+
+def _build_massive_search_jobs(batch_id, c, niches, cities_to_search, methods, max_pages, user_id):
+    """Cria search_job records para todos os combos método+nicho+cidade."""
+    api_enrichment_jobs = []
+    search_engine_jobs  = []
+    google_maps_jobs         = []
+    directory_jobs           = []
+    instagram_jobs           = []
+    linkedin_jobs            = []
+    local_business_data_jobs = []
+    google_email_harvest_jobs = []
+    website_email_crawler_jobs = []
+    cnpj_open_jobs           = []
+    serper_google_jobs       = []
+    apify_maps_jobs          = []
+
+    def _insert_job(engine, niche, city_data, source, mp):
+        query = f"{niche} em {city_data['city']}"
+        c.execute(
+            '''INSERT INTO search_jobs
+               (batch_id, user_id, query, engine, niche, city, state,
+                region, max_pages, status, enrichment_source, created_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id''',
+            (batch_id, user_id, query, engine, niche,
+             city_data['city'], city_data['state'], city_data['region'],
+             mp, source, datetime.now())
+        )
+        job_id = c.fetchone()[0]
+        return {'search_job_id': job_id, 'niche': niche,
+                'city': city_data['city'], 'state': city_data['state'], 'query': query}
+
+    if 'api_enrichment' in methods:
+        for niche in niches:
+            for cd in cities_to_search:
+                api_enrichment_jobs.append(_insert_job('api_enrichment', niche, cd, 'hunter+snov', max_pages))
+
+    if 'search_engines' in methods:
+        for niche in niches:
+            for cd in cities_to_search:
+                search_engine_jobs.append(_insert_job('search', niche, cd, 'search_engines', max_pages))
+
+    if 'google_maps' in methods:
+        for niche in niches:
+            for cd in cities_to_search:
+                google_maps_jobs.append(_insert_job('google_maps', niche, cd, 'google_maps', max_pages))
+
+    if 'directories' in methods:
+        for niche in niches[:5]:
+            for cd in cities_to_search[:5]:
+                directory_jobs.append(_insert_job('directories', niche, cd, 'directories', 1))
+
+    if 'instagram' in methods:
+        for niche in niches[:2]:
+            for cd in cities_to_search[:2]:
+                instagram_jobs.append(_insert_job('instagram', niche, cd, 'instagram', 1))
+
+    if 'linkedin' in methods:
+        for niche in niches[:2]:
+            for cd in cities_to_search[:2]:
+                linkedin_jobs.append(_insert_job('linkedin', niche, cd, 'linkedin', 1))
+
+    if 'local_business_data' in methods:
+        for niche in niches[:5]:
+            for cd in cities_to_search[:3]:
+                local_business_data_jobs.append(
+                    _insert_job('local_business_data', niche, cd, 'local_business_data', 1)
+                )
+
+    if 'google_email_harvest' in methods:
+        for niche in niches[:3]:
+            for cd in cities_to_search[:3]:
+                google_email_harvest_jobs.append(
+                    _insert_job('google_email_harvest', niche, cd, 'google_email_harvest', 1)
+                )
+
+    if 'website_email_crawler' in methods:
+        for niche in niches[:5]:
+            for cd in cities_to_search[:5]:
+                website_email_crawler_jobs.append(
+                    _insert_job('website_email_crawler', niche, cd, 'website_email_crawler', 1)
+                )
+
+    if 'cnpj_open' in methods:
+        for niche in niches[:3]:
+            for cd in cities_to_search[:3]:
+                cnpj_open_jobs.append(
+                    _insert_job('cnpj_open', niche, cd, 'cnpj_open', 1)
+                )
+
+    if 'serper_google' in methods:
+        for niche in niches[:5]:
+            for cd in cities_to_search[:3]:
+                serper_google_jobs.append(
+                    _insert_job('serper_google', niche, cd, 'serper_google', 1)
+                )
+
+    if 'apify_maps' in methods:
+        for niche in niches[:3]:
+            for cd in cities_to_search[:2]:
+                apify_maps_jobs.append(
+                    _insert_job('apify_maps', niche, cd, 'apify_maps', 1)
+                )
+
+    return {
+        'api_enrichment':       api_enrichment_jobs,
+        'search_engines':       search_engine_jobs,
+        'google_maps':          google_maps_jobs,
+        'directories':          directory_jobs,
+        'instagram':            instagram_jobs,
+        'linkedin':             linkedin_jobs,
+        'local_business_data':  local_business_data_jobs,
+        'google_email_harvest': google_email_harvest_jobs,
+        'website_email_crawler': website_email_crawler_jobs,
+        'cnpj_open':            cnpj_open_jobs,
+        'serper_google':        serper_google_jobs,
+        'apify_maps':           apify_maps_jobs,
+    }
+
+
+def run_daily_pipeline(daily_job_id, niches, region_id, cities_to_search):
+    """
+    Pipeline completo diário:
+      1. Cria batch e roda busca massiva (6 métodos em paralelo)
+      2. Aguarda conclusão (max 8h, poll 60s)
+      3. Sanitiza todos os leads do batch
+      4. Sync para api.alexandrequeiroz.com.br (sem duplicar)
+      5. Atualiza daily_jobs com resultado
+    """
+    print(f"\n[DAILY] ======= Pipeline iniciado (id={daily_job_id}) =======")
+    methods    = ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'local_business_data', 'google_email_harvest', 'website_email_crawler', 'cnpj_open']
+    max_pages  = 2
+    user_id    = DAILY_JOB_USER_ID
+    batch_name = f'Pipeline Diário - {region_id} - {datetime.now().strftime("%Y-%m-%d")}'
+
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    c = conn.cursor()
+
+    try:
+        # ── 1. Criar batch ────────────────────────────────────────────────
+        n_dirs   = min(5, len(niches))
+        n_cities = min(5, len(cities_to_search))
+        n_ig_li  = min(2, len(niches)) * min(2, len(cities_to_search))
+        n_email_harvest = min(3, len(niches)) * min(3, len(cities_to_search))
+        n_web_crawler   = min(5, len(niches)) * min(5, len(cities_to_search))
+        n_cnpj_open     = min(3, len(niches)) * min(3, len(cities_to_search))
+        total_jobs = (len(niches) * len(cities_to_search) * 3 +
+                      n_dirs * n_cities +
+                      n_ig_li * 2 +
+                      n_email_harvest + n_web_crawler + n_cnpj_open)
+
+        c.execute(
+            'INSERT INTO batches (user_id, name, status, total_urls, created_at) '
+            'VALUES (%s,%s,%s,%s,%s) RETURNING id',
+            (user_id, batch_name, 'pending', total_jobs, datetime.now())
+        )
+        batch_id = c.fetchone()[0]
+        c.execute('UPDATE daily_jobs SET batch_id=%s WHERE id=%s', (batch_id, daily_job_id))
+        print(f"[DAILY] Batch criado: batch_id={batch_id}, jobs={total_jobs}")
+
+        # ── 2. Criar search_job records e iniciar threads ────────────────
+        jobs = _build_massive_search_jobs(batch_id, c, niches, cities_to_search, methods, max_pages, user_id)
+        c.execute("UPDATE batches SET status='processing' WHERE id=%s", (batch_id,))
+
+        if jobs['api_enrichment']:
+            threading.Thread(target=process_api_search_job,
+                             args=(batch_id, jobs['api_enrichment'], user_id), daemon=True).start()
+        if jobs['search_engines']:
+            threading.Thread(target=process_search_job,
+                             args=(batch_id, jobs['search_engines'], user_id), daemon=True).start()
+        if jobs['google_maps']:
+            threading.Thread(target=process_google_maps_massive,
+                             args=(batch_id, jobs['google_maps'], user_id, None), daemon=True).start()
+        if jobs['directories']:
+            threading.Thread(target=process_directories_massive,
+                             args=(batch_id, jobs['directories'], user_id), daemon=True).start()
+        if jobs['instagram']:
+            threading.Thread(target=process_instagram_massive,
+                             args=(batch_id, jobs['instagram'], user_id), daemon=True).start()
+        if jobs['linkedin']:
+            threading.Thread(target=process_linkedin_massive,
+                             args=(batch_id, jobs['linkedin'], user_id), daemon=True).start()
+        if jobs['local_business_data']:
+            threading.Thread(target=process_local_business_data_massive,
+                             args=(batch_id, jobs['local_business_data'], user_id), daemon=True).start()
+        if jobs.get('google_email_harvest'):
+            threading.Thread(target=process_google_email_harvest_massive,
+                             args=(batch_id, jobs['google_email_harvest'], user_id), daemon=True).start()
+        if jobs.get('website_email_crawler'):
+            threading.Thread(target=process_website_email_crawler_massive,
+                             args=(batch_id, jobs['website_email_crawler'], user_id), daemon=True).start()
+        if jobs.get('cnpj_open'):
+            threading.Thread(target=process_cnpj_open_massive,
+                             args=(batch_id, jobs['cnpj_open'], user_id), daemon=True).start()
+        if jobs.get('serper_google'):
+            threading.Thread(target=process_serper_google_massive,
+                             args=(batch_id, jobs['serper_google'], user_id), daemon=True).start()
+        if jobs.get('apify_maps'):
+            threading.Thread(target=process_apify_maps_massive,
+                             args=(batch_id, jobs['apify_maps'], user_id), daemon=True).start()
+
+        print(f"[DAILY] Threads iniciadas para batch {batch_id}")
+
+        # ── 3. Aguardar conclusão (max 8h, poll 60s) ──────────────────────
+        max_wait      = 8 * 3600
+        poll_interval = 60
+        waited        = 0
+        while waited < max_wait:
+            time.sleep(poll_interval)
+            waited += poll_interval
+            c.execute('''
+                SELECT
+                    COUNT(*) FILTER (WHERE status IN ('completed','failed')) AS done,
+                    COUNT(*) FILTER (WHERE status IN ('pending','processing')) AS remaining
+                FROM search_jobs WHERE batch_id = %s
+            ''', (batch_id,))
+            done, remaining = c.fetchone()
+            print(f"[DAILY] Batch {batch_id}: done={done}, remaining={remaining} (waited {waited}s)")
+            if remaining == 0:
+                break
+
+        c.execute(
+            'UPDATE batches SET status=%s, updated_at=NOW() WHERE id=%s',
+            ('completed', batch_id)
+        )
+
+        # ── 4. Contar leads ───────────────────────────────────────────────
+        c.execute('SELECT COUNT(*) FROM leads WHERE batch_id=%s', (batch_id,))
+        leads_found = c.fetchone()[0]
+        c.execute('UPDATE daily_jobs SET leads_found=%s WHERE id=%s', (leads_found, daily_job_id))
+        print(f"[DAILY] Leads encontrados: {leads_found}")
+
+        # ── 5. Sanitizar leads do batch ───────────────────────────────────
+        print(f"[DAILY] Sanitizando leads do batch {batch_id}...")
+        c.execute('''
+            SELECT id, company_name, email, phone, website, city, state,
+                   category, source, instagram, facebook, linkedin, twitter,
+                   whatsapp, cnpj, address, contact_name, quality_score, extra_data
+            FROM leads WHERE batch_id = %s
+        ''', (batch_id,))
+        _cols = ['id','company_name','email','phone','website','city','state',
+                 'category','source','instagram','facebook','linkedin','twitter',
+                 'whatsapp','cnpj','address','contact_name','quality_score','extra_data']
+        leads_rows = c.fetchall()
+
+        ids_to_delete = []
+        seen_emails   = {}
+        sanitized_count = 0
+
+        for row in leads_rows:
+            lead    = dict(zip(_cols, row))
+            lead_id = lead['id']
+            sanitized, _, has_contact = sanitize_single_lead(lead)
+
+            if not has_contact:
+                ids_to_delete.append(lead_id)
+                continue
+
+            norm_email = (sanitized.get('email') or '').lower().strip()
+            if norm_email and norm_email in seen_emails:
+                ids_to_delete.append(lead_id)
+                continue
+            if norm_email:
+                seen_emails[norm_email] = lead_id
+
+            new_score, _, _ = calculate_email_quality_score(sanitized.get('email') or '')
+            try:
+                c.execute('''
+                    UPDATE leads
+                    SET email=%s, phone=%s, website=%s, company_name=%s,
+                        quality_score=%s, updated_at=NOW()
+                    WHERE id=%s
+                ''', (sanitized.get('email'), sanitized.get('phone'),
+                      sanitized.get('website'), sanitized.get('company_name'),
+                      new_score, lead_id))
+                sanitized_count += 1
+            except Exception as upd_err:
+                print(f"[DAILY] Erro ao atualizar lead {lead_id}: {upd_err}")
+
+        if ids_to_delete:
+            c.execute('DELETE FROM leads WHERE id = ANY(%s)', (ids_to_delete,))
+            print(f"[DAILY] Removidos {len(ids_to_delete)} leads inválidos/duplicados")
+
+        c.execute('UPDATE daily_jobs SET leads_sanitized=%s WHERE id=%s', (sanitized_count, daily_job_id))
+        print(f"[DAILY] Sanitização: {sanitized_count} atualizados, {len(ids_to_delete)} removidos")
+
+        # ── 6. Sync para CRM ──────────────────────────────────────────────
+        c.execute('''
+            SELECT id, company_name, email, phone, website, city, state, source
+            FROM leads
+            WHERE batch_id=%s AND email IS NOT NULL AND email != ''
+              AND email NOT LIKE '%%@directory.local'
+              AND email NOT LIKE '%%@instagram.local'
+              AND email NOT LIKE '%%@linkedin.local'
+        ''', (batch_id,))
+        _sync_cols = ['id','company_name','email','phone','website','city','state','source']
+        leads_to_sync = [dict(zip(_sync_cols, r)) for r in c.fetchall()]
+
+        print(f"[DAILY] Sincronizando {len(leads_to_sync)} leads com CRM...")
+        synced, skipped, errors = sync_leads_batch_to_alexandrequeiroz(leads_to_sync, max_leads=len(leads_to_sync))
+        c.execute('UPDATE daily_jobs SET leads_synced=%s, leads_skipped=%s WHERE id=%s',
+                  (synced, skipped, daily_job_id))
+        print(f"[DAILY] CRM sync: {synced} criados, {skipped} já existiam, {errors} erros")
+
+        # ── 7. Marcar como concluído ──────────────────────────────────────
+        c.execute(
+            "UPDATE daily_jobs SET status='completed', finished_at=NOW() WHERE id=%s",
+            (daily_job_id,)
+        )
+        print(f"[DAILY] ======= Pipeline CONCLUÍDO (id={daily_job_id}) =======\n")
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[DAILY] ERRO CRÍTICO: {e}\n{tb}")
+        try:
+            c.execute(
+                "UPDATE daily_jobs SET status='failed', finished_at=NOW(), error_message=%s WHERE id=%s",
+                (str(e)[:500], daily_job_id)
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ============= Daily CRM Sync (09:00 AM) =============
+
+def _run_crm_sync_batch(sync_job_id):
+    """
+    Background thread: synchronize all leads with email to alexandrequeiroz.com.br CRM.
+    Uses batch import endpoint for efficiency.
+    """
+    print(f"[CRM_SYNC] Job {sync_job_id} started")
+    conn = psycopg2.connect(**DB_CONFIG)
+    c = conn.cursor()
+
+    try:
+        # Fetch all leads with email from shared base
+        c.execute(
+            '''SELECT id, company_name, email, phone, website, city, state, contact_name, tags, notes, whatsapp
+               FROM leads l
+               JOIN batches b ON l.batch_id = b.id
+               WHERE l.email IS NOT NULL AND l.email != '' AND b.is_shared = TRUE
+               ORDER BY l.extracted_at DESC LIMIT 5000'''
+        )
+        rows = c.fetchall()
+        leads_total = len(rows)
+        print(f"[CRM_SYNC] Found {leads_total} leads to sync")
+
+        if leads_total == 0:
+            c.execute(
+                "UPDATE crm_sync_logs SET status='completed', finished_at=NOW(), leads_total=0 WHERE id=%s",
+                (sync_job_id,)
+            )
+            conn.commit()
+            return
+
+        # Deduplicate by email
+        seen_emails = {}
+        unique_leads = []
+        for row in rows:
+            email = (row[2] or '').strip().lower()
+            if email and email not in seen_emails:
+                seen_emails[email] = True
+                unique_leads.append({
+                    'id': row[0],
+                    'company_name': row[1],
+                    'email': row[2],
+                    'phone': row[3],
+                    'website': row[4],
+                    'city': row[5],
+                    'state': row[6],
+                    'contact_name': row[7],
+                    'tags': row[8],
+                    'notes': row[9],
+                    'whatsapp': row[10]
+                })
+
+        # Format for CRM import API
+        customers = []
+        for lead in unique_leads:
+            contact_name = lead.get('contact_name') or lead.get('company_name') or 'Lead'
+            email = (lead.get('email') or '').strip()
+            phone = lead.get('phone') or None
+            whatsapp = lead.get('whatsapp') or None
+            company_name = lead.get('company_name') or 'N/A'
+            tags = lead.get('tags') or ''
+            notes = lead.get('notes') or ''
+
+            combined_notes = f"{notes}{',' if notes and tags else ''}{tags}"
+
+            customer = {
+                'name': contact_name[:100],
+                'email': email,
+                'phone': phone,
+                'whatsApp': whatsapp,
+                'companyName': company_name[:100],
+                'notes': combined_notes[:500] if combined_notes else '',
+                'tags': tags
+            }
+            customers.append(customer)
+
+        # Get CRM token
+        token = get_alexandrequeiroz_token()
+        if not token:
+            raise Exception("Failed to obtain CRM authentication token")
+
+        # Prepare payload
+        payload = {
+            'customers': customers,
+            'source': 'ExtractorImport'
+        }
+
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        }
+
+        # Send to CRM API
+        crm_endpoint = f'{ALEXANDREQUEIROZ_API}/api/v1/customers/import'
+        print(f"[CRM_SYNC] Sending {len(customers)} customers to {crm_endpoint}")
+
+        response = http_requests.post(
+            crm_endpoint,
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+
+        if response.status_code in [200, 201, 202]:
+            result = response.json()
+            leads_synced = result.get('created', len(customers))
+            leads_skipped = result.get('skipped', 0)
+            leads_failed = result.get('failed', 0)
+
+            print(f"[CRM_SYNC] ✅ Success: {leads_synced} created, {leads_skipped} skipped, {leads_failed} failed")
+
+            c.execute(
+                '''UPDATE crm_sync_logs
+                   SET status='completed', finished_at=NOW(), leads_total=%s,
+                       leads_synced=%s, leads_skipped=%s, leads_failed=%s
+                   WHERE id=%s''',
+                (len(unique_leads), leads_synced, leads_skipped, leads_failed, sync_job_id)
+            )
+            conn.commit()
+        else:
+            error_msg = response.text[:200] if response.text else f'HTTP {response.status_code}'
+            print(f"[CRM_SYNC] ❌ API error: {error_msg}")
+
+            c.execute(
+                '''UPDATE crm_sync_logs
+                   SET status='failed', finished_at=NOW(), leads_total=%s,
+                       error_message=%s
+                   WHERE id=%s''',
+                (len(unique_leads), error_msg, sync_job_id)
+            )
+            conn.commit()
+
+    except Exception as e:
+        error_str = str(e)[:500]
+        print(f"[CRM_SYNC] ❌ Exception: {error_str}")
+
+        try:
+            c.execute(
+                '''UPDATE crm_sync_logs
+                   SET status='failed', finished_at=NOW(), error_message=%s
+                   WHERE id=%s''',
+                (error_str, sync_job_id)
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def trigger_daily_crm_sync(trigger='scheduled'):
+    """
+    Trigger daily CRM sync (09:00). Guard + insert + thread pattern.
+    trigger: 'scheduled' (automatic) or 'manual' (user-initiated)
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    c = conn.cursor()
+
+    try:
+        # Guard: avoid double-fire (check last 5 minutes)
+        c.execute(
+            "SELECT id FROM crm_sync_logs WHERE started_at > NOW() - INTERVAL '5 minutes' AND status='running'"
+        )
+        if c.fetchone():
+            print("[CRM_SYNC] Already running, skipping")
+            return
+
+        # Insert record
+        c.execute(
+            "INSERT INTO crm_sync_logs (trigger, status) VALUES (%s, 'running') RETURNING id",
+            (trigger,)
+        )
+        sync_job_id = c.fetchone()[0]
+        conn.commit()
+
+    except Exception as e:
+        print(f"[CRM_SYNC] Failed to start: {e}")
+        return
+
+    finally:
+        try:
+            c.close()
+            conn.close()
+        except Exception:
+            pass
+
+    # Spawn daemon thread
+    threading.Thread(target=_run_crm_sync_batch, args=(sync_job_id,), daemon=True).start()
+    print(f"[CRM_SYNC] Daily sync initiated (job {sync_job_id}, trigger={trigger})")
+
+
+def trigger_daily_pipeline(niches=None, region_id=None):
+    """Cria registro daily_job e dispara run_daily_pipeline em background."""
+    niches    = niches    or DAILY_JOB_NICHES
+    region_id = region_id or DAILY_JOB_REGION
+
+    if region_id not in SEARCH_REGIONS:
+        print(f"[DAILY] Região desconhecida: {region_id}")
+        return None
+
+    region_data      = SEARCH_REGIONS[region_id]
+    cities_to_search = [
+        {'city': city, 'state': region_data['state'], 'region': region_id}
+        for city in region_data['cities']
+    ]
+
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            # Guard: evita double-fire quando Gunicorn usa múltiplos workers
+            cur.execute(
+                "SELECT id FROM daily_jobs WHERE started_at > NOW() - INTERVAL '5 minutes'"
+            )
+            if cur.fetchone():
+                print("[DAILY] Job já iniciado por outro worker nos últimos 5 min — abortando.")
+                return None
+            cur.execute(
+                "INSERT INTO daily_jobs (status, niches_used, region_used, started_at) "
+                "VALUES ('running', %s, %s, NOW()) RETURNING id",
+                (niches, region_id)
+            )
+            daily_job_id = cur.fetchone()[0]
+
+        print(f"[DAILY] Pipeline disparado: id={daily_job_id}, região={region_id}, nichos={len(niches)}")
+        threading.Thread(
+            target=run_daily_pipeline,
+            args=(daily_job_id, niches, region_id, cities_to_search),
+            daemon=True
+        ).start()
+        return daily_job_id
+    except Exception as e:
+        print(f"[DAILY] Falha ao disparar: {e}")
+        return None
+
+
+@app.route('/api/admin/daily-job/status', methods=['GET'])
+@limiter.limit("30/minute")
+def daily_job_status():
+    """Retorna histórico dos últimos 10 jobs diários."""
+    user = verify_token(get_auth_header())
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT is_admin FROM users WHERE id=%s', (user,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+        cur.execute('''
+            SELECT id, started_at, finished_at, status, batch_id,
+                   niches_used, region_used, leads_found, leads_sanitized,
+                   leads_synced, leads_skipped, error_message
+            FROM daily_jobs ORDER BY started_at DESC LIMIT 10
+        ''')
+        jobs = []
+        for r in cur.fetchall():
+            jobs.append({
+                'id':              r[0],
+                'started_at':      r[1].isoformat() if r[1] else None,
+                'finished_at':     r[2].isoformat() if r[2] else None,
+                'status':          r[3],
+                'batch_id':        r[4],
+                'niches':          r[5],
+                'region':          r[6],
+                'leads_found':     r[7],
+                'leads_sanitized': r[8],
+                'leads_synced':    r[9],
+                'leads_skipped':   r[10],
+                'error':           r[11],
+            })
+
+    return jsonify({
+        'jobs': jobs,
+        'next_scheduled': f'{DAILY_JOB_HOUR:02d}:00 (America/Sao_Paulo)',
+        'default_region': DAILY_JOB_REGION,
+        'default_niches': DAILY_JOB_NICHES,
+    })
+
+
+@app.route('/api/niches/custom', methods=['GET'])
+@limiter.limit("60/minute")
+def get_custom_niches():
+    """Return all custom niches saved by users. Auth required."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT id, name, created_at FROM custom_niches ORDER BY name ASC')
+        rows = c.fetchall()
+        niches = [{'id': r[0], 'name': r[1], 'created_at': r[2].isoformat() if r[2] else None} for r in rows]
+
+    return jsonify({'niches': niches}), 200
+
+
+@app.route('/api/niches/custom', methods=['POST'])
+@limiter.limit("30/minute")
+def add_custom_niche():
+    """Save a new custom niche. Auth required."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'name é obrigatório'}), 400
+
+    with get_db() as conn:
+        c = conn.cursor()
+        try:
+            c.execute(
+                'INSERT INTO custom_niches (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id',
+                (name,)
+            )
+            row = c.fetchone()
+            conn.commit()
+            niche_id = row[0] if row else None
+        except Exception as e:
+            conn.rollback()
+            return jsonify({'error': str(e)}), 500
+
+    return jsonify({'id': niche_id, 'name': name}), 200 if niche_id is None else 201
+
+
+@app.route('/api/niches/custom/<path:name>', methods=['DELETE'])
+@limiter.limit("30/minute")
+def delete_custom_niche(name):
+    """Delete a custom niche by name. Auth required."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('DELETE FROM custom_niches WHERE LOWER(name) = LOWER(%s)', (name,))
+        conn.commit()
+
+    return jsonify({'deleted': name}), 200
+
+
+@app.route('/api/admin/logs', methods=['GET'])
+@limiter.limit("60/minute")
+def admin_logs():
+    """Return paginated system_logs entries. Admin only."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        row = c.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Forbidden'}), 403
+
+        level   = request.args.get('level', '')
+        provider = request.args.get('provider', '')
+        search  = request.args.get('search', '')
+        error_type = request.args.get('error_type', '')
+        date_from = request.args.get('date_from', '')
+        date_to   = request.args.get('date_to', '')
+        group_by  = request.args.get('group_by', '')  # provider, query, error_type
+        page    = max(1, int(request.args.get('page', 1)))
+        per_page = min(200, max(10, int(request.args.get('per_page', 50))))
+        offset  = (page - 1) * per_page
+
+        conditions = []
+        params: list = []
+
+        if level:
+            conditions.append('level = %s')
+            params.append(level.upper())
+        if provider:
+            conditions.append('provider ILIKE %s')
+            params.append(f'%{provider}%')
+        if search:
+            conditions.append('(message ILIKE %s OR query ILIKE %s OR exception ILIKE %s)')
+            params += [f'%{search}%', f'%{search}%', f'%{search}%']
+        if error_type:
+            conditions.append('error_type = %s')
+            params.append(error_type)
+        if date_from:
+            conditions.append('created_at >= %s')
+            params.append(date_from)
+        if date_to:
+            conditions.append('created_at <= %s')
+            params.append(date_to)
+
+        where = ('WHERE ' + ' AND '.join(conditions)) if conditions else ''
+
+        c.execute(f'SELECT COUNT(*) FROM system_logs {where}', params)
+        total = c.fetchone()[0]
+
+        c.execute(
+            f'''SELECT id, created_at, level, provider, query, message, exception, fix_prompt, error_type, extra_data
+                FROM system_logs {where}
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s''',
+            params + [per_page, offset]
+        )
+        rows = c.fetchall()
+
+        import json as _json
+        logs = []
+        for r in rows:
+            extra = None
+            if r[9]:
+                try:
+                    extra = r[9] if isinstance(r[9], dict) else _json.loads(r[9])
+                except Exception:
+                    extra = None
+            logs.append({
+                'id':         r[0],
+                'created_at': r[1].isoformat() if r[1] else None,
+                'level':      r[2],
+                'provider':   r[3],
+                'query':      r[4],
+                'message':    r[5],
+                'exception':  r[6],
+                'fix_prompt': r[7],
+                'error_type': r[8],
+                'extra_data': extra,
+            })
+
+        # Level counts for summary bar
+        c.execute(
+            '''SELECT level, COUNT(*) FROM system_logs GROUP BY level ORDER BY level'''
+        )
+        level_counts = {row[0]: row[1] for row in c.fetchall()}
+
+        # Error type counts
+        c.execute(
+            '''SELECT error_type, COUNT(*) FROM system_logs WHERE error_type IS NOT NULL GROUP BY error_type ORDER BY COUNT(*) DESC'''
+        )
+        error_type_counts = {row[0]: row[1] for row in c.fetchall()}
+
+        # Provider counts
+        c.execute(
+            '''SELECT provider, COUNT(*) FROM system_logs WHERE provider IS NOT NULL GROUP BY provider ORDER BY COUNT(*) DESC'''
+        )
+        provider_counts = {row[0]: row[1] for row in c.fetchall()}
+
+    return jsonify({
+        'logs':               logs,
+        'total':              total,
+        'page':               page,
+        'per_page':           per_page,
+        'total_pages':        (total + per_page - 1) // per_page,
+        'level_counts':       level_counts,
+        'error_type_counts':  error_type_counts,
+        'provider_counts':    provider_counts,
+    })
+
+
+@app.route('/api/admin/logs', methods=['DELETE'])
+@limiter.limit("5/hour")
+def admin_logs_delete_all():
+    """Delete ALL system_logs entries. Admin only."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        row = c.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Forbidden'}), 403
+
+        c.execute('SELECT COUNT(*) FROM system_logs')
+        total = c.fetchone()[0]
+        c.execute('TRUNCATE TABLE system_logs')
+        conn.commit()
+
+    return jsonify({'message': f'{total} logs excluidos', 'deleted': total})
+
+
+@app.route('/api/admin/daily-job/run', methods=['POST'])
+@limiter.limit("2/hour")
+def daily_job_run():
+    """Dispara o pipeline diário manualmente."""
+    user = verify_token(get_auth_header())
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT is_admin FROM users WHERE id=%s', (user,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+    data      = request.get_json() or {}
+    niches    = data.get('niches')    or DAILY_JOB_NICHES
+    region_id = data.get('region')    or DAILY_JOB_REGION
+
+    daily_job_id = trigger_daily_pipeline(niches=niches, region_id=region_id)
+    if not daily_job_id:
+        return jsonify({'error': 'Falha ao iniciar pipeline'}), 500
+
+    return jsonify({
+        'message':      'Pipeline diário iniciado',
+        'daily_job_id': daily_job_id,
+        'niches_count': len(niches),
+        'region':       region_id,
+        'status':       'running',
+    }), 202
+
+
+@app.route('/api/crm/refine', methods=['POST'])
+@limiter.limit("2/hour")
+def crm_refine():
+    """
+    Sanitiza todos os leads com email e sincroniza com o CRM,
+    eliminando inválidos e duplicados. Roda em background.
+    """
+    user = verify_token(get_auth_header())
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT is_admin FROM users WHERE id=%s', (user,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+    def _run_refine():
+        print("[CRM_REFINE] Iniciando refinamento de leads...")
+        rconn = psycopg2.connect(**DB_CONFIG)
+        rconn.autocommit = True
+        rc = rconn.cursor()
+        try:
+            rc.execute('''
+                SELECT id, company_name, email, phone, website, city, state,
+                       category, source, instagram, facebook, linkedin, twitter,
+                       whatsapp, cnpj, address, contact_name, quality_score, extra_data
+                FROM leads
+                WHERE email IS NOT NULL AND email != ''
+                  AND email NOT LIKE '%%@directory.local'
+                  AND email NOT LIKE '%%@instagram.local'
+                  AND email NOT LIKE '%%@linkedin.local'
+                ORDER BY quality_score DESC NULLS LAST
+            ''')
+            _cols = ['id','company_name','email','phone','website','city','state',
+                     'category','source','instagram','facebook','linkedin','twitter',
+                     'whatsapp','cnpj','address','contact_name','quality_score','extra_data']
+            rows         = rc.fetchall()
+            total        = len(rows)
+            san_count    = 0
+            invalid_count = 0
+            seen_emails  = {}
+            to_sync      = []
+
+            for row in rows:
+                lead    = dict(zip(_cols, row))
+                lead_id = lead['id']
+                sanitized, _, has_contact = sanitize_single_lead(lead)
+
+                if not has_contact:
+                    invalid_count += 1
+                    continue
+
+                norm_email = (sanitized.get('email') or '').lower().strip()
+                if norm_email in seen_emails:
+                    invalid_count += 1
+                    continue
+                seen_emails[norm_email] = lead_id
+
+                new_score, _, _ = calculate_email_quality_score(sanitized.get('email') or '')
+                try:
+                    rc.execute('''
+                        UPDATE leads
+                        SET email=%s, phone=%s, website=%s, company_name=%s,
+                            quality_score=%s, updated_at=NOW()
+                        WHERE id=%s
+                    ''', (sanitized.get('email'), sanitized.get('phone'),
+                          sanitized.get('website'), sanitized.get('company_name'),
+                          new_score, lead_id))
+                    san_count += 1
+                except Exception as e:
+                    print(f"[CRM_REFINE] Erro update lead {lead_id}: {e}")
+                to_sync.append(sanitized)
+
+            synced = skipped = 0
+            if to_sync:
+                synced, skipped, _ = sync_leads_batch_to_alexandrequeiroz(to_sync, max_leads=len(to_sync))
+
+            print(f"[CRM_REFINE] Concluído: total={total}, sanitizados={san_count}, "
+                  f"inválidos={invalid_count}, sincronizados={synced}, já existiam={skipped}")
+        except Exception as e:
+            print(f"[CRM_REFINE] ERRO: {e}")
+        finally:
+            rconn.close()
+
+    threading.Thread(target=_run_refine, daemon=True).start()
+    return jsonify({'message': 'Refinamento CRM iniciado em background', 'status': 'running'}), 202
+
+
+# ============= CRM Sync Status & Manual Trigger =============
+
+@app.route('/api/crm/sync-status', methods=['GET'])
+@limiter.limit("30/minute")
+def crm_sync_status():
+    """Get CRM sync history (last 10 executions)"""
+    user = verify_token(get_auth_header())
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('''
+                SELECT id, started_at, finished_at, status, leads_total, leads_synced,
+                       leads_skipped, leads_failed, error_message, trigger
+                FROM crm_sync_logs
+                ORDER BY started_at DESC
+                LIMIT 10
+            ''')
+            rows = c.fetchall()
+
+        syncs = []
+        for row in rows:
+            syncs.append({
+                'id': row[0],
+                'started_at': row[1].isoformat() if row[1] else None,
+                'finished_at': row[2].isoformat() if row[2] else None,
+                'status': row[3],
+                'leads_total': row[4],
+                'leads_synced': row[5],
+                'leads_skipped': row[6],
+                'leads_failed': row[7],
+                'error_message': row[8],
+                'trigger': row[9]
+            })
+
+        return jsonify({
+            'syncs': syncs,
+            'total': len(syncs),
+            'next_sync': f'{DAILY_CRM_SYNC_HOUR:02d}:00 (America/Sao_Paulo)'
+        }), 200
+
+    except Exception as e:
+        print(f'[ERROR] /api/crm/sync-status: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/crm/auto-token', methods=['GET'])
+@limiter.limit("10/minute")
+def crm_auto_token():
+    """
+    Get CRM URL and JWT token automatically.
+    Token is obtained via get_alexandrequeiroz_token() with cache 6h.
+    Used by frontend modal to auto-fill "Enviar para CRM" form.
+    """
+    user = verify_token(get_auth_header())
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        token = get_alexandrequeiroz_token()
+        if not token:
+            return jsonify({'error': 'Não foi possível autenticar no CRM'}), 503
+
+        return jsonify({
+            'crm_url': ALEXANDREQUEIROZ_API,
+            'token': token,
+        }), 200
+
+    except Exception as e:
+        print(f'[ERROR] /api/crm/auto-token: {e}')
+        return jsonify({'error': f'Erro ao obter token: {str(e)[:100]}'}), 500
+
+
+@app.route('/api/crm/sync-now', methods=['POST'])
+@limiter.limit("2/hour")
+def crm_sync_now():
+    """Manually trigger CRM sync (admin only)"""
+    user = verify_token(get_auth_header())
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT is_admin FROM users WHERE id=%s', (user,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+    try:
+        trigger_daily_crm_sync(trigger='manual')
+        return jsonify({
+            'message': 'CRM sync triggered manually',
+            'status': 'running',
+            'trigger': 'manual'
+        }), 202
+
+    except Exception as e:
+        print(f'[ERROR] /api/crm/sync-now: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ============= SaaS: Usage Tracking & Plan Management =============
+
+def _get_current_month_year():
+    """Return current month in 'YYYY-MM' format"""
+    return datetime.now().strftime('%Y-%m')
+
+def _reset_monthly_usage(user_id):
+    """Reset usage tracking for current month if entry doesn't exist"""
+    month_year = _get_current_month_year()
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT id FROM usage_tracking WHERE user_id = %s AND month_year = %s',
+            (user_id, month_year)
+        )
+        if not c.fetchone():
+            c.execute(
+                'INSERT INTO usage_tracking (user_id, month_year, leads_viewed, leads_exported, reset_at) VALUES (%s, %s, 0, 0, %s)',
+                (user_id, month_year, datetime.now())
+            )
+
+def _get_user_plan(user_id):
+    """Get user's current plan (free/pro/enterprise)"""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT plan FROM users WHERE id = %s', (user_id,))
+        result = c.fetchone()
+        return result[0] if result else 'free'
+
+def _get_plan_limits(plan_name):
+    """Get limits for a given plan"""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT leads_per_month, exports_per_month, price_monthly, features FROM plan_limits WHERE plan_name = %s',
+            (plan_name,)
+        )
+        result = c.fetchone()
+        if result:
+            return {
+                'leads_per_month': result[0],
+                'exports_per_month': result[1],
+                'price_monthly': float(result[2]) if result[2] else 0,
+                'features': result[3] if result[3] else {}
+            }
+        return None
+
+def _get_usage_stats(user_id):
+    """Get current month usage stats for a user"""
+    month_year = _get_current_month_year()
+    _reset_monthly_usage(user_id)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            'SELECT leads_viewed, leads_exported FROM usage_tracking WHERE user_id = %s AND month_year = %s',
+            (user_id, month_year)
+        )
+        result = c.fetchone()
+        return {
+            'leads_viewed': result[0] if result else 0,
+            'leads_exported': result[1] if result else 0,
+            'month_year': month_year
+        }
+
+def _is_admin_user(user_id):
+    """Check if user is admin (helper for usage tracking bypass)"""
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (user_id,))
+            row = c.fetchone()
+            return bool(row and row[0])
+    except Exception:
+        return False
+
+def _increment_usage(user_id, field='leads_viewed', amount=1):
+    """Increment usage counter (leads_viewed or leads_exported). Skipped for admins."""
+    if _is_admin_user(user_id):
+        return  # admins have unlimited usage
+    month_year = _get_current_month_year()
+    _reset_monthly_usage(user_id)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        if field == 'leads_viewed':
+            c.execute(
+                'UPDATE usage_tracking SET leads_viewed = leads_viewed + %s WHERE user_id = %s AND month_year = %s',
+                (amount, user_id, month_year)
+            )
+        elif field == 'leads_exported':
+            c.execute(
+                'UPDATE usage_tracking SET leads_exported = leads_exported + %s WHERE user_id = %s AND month_year = %s',
+                (amount, user_id, month_year)
+            )
+
+@app.route('/api/client/usage', methods=['GET'])
+@limiter.limit("30/minute")
+def client_usage():
+    """Get client's plan and current usage stats"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        plan = _get_user_plan(user_id)
+        limits = _get_plan_limits(plan)
+        usage = _get_usage_stats(user_id)
+
+        return jsonify({
+            'plan': plan,
+            'limits': limits,
+            'usage': usage,
+            'usage_percent': {
+                'leads': (usage['leads_viewed'] / limits['leads_per_month'] * 100) if limits['leads_per_month'] > 0 else 0,
+                'exports': (usage['leads_exported'] / limits['exports_per_month'] * 100) if limits['exports_per_month'] > 0 else 0
+            }
+        }), 200
+    except Exception as e:
+        print(f'[ERROR] /api/client/usage: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/users', methods=['GET'])
+@limiter.limit("30/minute")
+def admin_users():
+    """Get all users and their plans (admin only)"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        # Check if user is admin
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (user_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            # Get all users with their plans
+            c.execute('SELECT id, username, plan, created_at, is_admin FROM users ORDER BY created_at DESC')
+            users = []
+            for row in c.fetchall():
+                usage = _get_usage_stats(row[0])
+                limits = _get_plan_limits(row[2])
+                users.append({
+                    'id': row[0],
+                    'username': row[1],
+                    'plan': row[2],
+                    'created_at': row[3].isoformat() if row[3] else None,
+                    'is_admin': bool(row[4]),
+                    'usage': usage,
+                    'limits': limits
+                })
+
+            return jsonify({'users': users, 'total': len(users)}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/users: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/summary', methods=['GET'])
+@limiter.limit("30/minute")
+def admin_summary():
+    """Quick summary stats for the admin home page."""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            c.execute('SELECT COUNT(*) FROM users')
+            total_users = c.fetchone()[0]
+
+            c.execute('SELECT COUNT(*) FROM users WHERE is_admin = TRUE')
+            total_admins = c.fetchone()[0]
+
+            c.execute('SELECT plan, COUNT(*) FROM users GROUP BY plan')
+            users_by_plan = {row[0]: row[1] for row in c.fetchall()}
+
+            c.execute('''SELECT COUNT(*) FROM leads l
+                         JOIN batches b ON l.batch_id = b.id
+                         WHERE b.is_shared = TRUE''')
+            total_leads = c.fetchone()[0]
+
+            # Leads added this week
+            week_ago = datetime.now() - timedelta(days=7)
+            c.execute('''SELECT COUNT(*) FROM leads l
+                         JOIN batches b ON l.batch_id = b.id
+                         WHERE b.is_shared = TRUE AND l.extracted_at >= %s''', (week_ago,))
+            leads_this_week = c.fetchone()[0]
+
+        return jsonify({
+            'total_users': total_users,
+            'total_admins': total_admins,
+            'total_customers': total_users - total_admins,
+            'users_by_plan': users_by_plan,
+            'total_leads': total_leads,
+            'leads_this_week': leads_this_week,
+        }), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/summary: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/batches', methods=['GET'])
+@limiter.limit("30/minute")
+def admin_list_batches():
+    """List all batches (admin only) — for the admin base-management view."""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            c.execute('''
+                SELECT b.id, b.name, b.status, b.total_urls, b.processed_urls,
+                       b.total_leads, b.created_at, b.finished_at, b.is_shared,
+                       COUNT(l.id) as lead_count
+                FROM batches b
+                LEFT JOIN leads l ON l.batch_id = b.id
+                GROUP BY b.id, b.name, b.status, b.total_urls, b.processed_urls,
+                         b.total_leads, b.created_at, b.finished_at, b.is_shared
+                ORDER BY b.created_at DESC
+                LIMIT 50
+            ''')
+            batches = []
+            for row in c.fetchall():
+                batches.append({
+                    'id': row[0],
+                    'name': row[1],
+                    'status': row[2],
+                    'total_urls': row[3],
+                    'processed_urls': row[4],
+                    'total_leads': row[5],
+                    'created_at': row[6].isoformat() if row[6] else None,
+                    'finished_at': row[7].isoformat() if row[7] else None,
+                    'is_shared': bool(row[8]) if row[8] is not None else True,
+                    'lead_count': row[9],
+                })
+            return jsonify({'batches': batches}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/batches: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/batches/<int:batch_id>/publish', methods=['PUT'])
+@limiter.limit("30/minute")
+def admin_publish_batch(batch_id):
+    """Publish a batch to the shared base (admin only)."""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+            c.execute('UPDATE batches SET is_shared = TRUE WHERE id = %s', (batch_id,))
+            if c.rowcount == 0:
+                return jsonify({'error': 'Batch not found'}), 404
+            return jsonify({'success': True, 'batch_id': batch_id, 'is_shared': True}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/batches/{batch_id}/publish: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/batches/<int:batch_id>/unpublish', methods=['PUT'])
+@limiter.limit("30/minute")
+def admin_unpublish_batch(batch_id):
+    """Remove a batch from the shared base (admin only)."""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+            c.execute('UPDATE batches SET is_shared = FALSE WHERE id = %s', (batch_id,))
+            if c.rowcount == 0:
+                return jsonify({'error': 'Batch not found'}), 404
+            return jsonify({'success': True, 'batch_id': batch_id, 'is_shared': False}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/batches/{batch_id}/unpublish: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/users/<int:user_id>/plan', methods=['PUT'])
+@limiter.limit("30/minute")
+def admin_update_user_plan(user_id):
+    """Update a user's plan (admin only)"""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        # Check if requester is admin
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            # Validate new plan exists
+            data = request.get_json() or {}
+            new_plan = data.get('plan', 'free').lower()
+
+            c.execute('SELECT plan_name FROM plan_limits WHERE plan_name = %s', (new_plan,))
+            if not c.fetchone():
+                return jsonify({'error': f'Invalid plan: {new_plan}'}), 400
+
+            # Update user's plan
+            c.execute('UPDATE users SET plan = %s WHERE id = %s', (new_plan, user_id))
+
+            return jsonify({'message': f'User {user_id} plan updated to {new_plan}', 'new_plan': new_plan}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/users/{user_id}/plan: {e}')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/plans', methods=['GET'])
+@limiter.limit("30/minute")
+def admin_plans():
+    """Get all available plans (admin only)"""
+    try:
+        token = get_auth_header()
+        user_id = verify_token(token)
+        if not user_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        # Check if user is admin
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (user_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            # Get all plans
+            c.execute('SELECT plan_name, leads_per_month, exports_per_month, price_monthly, features FROM plan_limits ORDER BY price_monthly ASC')
+            plans = []
+            for row in c.fetchall():
+                plans.append({
+                    'name': row[0],
+                    'leads_per_month': row[1],
+                    'exports_per_month': row[2],
+                    'price_monthly': float(row[3]) if row[3] else 0,
+                    'features': row[4] if row[4] else {}
+                })
+
+            return jsonify({'plans': plans}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/plans: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/plans-stats', methods=['GET'])
+def admin_plans_stats():
+    """Get plans with user counts (admin only)"""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            c.execute('''
+                SELECT
+                    pl.plan_name,
+                    pl.leads_per_month,
+                    pl.exports_per_month,
+                    pl.price_monthly,
+                    pl.features,
+                    COUNT(u.id) AS user_count
+                FROM plan_limits pl
+                LEFT JOIN users u ON u.plan = pl.plan_name
+                GROUP BY pl.plan_name, pl.leads_per_month, pl.exports_per_month, pl.price_monthly, pl.features
+                ORDER BY pl.price_monthly ASC
+            ''')
+            plans = []
+            for row in c.fetchall():
+                plans.append({
+                    'name': row[0],
+                    'leads_per_month': row[1],
+                    'exports_per_month': row[2],
+                    'price_monthly': float(row[3]) if row[3] else 0,
+                    'features': row[4] if row[4] else {},
+                    'user_count': row[5]
+                })
+
+            return jsonify({'plans': plans}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/plans-stats: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/plans/<plan_name>', methods=['PUT'])
+def admin_update_plan(plan_name):
+    """Update plan limits (admin only)"""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            # Validate plan name
+            valid_plans = ['free', 'pro', 'enterprise']
+            if plan_name not in valid_plans:
+                return jsonify({'error': 'Invalid plan name'}), 400
+
+            data = request.json or {}
+            allowed_fields = ['leads_per_month', 'exports_per_month', 'price_monthly']
+            updates = {k: v for k, v in data.items() if k in allowed_fields}
+
+            if not updates:
+                return jsonify({'error': 'No valid fields to update'}), 400
+
+            set_clause = ', '.join([f'{k} = %s' for k in updates.keys()])
+            values = list(updates.values()) + [plan_name]
+            c.execute(f'UPDATE plan_limits SET {set_clause} WHERE plan_name = %s', values)
+            conn.commit()
+
+            # Return updated plan
+            c.execute('SELECT plan_name, leads_per_month, exports_per_month, price_monthly, features FROM plan_limits WHERE plan_name = %s', (plan_name,))
+            row = c.fetchone()
+            if not row:
+                return jsonify({'error': 'Plan not found'}), 404
+
+            return jsonify({
+                'plan': {
+                    'name': row[0],
+                    'leads_per_month': row[1],
+                    'exports_per_month': row[2],
+                    'price_monthly': float(row[3]) if row[3] else 0,
+                    'features': row[4] if row[4] else {}
+                }
+            }), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/plans/{plan_name}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/users/<int:target_id>/reset-usage', methods=['POST'])
+@limiter.limit("30/minute")
+def admin_reset_user_usage(target_id):
+    """Reset current month usage for a user (admin only)"""
+    try:
+        token = get_auth_header()
+        admin_id = verify_token(token)
+        if not admin_id:
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (admin_id,))
+            result = c.fetchone()
+            if not result or not result[0]:
+                return jsonify({'error': 'Forbidden: Admin access required'}), 403
+
+            month_year = _get_current_month_year()
+            c.execute(
+                '''INSERT INTO usage_tracking (user_id, month_year, leads_viewed, leads_exported, reset_at)
+                   VALUES (%s, %s, 0, 0, %s)
+                   ON CONFLICT (user_id, month_year)
+                   DO UPDATE SET leads_viewed = 0, leads_exported = 0, reset_at = %s''',
+                (target_id, month_year, datetime.now(), datetime.now())
+            )
+            return jsonify({'message': f'Usage reset for user {target_id}', 'month_year': month_year}), 200
+    except Exception as e:
+        print(f'[ERROR] /api/admin/users/{target_id}/reset-usage: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ============= Admin Quality Endpoints =============
+
+@app.route('/api/admin/rescore-all', methods=['POST'])
+def admin_rescore_all():
+    """
+    Recalcula lead_score (0-100) e quality_score para TODOS os leads.
+    Roda em background. Retorna imediatamente com contagem estimada.
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as _chk:
+        _cur = _chk.cursor()
+        _cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        _row = _cur.fetchone()
+        if not _row or not _row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+    def _rescore_background():
+        conn = psycopg2.connect(**DB_CONFIG)
+        c = conn.cursor()
+        try:
+            c.execute('''SELECT id, company_name, email, phone, website, instagram, facebook,
+                                linkedin, whatsapp, cnpj, quality_score
+                         FROM leads ORDER BY id''')
+            rows = c.fetchall()
+            cols = ['id', 'company_name', 'email', 'phone', 'website', 'instagram', 'facebook',
+                    'linkedin', 'whatsapp', 'cnpj', 'quality_score']
+            total = len(rows)
+            updated = 0
+            for row in rows:
+                lead = dict(zip(cols, row))
+                new_score = calculate_lead_score_numeric(lead)
+                new_tier = calculate_quality_score(lead)
+                try:
+                    c.execute('UPDATE leads SET lead_score = %s, quality_score = %s WHERE id = %s',
+                              (new_score, new_tier, lead['id']))
+                    updated += 1
+                except Exception as e:
+                    print(f'[RESCORE] Error lead {lead["id"]}: {e}')
+                    try: conn.rollback()
+                    except: pass
+            conn.commit()
+            print(f'[RESCORE] ✅ {updated}/{total} leads rescored')
+        except Exception as e:
+            print(f'[RESCORE] ❌ {e}')
+        finally:
+            c.close()
+            conn.close()
+
+    # Conta leads para informar
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM leads')
+        total = c.fetchone()[0]
+
+    threading.Thread(target=_rescore_background, daemon=True).start()
+    return jsonify({'message': f'Rescore iniciado em background para {total} leads', 'total': total})
+
+
+@app.route('/api/admin/global-dedup', methods=['POST'])
+def admin_global_dedup():
+    """
+    Deduplicação global cross-batch:
+    1. Email exato: mantém lead com maior lead_score, remove os outros.
+    2. Fuzzy por nome+cidade (threshold 88): marca como duplicado.
+    Roda em background.
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as _chk:
+        _cur = _chk.cursor()
+        _cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        _row = _cur.fetchone()
+        if not _row or not _row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+    def _global_dedup_background():
+        conn = psycopg2.connect(**DB_CONFIG)
+        c = conn.cursor()
+        try:
+            # --- Pass 1: dedup por email exato ---
+            c.execute('''SELECT id, email, COALESCE(lead_score, 0) as score
+                         FROM leads
+                         WHERE email IS NOT NULL AND email != ''
+                           AND email NOT LIKE '%@%.local'
+                         ORDER BY COALESCE(lead_score, 0) DESC, id ASC''')
+            rows = c.fetchall()
+            seen_emails = {}
+            ids_to_delete = []
+            for lid, email, score in rows:
+                email_clean = email.strip().lower()
+                if email_clean in seen_emails:
+                    ids_to_delete.append(lid)  # já tem um com score maior
+                else:
+                    seen_emails[email_clean] = lid
+
+            deleted_exact = 0
+            if ids_to_delete:
+                c.execute('DELETE FROM leads WHERE id = ANY(%s)', (ids_to_delete,))
+                deleted_exact = len(ids_to_delete)
+                conn.commit()
+            print(f'[GLOBAL-DEDUP] Email exato: {deleted_exact} deletados')
+
+            # --- Pass 2: fuzzy dedup por nome+cidade ---
+            if not _RAPIDFUZZ_AVAILABLE:
+                print('[GLOBAL-DEDUP] rapidfuzz indisponível, pulando fuzzy pass')
+                return
+
+            from rapidfuzz import fuzz
+            c.execute('''SELECT id, LOWER(TRIM(COALESCE(company_name, ''))),
+                                LOWER(TRIM(COALESCE(city, '')))
+                         FROM leads
+                         WHERE company_name IS NOT NULL AND company_name != ''
+                           AND crm_status != 'duplicado'
+                         ORDER BY COALESCE(lead_score, 0) DESC''')
+            rows = c.fetchall()
+            seen_names = []  # list of (id, name_city_key)
+            fuzzy_dups = []
+            for lid, name, city in rows:
+                if not name or len(name) < 4:
+                    continue
+                key = f"{name}|{city}"
+                is_dup = False
+                for sid, skey in seen_names:
+                    sname = skey.split('|')[0]
+                    scity = skey.split('|')[1]
+                    # Só compara mesma cidade
+                    if city and scity and city != scity:
+                        continue
+                    similarity = fuzz.token_sort_ratio(name, sname)
+                    if similarity >= 88:
+                        fuzzy_dups.append(lid)
+                        is_dup = True
+                        break
+                if not is_dup:
+                    seen_names.append((lid, key))
+
+            marked_fuzzy = 0
+            if fuzzy_dups:
+                c.execute('''UPDATE leads SET crm_status = 'duplicado',
+                                tags = CASE WHEN tags IS NULL OR tags = '' THEN 'duplicado_fuzzy'
+                                            WHEN tags NOT LIKE '%%duplicado_fuzzy%%' THEN tags || ',duplicado_fuzzy'
+                                            ELSE tags END
+                             WHERE id = ANY(%s)''', (fuzzy_dups,))
+                marked_fuzzy = len(fuzzy_dups)
+                conn.commit()
+
+            print(f'[GLOBAL-DEDUP] ✅ Email: {deleted_exact} deletados | Fuzzy: {marked_fuzzy} marcados')
+        except Exception as e:
+            print(f'[GLOBAL-DEDUP] ❌ {e}')
+            import traceback; traceback.print_exc()
+        finally:
+            c.close()
+            conn.close()
+
+    threading.Thread(target=_global_dedup_background, daemon=True).start()
+    return jsonify({'message': 'Deduplicação global iniciada em background'})
+
+
+@app.route('/api/admin/bulk-cnpj-enrich', methods=['POST'])
+def admin_bulk_cnpj_enrich():
+    """
+    Enriquecimento CNPJ em massa via BrasilAPI para leads com website .com.br sem CNPJ.
+    Roda em background com throttle (2s entre requisições).
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as _chk:
+        _cur = _chk.cursor()
+        _cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        _row = _cur.fetchone()
+        if not _row or not _row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+    def _bulk_cnpj_background():
+        conn = psycopg2.connect(**DB_CONFIG)
+        c = conn.cursor()
+        try:
+            c.execute('''SELECT id, website, company_name
+                         FROM leads
+                         WHERE (cnpj IS NULL OR cnpj = '')
+                           AND website IS NOT NULL AND website != ''
+                           AND (website ILIKE '%.com.br%' OR website ILIKE '%.med.br%'
+                                OR website ILIKE '%.adv.br%' OR website ILIKE '%.eng.br%')
+                         ORDER BY id
+                         LIMIT 300''')
+            rows = c.fetchall()
+            enriched = 0
+            for lid, website, name in rows:
+                try:
+                    # Extrai domínio do website
+                    domain = re.sub(r'https?://', '', website or '').split('/')[0].strip()
+                    if not domain:
+                        continue
+                    # Tenta buscar CNPJ via BrasilAPI por razão social
+                    # Usa endpoint de busca por nome
+                    search_url = f'https://brasilapi.com.br/api/cnpj/v1/search?query={requests.utils.quote(domain)}'
+                    try:
+                        resp = http_requests.get(search_url, timeout=8,
+                                                  headers={'User-Agent': random.choice(USER_AGENTS)})
+                        if resp.status_code == 200:
+                            results = resp.json()
+                            if isinstance(results, list) and results:
+                                cnpj_found = results[0].get('cnpj', '')
+                                if cnpj_found:
+                                    c.execute('UPDATE leads SET cnpj = %s WHERE id = %s',
+                                              (cnpj_found, lid))
+                                    enriched += 1
+                    except Exception:
+                        pass
+                    time.sleep(2)  # throttle BrasilAPI
+                except Exception as e:
+                    print(f'[BULK-CNPJ] Error lead {lid}: {e}')
+            conn.commit()
+            print(f'[BULK-CNPJ] ✅ {enriched}/{len(rows)} leads enriquecidos com CNPJ')
+        except Exception as e:
+            print(f'[BULK-CNPJ] ❌ {e}')
+        finally:
+            c.close()
+            conn.close()
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('''SELECT COUNT(*) FROM leads
+                     WHERE (cnpj IS NULL OR cnpj = '') AND website IS NOT NULL
+                       AND (website ILIKE '%.com.br%' OR website ILIKE '%.med.br%')''')
+        candidates = c.fetchone()[0]
+
+    threading.Thread(target=_bulk_cnpj_background, daemon=True).start()
+    return jsonify({'message': f'Enriquecimento CNPJ iniciado para ~{candidates} leads', 'candidates': candidates})
+
+
+@app.route('/api/admin/auto-categorize-all', methods=['POST'])
+def admin_auto_categorize_all():
+    """
+    Auto-categoriza leads sem categoria usando auto_tag_lead().
+    Também preenche campos source 'desconhecido' de leads antigos.
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as _chk:
+        _cur = _chk.cursor()
+        _cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        _row = _cur.fetchone()
+        if not _row or not _row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+    with get_db() as conn:
+        c = conn.cursor()
+        # Categorizar leads sem categoria
+        c.execute('''SELECT id, company_name, email, city
+                     FROM leads
+                     WHERE (category IS NULL OR category = '')
+                     ORDER BY id''')
+        rows = c.fetchall()
+        categorized = 0
+        for lid, name, email, city in rows:
+            tags = auto_tag_lead(name or '', email=email, city=city)
+            if tags:
+                category = tags[0]  # usa primeiro tag como categoria
+                tag_str = ','.join(tags)
+                c.execute('''UPDATE leads SET category = %s,
+                                tags = CASE WHEN tags IS NULL OR tags = '' THEN %s
+                                            ELSE tags END
+                             WHERE id = %s''',
+                          (category, tag_str, lid))
+                categorized += 1
+
+        # Normalizar source NULL → 'search_engine' para leads antigos sem source
+        c.execute('''UPDATE leads SET source = 'search_engine'
+                     WHERE (source IS NULL OR source = '')''')
+        source_fixed = c.rowcount
+
+        conn.commit()
+
+    return jsonify({
+        'categorized': categorized,
+        'source_normalized': source_fixed,
+        'message': f'{categorized} leads categorizados, {source_fixed} sources normalizados'
+    })
+
+
+# ============= Scheduler Setup =============
+try:
+    if _APSCHEDULER_AVAILABLE:
+        _tz = pytz.timezone('America/Sao_Paulo')
+        _scheduler = BackgroundScheduler(
+            timezone=_tz,
+            job_defaults={'misfire_grace_time': 3600, 'coalesce': True}
+        )
+        _scheduler.add_job(
+            trigger_daily_pipeline,
+            CronTrigger(hour=DAILY_JOB_HOUR, minute=0, timezone=_tz),
+            id='daily_pipeline',
+            replace_existing=True
+        )
+        _scheduler.add_job(
+            trigger_daily_crm_sync,
+            CronTrigger(hour=DAILY_CRM_SYNC_HOUR, minute=0, timezone=_tz),
+            id='daily_crm_sync',
+            replace_existing=True
+        )
+
+        def trigger_weekly_quality_maintenance():
+            """Domingo 03:30 — rescore + global dedup + sanitize de todos os leads."""
+            print('[SCHEDULER] Iniciando manutenção semanal de qualidade...')
+            # Guard: evita double-fire com 2 workers
+            conn = psycopg2.connect(**DB_CONFIG)
+            c = conn.cursor()
+            try:
+                # Rescore
+                c.execute('SELECT id, company_name, email, phone, website, instagram, facebook, linkedin, whatsapp, cnpj FROM leads ORDER BY id')
+                rows = c.fetchall()
+                cols = ['id','company_name','email','phone','website','instagram','facebook','linkedin','whatsapp','cnpj']
+                updated = 0
+                for row in rows:
+                    lead = dict(zip(cols, row))
+                    new_score = calculate_lead_score_numeric(lead)
+                    new_tier = calculate_quality_score(lead)
+                    try:
+                        c.execute('UPDATE leads SET lead_score = %s, quality_score = %s WHERE id = %s',
+                                  (new_score, new_tier, lead['id']))
+                        updated += 1
+                    except Exception:
+                        try: conn.rollback()
+                        except: pass
+                conn.commit()
+                print(f'[WEEKLY-QUALITY] Rescore: {updated} leads atualizados')
+
+                # Global dedup por email
+                c.execute('''SELECT id, email, COALESCE(lead_score, 0)
+                             FROM leads
+                             WHERE email IS NOT NULL AND email != ''
+                               AND email NOT LIKE '%%@%%.local'
+                             ORDER BY COALESCE(lead_score, 0) DESC, id ASC''')
+                email_rows = c.fetchall()
+                seen_e = {}
+                del_ids = []
+                for lid, email, score in email_rows:
+                    ec = (email or '').strip().lower()
+                    if ec in seen_e:
+                        del_ids.append(lid)
+                    else:
+                        seen_e[ec] = lid
+                if del_ids:
+                    c.execute('DELETE FROM leads WHERE id = ANY(%s)', (del_ids,))
+                    conn.commit()
+                print(f'[WEEKLY-QUALITY] Global dedup: {len(del_ids)} removidos')
+
+                # Auto-categorize sem categoria
+                c.execute('SELECT id, company_name, email, city FROM leads WHERE (category IS NULL OR category = \'\')')
+                cat_rows = c.fetchall()
+                categorized = 0
+                for lid, name, email, city in cat_rows:
+                    tags = auto_tag_lead(name or '', email=email, city=city)
+                    if tags:
+                        c.execute('UPDATE leads SET category = %s WHERE id = %s', (tags[0], lid))
+                        categorized += 1
+                conn.commit()
+                print(f'[WEEKLY-QUALITY] Auto-categorize: {categorized} leads categorizados')
+                print('[SCHEDULER] ✅ Manutenção semanal concluída')
+            except Exception as e:
+                print(f'[SCHEDULER] ❌ Erro na manutenção semanal: {e}')
+            finally:
+                c.close()
+                conn.close()
+
+        _scheduler.add_job(
+            trigger_weekly_quality_maintenance,
+            CronTrigger(day_of_week='sun', hour=3, minute=30, timezone=_tz),
+            id='weekly_quality_maintenance',
+            replace_existing=True
+        )
+
+        _scheduler.start()
+        print(f"[SCHEDULER] Pipeline diário agendado: {DAILY_JOB_HOUR:02d}:00 America/Sao_Paulo")
+        print(f"[SCHEDULER] CRM sync diário agendado: {DAILY_CRM_SYNC_HOUR:02d}:00 America/Sao_Paulo")
+        print(f"[SCHEDULER] Manutenção semanal agendada: Domingo 03:30 America/Sao_Paulo")
+    else:
+        print("[SCHEDULER] APScheduler indisponível — instale: pip install APScheduler pytz")
+except Exception as _sched_err:
+    print(f"[SCHEDULER] Erro ao iniciar: {_sched_err}")

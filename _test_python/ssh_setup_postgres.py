@@ -4,14 +4,15 @@ Step 1: Setup PostgreSQL Docker container on VPS
 import paramiko
 import sys
 import time
+from _secrets import vps_host, vps_user, vps_pass, db_password
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-VPS_HOST = '185.173.110.180'
-VPS_USER = 'root'
-VPS_PASS = '1982X@ndeq1982#'
+VPS_HOST = vps_host()
+VPS_USER = vps_user()
+VPS_PASS = vps_pass()
 
-DB_PASSWORD = 'Extr4t0r_S3cur3_2026!'
+DB_PASSWORD = db_password()
 
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())

@@ -39,7 +39,7 @@ print("=" * 60)
 
 # 1. Login
 print("\n1. AUTHENTICATION")
-status, body = api('POST', '/api/login', {'username': 'admin', 'password': '1982Xandeq1982#'})
+status, body = api('POST', '/api/login', {'username': 'admin', 'password': 'REDACTED_PASSWORD'})
 data = json.loads(body)
 token = data.get('token')
 check("Login returns 200", status == 200)
