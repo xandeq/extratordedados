@@ -14098,8 +14098,12 @@ def admin_rescore_all():
     user_id = verify_token(get_auth_header())
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    if not _is_admin(user_id):
-        return jsonify({'error': 'Admin only'}), 403
+    with get_db() as _chk:
+        _cur = _chk.cursor()
+        _cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        _row = _cur.fetchone()
+        if not _row or not _row[0]:
+            return jsonify({'error': 'Admin only'}), 403
 
     def _rescore_background():
         conn = psycopg2.connect(**DB_CONFIG)
@@ -14154,8 +14158,12 @@ def admin_global_dedup():
     user_id = verify_token(get_auth_header())
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    if not _is_admin(user_id):
-        return jsonify({'error': 'Admin only'}), 403
+    with get_db() as _chk:
+        _cur = _chk.cursor()
+        _cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        _row = _cur.fetchone()
+        if not _row or not _row[0]:
+            return jsonify({'error': 'Admin only'}), 403
 
     def _global_dedup_background():
         conn = psycopg2.connect(**DB_CONFIG)
@@ -14249,8 +14257,12 @@ def admin_bulk_cnpj_enrich():
     user_id = verify_token(get_auth_header())
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    if not _is_admin(user_id):
-        return jsonify({'error': 'Admin only'}), 403
+    with get_db() as _chk:
+        _cur = _chk.cursor()
+        _cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        _row = _cur.fetchone()
+        if not _row or not _row[0]:
+            return jsonify({'error': 'Admin only'}), 403
 
     def _bulk_cnpj_background():
         conn = psycopg2.connect(**DB_CONFIG)
@@ -14319,8 +14331,12 @@ def admin_auto_categorize_all():
     user_id = verify_token(get_auth_header())
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    if not _is_admin(user_id):
-        return jsonify({'error': 'Admin only'}), 403
+    with get_db() as _chk:
+        _cur = _chk.cursor()
+        _cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        _row = _cur.fetchone()
+        if not _row or not _row[0]:
+            return jsonify({'error': 'Admin only'}), 403
 
     with get_db() as conn:
         c = conn.cursor()
