@@ -5943,7 +5943,15 @@ def list_leads():
     # SaaS: Track usage and check limits
     plan = _get_user_plan(user_id)
     limits = _get_plan_limits(plan)
-    usage = _get_usage_stats(user_id)
+    is_admin = _is_admin_user(user_id)
+
+    # Admins bypass usage limits entirely
+    if is_admin:
+        usage = {'leads_viewed': 0, 'leads_exported': 0}
+        leads_limit = 999999
+    else:
+        usage = _get_usage_stats(user_id)
+        leads_limit = limits['leads_per_month'] if limits else 100
 
     # Count leads being viewed on this page
     leads_count = len(leads)
@@ -5960,12 +5968,12 @@ def list_leads():
         'plan': plan,
         'usage': {
             'leads_viewed': usage['leads_viewed'],
-            'leads_limit': limits['leads_per_month'],
-            'usage_percent': (usage['leads_viewed'] / limits['leads_per_month'] * 100) if limits['leads_per_month'] > 0 else 0
+            'leads_limit': leads_limit,
+            'usage_percent': (usage['leads_viewed'] / leads_limit * 100) if leads_limit > 0 else 0
         }
     }
 
-    # Increment view counter
+    # Increment view counter (skipped for admins via _increment_usage)
     if leads_count > 0:
         _increment_usage(user_id, 'leads_viewed', leads_count)
 
@@ -13661,8 +13669,21 @@ def _get_usage_stats(user_id):
             'month_year': month_year
         }
 
+def _is_admin_user(user_id):
+    """Check if user is admin (helper for usage tracking bypass)"""
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_admin FROM users WHERE id = %s', (user_id,))
+            row = c.fetchone()
+            return bool(row and row[0])
+    except Exception:
+        return False
+
 def _increment_usage(user_id, field='leads_viewed', amount=1):
-    """Increment usage counter (leads_viewed or leads_exported)"""
+    """Increment usage counter (leads_viewed or leads_exported). Skipped for admins."""
+    if _is_admin_user(user_id):
+        return  # admins have unlimited usage
     month_year = _get_current_month_year()
     _reset_monthly_usage(user_id)
 

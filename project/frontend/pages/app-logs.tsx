@@ -1,6 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { useRouter } from 'next/router'
-import Layout from '../components/Layout'
 import api from '../lib/api'
 import {
   Activity,
@@ -666,8 +665,7 @@ export default function AppLogs() {
   const activeFilterCount = [levelFilter, providerFilter, errorTypeFilter, search, dateFrom, dateTo].filter(Boolean).length
 
   return (
-    <Layout>
-      <div className="max-w-7xl mx-auto px-4 py-6 space-y-5">
+    <div className="max-w-7xl mx-auto px-4 py-6 space-y-5">
 
         {/* ── Header ── */}
         <div className="flex items-center justify-between flex-wrap gap-3">
@@ -936,6 +934,5 @@ export default function AppLogs() {
           </div>
         )}
       </div>
-    </Layout>
   )
 }

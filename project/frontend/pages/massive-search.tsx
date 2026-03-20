@@ -1,7 +1,6 @@
 import { Building2, CheckCircle2, Database, Globe, Hash, Instagram, Linkedin, Loader2, Mail, MapPin, Search, TrendingUp, XCircle, Zap } from 'lucide-react';
 import { useRouter } from 'next/router';
 import { useEffect, useState } from 'react';
-import Layout from '../components/Layout';
 import api from '../lib/api';
 import InfoBox from '../components/InfoBox';
 import Tooltip from '../components/Tooltip';
@@ -284,8 +283,7 @@ export default function MassiveSearch() {
   const estimatedJobs = selectedNichesCount * enabledMethodsCount * (selectedRegionData?.cities.length || 1);
 
   return (
-    <Layout>
-      <div className="max-w-7xl mx-auto py-8 px-4">
+    <div className="max-w-7xl mx-auto py-8 px-4">
         {/* Header */}
         <div className="mb-8">
           <div className="flex items-center gap-3 mb-3">
@@ -594,6 +592,5 @@ export default function MassiveSearch() {
           </div>
         </div>
       </div>
-    </Layout>
   );
 }
