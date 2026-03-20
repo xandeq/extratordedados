@@ -4630,9 +4630,8 @@ def create_batch():
     thread = threading.Thread(target=process_batch, args=(batch_id, urls), daemon=True)
     thread.start()
 
-    # AUTO-SYNC: Start background thread to sync leads to alexandrequeiroz.com.br
-    sync_thread = threading.Thread(target=auto_sync_new_leads_background, args=(batch_id,), daemon=True)
-    sync_thread.start()
+    # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
+    threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
 
     return jsonify({
         'batch_id': batch_id,
@@ -4941,9 +4940,8 @@ def start_search():
     )
     thread.start()
 
-    # AUTO-SYNC: Start background thread to sync leads to alexandrequeiroz.com.br
-    sync_thread = threading.Thread(target=auto_sync_new_leads_background, args=(batch_id,), daemon=True)
-    sync_thread.start()
+    # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
+    threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
 
     return jsonify({
         'batch_id': batch_id,
@@ -5476,9 +5474,8 @@ def start_api_search():
     )
     thread.start()
 
-    # AUTO-SYNC: Start background thread to sync leads
-    sync_thread = threading.Thread(target=auto_sync_new_leads_background, args=(batch_id,), daemon=True)
-    sync_thread.start()
+    # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
+    threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
 
     return jsonify({
         'batch_id': batch_id,
@@ -8914,9 +8911,8 @@ def import_leads():
         cur.execute("UPDATE batches SET total_urls = %s WHERE id = %s", (imported, batch_id))
         conn.commit()
 
-        # AUTO-SYNC: Start background thread to sync leads
-        sync_thread = threading.Thread(target=auto_sync_new_leads_background, args=(batch_id,), daemon=True)
-        sync_thread.start()
+        # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
+        threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
 
         return jsonify({
             'batch_id': batch_id,
@@ -10291,9 +10287,8 @@ def start_massive_search():
     monitor_thread = threading.Thread(target=_monitor_batch_completion, args=(batch_id,), daemon=True)
     monitor_thread.start()
 
-    # AUTO-SYNC: Start background thread to sync leads to alexandrequeiroz.com.br
-    sync_thread = threading.Thread(target=auto_sync_new_leads_background, args=(batch_id,), daemon=True)
-    sync_thread.start()
+    # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
+    threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
 
     return jsonify({
         'batch_id': batch_id,
@@ -11924,6 +11919,141 @@ def _monitor_batch_completion(batch_id):
             conn.close()
         except Exception:
             pass
+
+
+def auto_sanitize_background(batch_id):
+    """
+    Background thread: aguarda o batch completar, sanitiza os leads e em seguida
+    dispara o auto_sync_new_leads_background.
+    Substitui o antigo sync_thread direto — pipeline: sanitize → sync.
+    """
+    print(f"[SANITIZE] Starting auto-sanitize for batch {batch_id}")
+    time.sleep(5)
+
+    conn = psycopg2.connect(**DB_CONFIG)
+    c = conn.cursor()
+
+    try:
+        # Aguarda até 15 min pelo batch completar
+        max_wait = 900
+        elapsed = 0
+        while elapsed < max_wait:
+            c.execute('SELECT status FROM batches WHERE id = %s', (batch_id,))
+            row = c.fetchone()
+            if not row:
+                print(f"[SANITIZE] Batch {batch_id} not found, aborting")
+                return
+            status = row[0]
+            if status == 'completed':
+                break
+            elif status == 'failed':
+                print(f"[SANITIZE] Batch {batch_id} failed, aborting sanitize")
+                return
+            time.sleep(10)
+            elapsed += 10
+
+        # Busca todos os leads do batch
+        c.execute(
+            '''SELECT id, company_name, email, phone, website, address,
+                      city, state, source, instagram, linkedin, facebook,
+                      whatsapp, cnpj, contact_name, notes, crm_status,
+                      quality_score, batch_id
+               FROM leads
+               WHERE batch_id = %s
+               ORDER BY id''',
+            (batch_id,)
+        )
+        rows = c.fetchall()
+        if not rows:
+            print(f"[SANITIZE] No leads found for batch {batch_id}, skipping")
+        else:
+            cols = ['id', 'company_name', 'email', 'phone', 'website', 'address',
+                    'city', 'state', 'source', 'instagram', 'linkedin', 'facebook',
+                    'whatsapp', 'cnpj', 'contact_name', 'notes', 'crm_status',
+                    'quality_score', 'batch_id']
+            leads_raw = [dict(zip(cols, row)) for row in rows]
+            total = len(leads_raw)
+
+            ids_to_delete = []
+            seen_emails = {}
+            sanitized_leads = []
+
+            # Pass 1: sanitizar cada lead
+            for lead in leads_raw:
+                sanitized, issues, has_contact = sanitize_single_lead(lead)
+                if not has_contact:
+                    ids_to_delete.append(lead['id'])
+                    continue
+                sanitized_leads.append(sanitized)
+
+            # Pass 2: dedup por email dentro do batch
+            final_leads = []
+            for sanitized in sanitized_leads:
+                email = (sanitized.get('email') or '').strip().lower()
+                if email:
+                    if email in seen_emails:
+                        existing = seen_emails[email]
+                        existing_score = existing.get('quality_score') or 0
+                        new_score = sanitized.get('quality_score') or 0
+                        if new_score > existing_score:
+                            ids_to_delete.append(existing['id'])
+                            seen_emails[email] = sanitized
+                        else:
+                            ids_to_delete.append(sanitized['id'])
+                        continue
+                    else:
+                        seen_emails[email] = sanitized
+                final_leads.append(sanitized)
+
+            # Pass 3: atualizar leads válidos
+            updated = 0
+            for lead in final_leads:
+                try:
+                    c.execute(
+                        '''UPDATE leads SET
+                            company_name = %s, email = %s, phone = %s, website = %s,
+                            address = %s, city = %s, state = %s, contact_name = %s,
+                            quality_score = %s
+                           WHERE id = %s''',
+                        (
+                            lead.get('company_name'), lead.get('email'), lead.get('phone'),
+                            lead.get('website'), lead.get('address'), lead.get('city'),
+                            lead.get('state'), lead.get('contact_name'),
+                            lead.get('quality_score'), lead['id']
+                        )
+                    )
+                    updated += 1
+                except Exception as e:
+                    print(f"[SANITIZE] Error updating lead {lead['id']}: {e}")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+
+            # Pass 4: deletar leads inválidos/duplicados
+            deleted = 0
+            if ids_to_delete:
+                unique_ids = list(set(ids_to_delete))
+                try:
+                    c.execute('DELETE FROM leads WHERE id = ANY(%s)', (unique_ids,))
+                    deleted = len(unique_ids)
+                except Exception as e:
+                    print(f"[SANITIZE] Error deleting leads: {e}")
+
+            conn.commit()
+            print(f"[SANITIZE] ✅ Batch {batch_id}: {total} analisados, {updated} atualizados, {deleted} removidos")
+
+    except Exception as e:
+        print(f"[SANITIZE] ❌ Error in auto-sanitize for batch {batch_id}: {e}")
+    finally:
+        try:
+            c.close()
+            conn.close()
+        except Exception:
+            pass
+
+    # Dispara sync após sanitização
+    auto_sync_new_leads_background(batch_id)
 
 
 @_persist_thread_errors('sync')
