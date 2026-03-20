@@ -786,14 +786,103 @@ DAILY_JOB_USER_ID = 1                   # user_id do admin que "roda" o job
 DAILY_CRM_SYNC_HOUR = 9                 # 09:00 da manhã para sync CRM automático
 
 SKIP_DOMAINS = {
+    # Redes sociais
     'facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'linkedin.com',
-    'youtube.com', 'tiktok.com', 'pinterest.com', 'reddit.com',
+    'youtube.com', 'tiktok.com', 'pinterest.com', 'reddit.com', 'threads.net',
+    # Marketplaces e classificados
     'mercadolivre.com.br', 'olx.com.br', 'amazon.com.br', 'magazineluiza.com.br',
-    'gov.br', 'wikipedia.org', 'tripadvisor.com', 'tripadvisor.com.br',
-    'reclameaqui.com.br', 'yelp.com', 'glassdoor.com',
-    'google.com', 'google.com.br', 'bing.com', 'duckduckgo.com',
-    'yahoo.com', 'uol.com.br', 'globo.com', 'terra.com.br',
+    'americanas.com.br', 'shopee.com.br', 'submarino.com.br', 'buscape.com.br',
+    # Governo e enciclopédias
+    'gov.br', 'wikipedia.org', 'wikimedia.org', 'wikidata.org',
+    # Avaliações e diretórios genéricos
+    'tripadvisor.com', 'tripadvisor.com.br', 'reclameaqui.com.br',
+    'yelp.com', 'glassdoor.com', 'foursquare.com', 'zomato.com',
+    # Motores de busca
+    'google.com', 'google.com.br', 'bing.com', 'duckduckgo.com', 'yahoo.com',
+    # Portais brasileiros (conteúdo editorial, não empresas)
+    'uol.com.br', 'globo.com', 'terra.com.br', 'r7.com', 'ig.com.br',
+    'msn.com', 'abril.com.br', 'veja.com.br', 'exame.com', 'valor.com.br',
+    # Portais de notícias nacionais
+    'g1.globo.com', 'ge.globo.com', 'gshow.globo.com', 'oglobo.globo.com',
+    'folha.uol.com.br', 'estadao.com', 'estadao.com.br',
+    'correiobraziliense.com.br', 'gazetaonline.com.br', 'agazeta.com.br',
+    'tribunaonline.com.br', 'aquinoticias.com', 'seculodiario.com.br',
+    # Sites de tecnologia e tech media (internacionais)
+    'digitaltrends.com', 'techcrunch.com', 'theverge.com', 'engadget.com',
+    'wired.com', 'gizmodo.com', 'cnet.com', 'zdnet.com', 'lifehacker.com',
+    'tomsguide.com', 'pcmag.com', 'techradar.com', 'makeuseof.com',
+    # Empresas internacionais que não são leads BR
+    'thermofisher.com', 'mabtech.com', 'sigma-aldrich.com', 'merck.com',
+    'cheyenne.org', 'clubic.com', 'businessinsider.com', 'markets.businessinsider.com',
+    # Portais de finanças/mercado (não são empresas-alvo)
+    'infomoney.com.br', 'investing.com', 'tradingview.com',
+    'morningstar.com', 'bloomberg.com', 'reuters.com',
+    # Agregadores educacionais
+    'ifes.edu.br', 'uff.br', 'usp.br', 'unicamp.br', 'ufrj.br',
 }
+
+# Domínios de email irrelevantes para leads BR (empresas/sites não-alvo)
+# Vai além do SKIP_DOMAINS — aplicado na validação de email
+IRRELEVANT_EMAIL_DOMAINS = {
+    'estadao.com', 'estadao.com.br', 'folha.com', 'globo.com',
+    'digitaltrends.com', 'techcrunch.com', 'theverge.com', 'wired.com',
+    'thermofisher.com', 'mabtech.com', 'cheyenne.org', 'clubic.com',
+    'businessinsider.com', 'morningstar.com', 'bloomberg.com', 'reuters.com',
+    'ifes.edu.br', 'instagram.local', 'linkedin.local', 'facebook.local',
+    'noticiasdealava.eus', 'legacyschool.com.br',
+}
+
+# DDDs válidos no Brasil (ANATEL)
+DDD_VALIDOS_BR = {
+    '11', '12', '13', '14', '15', '16', '17', '18', '19',  # SP
+    '21', '22', '24',                                        # RJ
+    '27', '28',                                              # ES
+    '31', '32', '33', '34', '35', '37', '38',               # MG
+    '41', '42', '43', '44', '45', '46',                     # PR
+    '47', '48', '49',                                        # SC
+    '51', '53', '54', '55',                                  # RS
+    '61',                                                    # DF
+    '62', '64',                                              # GO
+    '63',                                                    # TO
+    '65', '66',                                              # MT
+    '67',                                                    # MS
+    '68',                                                    # AC
+    '69',                                                    # RO
+    '71', '73', '74', '75', '77',                           # BA
+    '79',                                                    # SE
+    '81', '87',                                              # PE
+    '82',                                                    # AL
+    '83',                                                    # PB
+    '84',                                                    # RN
+    '85', '88',                                              # CE
+    '86', '89',                                              # PI
+    '91', '93', '94',                                        # PA
+    '92', '97',                                              # AM
+    '95',                                                    # RR
+    '96',                                                    # AP
+    '98', '99',                                              # MA
+}
+
+# Sufixos/padrões que indicam empresa estrangeira
+FOREIGN_COMPANY_PATTERNS = [
+    r'\bInc\.?\b', r'\bLLC\b', r'\bLtd\.?\b', r'\bCO\s+LTD\b',
+    r'\bGmbH\b', r'\bS\.A\.S\.?\b', r'\bCorp\.?\b', r'\bPLC\b',
+    r'\bAG\b', r'\bNV\b', r'\bBV\b', r'\bSRL\b',
+]
+_FOREIGN_COMPANY_RE = re.compile('|'.join(FOREIGN_COMPANY_PATTERNS), re.IGNORECASE)
+
+# Prefixos de busca que contaminam o campo city
+_CITY_GARBAGE_RE = re.compile(
+    r'^(?:escritório|escritorio|advogado|advocacia|clínica|clinica|dentista'
+    r'|restaurante|padaria|hotel|pousada|escola|academia|farmácia|farmacia'
+    r'|supermercado|mecânica|mecanica|salão|salao|pet\s*shop|imobiliária|imobiliaria'
+    r'|contabilidade|psicólogo|psicologo|médico|medico|veterinário|veterinario'
+    r'|[a-záéíóúàãõâêîôûç\s]+)\s+(?:em|in|de|do|da|no|na)\s+',
+    re.IGNORECASE
+)
+
+# Máximo de leads com o mesmo domínio de email por batch
+MAX_LEADS_PER_EMAIL_DOMAIN = 5
 
 # ============= Email Quality Filters =============
 
@@ -3637,23 +3726,165 @@ def search_with_fallback(query, max_pages=2, safety=None, cursor=None, user_id=N
     return unique_results, engine_used
 
 
-def calculate_quality_score(lead_data):
-    """Calculate lead quality: basico, medio, or premium."""
-    score = 0
-    if lead_data.get('email'):
-        score += 1
-    if lead_data.get('phone'):
-        score += 1
-    if lead_data.get('whatsapp'):
-        score += 1
-    if lead_data.get('instagram') or lead_data.get('facebook') or lead_data.get('linkedin'):
-        score += 1
-    if lead_data.get('cnpj'):
-        score += 1
+def validate_phone_br(phone):
+    """
+    Valida e normaliza telefone brasileiro.
+    Retorna (phone_normalizado, is_valid).
+    Rejeita DDDs inválidos, números muito curtos/longos e prefixos internacionais.
+    """
+    if not phone:
+        return None, False
+    p = str(phone).strip()
+    # Remove caracteres não numéricos exceto +
+    digits = re.sub(r'[^\d]', '', p)
+    # Remove +55 ou 55 no início
+    if digits.startswith('55') and len(digits) > 11:
+        digits = digits[2:]
+    # Prefixo internacional (00xx) — rejeitar
+    if digits.startswith('00'):
+        return None, False
+    # Comprimento inválido
+    if len(digits) < 8 or len(digits) > 11:
+        return None, False
+    # Extrai DDD (apenas se tem 10 ou 11 dígitos)
+    if len(digits) >= 10:
+        ddd = digits[:2]
+        if ddd not in DDD_VALIDOS_BR:
+            return None, False
+    # Número só com dígitos iguais (11111111) — inválido
+    if len(set(digits)) == 1:
+        return None, False
+    return p, True
 
-    if score >= 4:
+
+def clean_city_name(city):
+    """
+    Remove prefixos de busca que contaminam o campo city.
+    Ex: 'Escritório de Contabilidade em Vila Velha' → 'Vila Velha'
+        'Advogado em São Paulo' → 'São Paulo'
+    """
+    if not city:
+        return city
+    city = city.strip()
+    # Aplica regex de limpeza
+    cleaned = _CITY_GARBAGE_RE.sub('', city).strip()
+    # Se o resultado ficou muito curto ou vazio, mantém o original
+    if len(cleaned) < 3:
+        return city
+    # Remove " - ES", " - SP" etc. no final
+    cleaned = re.sub(r'\s*[-–]\s*[A-Z]{2}$', '', cleaned).strip()
+    return cleaned
+
+
+def is_foreign_company(company_name):
+    """
+    Detecta se a empresa é estrangeira por sufixos legais (Inc, LLC, Ltd, GmbH etc.).
+    Retorna True se parecer empresa estrangeira.
+    """
+    if not company_name:
+        return False
+    return bool(_FOREIGN_COMPANY_RE.search(company_name))
+
+
+def is_irrelevant_email_domain(email):
+    """
+    Verifica se o domínio do email é de um site irrelevante para leads BR
+    (portais de notícias, tech media, empresas internacionais).
+    """
+    if not email or '@' not in email:
+        return False
+    domain = email.split('@')[-1].lower().strip()
+    return domain in IRRELEVANT_EMAIL_DOMAINS
+
+
+def calculate_lead_score_numeric(lead_data):
+    """
+    Calcula score numérico 0-100 para o lead.
+    Leva em conta completude dos dados e qualidade do contato.
+    Retorna int 0-100.
+    """
+    score = 0
+    email = (lead_data.get('email') or '').lower()
+    phone = lead_data.get('phone') or ''
+    whatsapp = lead_data.get('whatsapp') or ''
+    instagram = lead_data.get('instagram') or ''
+    facebook = lead_data.get('facebook') or ''
+    linkedin = lead_data.get('linkedin') or ''
+    website = lead_data.get('website') or ''
+    cnpj = lead_data.get('cnpj') or ''
+    company = lead_data.get('company_name') or ''
+
+    # Email
+    if email:
+        domain = email.split('@')[-1] if '@' in email else ''
+        free_providers = {'gmail.com','hotmail.com','yahoo.com','outlook.com',
+                          'bol.com.br','ig.com.br','uol.com.br','terra.com.br',
+                          'live.com','msn.com','icloud.com','me.com'}
+        generic_prefixes_local = {'contato','info','atendimento','suporte','vendas',
+                                   'comercial','financeiro','rh','marketing','sac',
+                                   'faleconosco','ouvidoria','diretoria','administrativo',
+                                   'recepcao','newsletter','noticias','secretaria'}
+        local = email.split('@')[0] if '@' in email else ''
+
+        if domain in free_providers:
+            score += 8   # Email existe, mas provedor gratuito
+        elif local in generic_prefixes_local:
+            score += 12  # Email corporativo genérico
+        else:
+            score += 20  # Email corporativo pessoal/nominal — mais valioso
+
+        # Bonus TLD brasileiro
+        if domain.endswith('.com.br') or domain.endswith('.med.br') or \
+           domain.endswith('.adv.br') or domain.endswith('.eng.br'):
+            score += 8
+
+    # Telefone com DDD válido
+    if phone:
+        _, valid = validate_phone_br(phone)
+        if valid:
+            score += 15
+        else:
+            score += 3  # Tem telefone mas inválido — pequeno bônus
+
+    # WhatsApp
+    if whatsapp:
+        score += 15
+
+    # Redes sociais
+    if instagram:
+        score += 7
+    if facebook:
+        score += 5
+    if linkedin:
+        score += 8
+
+    # Website próprio
+    if website:
+        if '.com.br' in website or '.med.br' in website or '.adv.br' in website:
+            score += 8
+        else:
+            score += 4
+
+    # CNPJ enriquecido
+    if cnpj:
+        score += 10
+
+    # Nome de empresa limpo (não genérico)
+    if company and len(company) > 3:
+        score += 2
+
+    return min(score, 100)
+
+
+def calculate_quality_score(lead_data):
+    """
+    Calcula tier de qualidade do lead: basico, medio, premium.
+    Usa calculate_lead_score_numeric internamente.
+    """
+    numeric = calculate_lead_score_numeric(lead_data)
+    if numeric >= 65:
         return 'premium'
-    elif score >= 2:
+    elif numeric >= 35:
         return 'medio'
     return 'basico'
 
@@ -5506,7 +5737,8 @@ SHARED_LEADS_SELECT = '''SELECT l.id, l.company_name, l.email, l.phone, l.websit
                                 l.instagram, l.facebook, l.linkedin, l.twitter, l.youtube,
                                 l.whatsapp, l.cnpj, l.address,
                                 l.crm_status, l.tags, l.notes, l.contact_name, l.updated_at,
-                                b.name as batch_name, l.batch_id, COALESCE(l.lead_score, 0) as lead_score
+                                b.name as batch_name, l.batch_id, COALESCE(l.lead_score, 0) as lead_score,
+                                l.source, l.quality_score
                          FROM leads l JOIN batches b ON l.batch_id = b.id
                          WHERE b.is_shared = TRUE'''
 
@@ -5524,6 +5756,7 @@ def lead_row_to_dict(row):
         'updated_at': row[22].isoformat() if row[22] else None,
         'batch_name': row[23], 'batch_id': row[24],
         'lead_score': row[25] if row[25] is not None else 0,
+        'source': row[26] or '', 'quality_score': row[27] or 'basico',
     }
 
 
@@ -6397,7 +6630,13 @@ def sanitize_single_lead(lead_dict):
         issues.append('company_name_normalized')
         lead['company_name'] = clean_name
 
-    # 1b. Corrigir encoding de outros campos de texto
+    # 1b. Detectar empresa estrangeira pelo nome (Inc, LLC, Ltd, GmbH...)
+    if is_foreign_company(lead.get('company_name') or ''):
+        issues.append(f'foreign_company:{lead.get("company_name","")[:50]}')
+        lead['crm_status'] = 'descartado'
+        # Marca mas não apaga — deixa auto_sanitize_background decidir
+
+    # 1c. Corrigir encoding de outros campos de texto
     for field in ('address', 'city', 'state', 'contact_name', 'notes'):
         val = lead.get(field)
         if val and isinstance(val, str):
@@ -6406,7 +6645,15 @@ def sanitize_single_lead(lead_dict):
                 issues.append(f'encoding_corrected:{field}')
                 lead[field] = fixed
 
-    # 1c. Smart title case em city e state também
+    # 1d. Limpar cidade: extrair nome real de strings como "Escritório de X em Vitória"
+    city = lead.get('city') or ''
+    if city:
+        cleaned_city = clean_city_name(city)
+        if cleaned_city != city:
+            issues.append(f'city_cleaned:{city[:40]}→{cleaned_city}')
+            lead['city'] = cleaned_city
+
+    # 1e. Smart title case em city e state
     for field in ('city', 'state'):
         val = lead.get(field)
         if val and isinstance(val, str):
@@ -6420,16 +6667,20 @@ def sanitize_single_lead(lead_dict):
     email_type = 'desconhecido'
 
     if email and not email.endswith(('@directory.local', '@instagram.local', '@linkedin.local')):
-        # 2a. Detecção de extensão de domínio ruim
-        if has_bad_domain_extension(email):
+        # 2a. Domínio irrelevante (jornais, tech media, empresas internacionais)
+        if is_irrelevant_email_domain(email):
+            issues.append(f'irrelevant_domain:{email}')
+            lead['email'] = None
+        # 2b. Extensão de domínio ruim (scraping artifact)
+        elif has_bad_domain_extension(email):
             issues.append(f'bad_domain_extension:{email}')
             lead['email'] = None
-        # 2b. Domínio de spam
+        # 2c. Domínio de spam/temporário
         elif is_spam_domain(email):
             issues.append(f'spam_domain:{email}')
             lead['email'] = None
         else:
-            # 2c. Validação via função existente
+            # 2d. Validação de qualidade via score
             score, is_valid, reason = calculate_email_quality_score(email)
             if not is_valid:
                 issues.append(f'email_invalid:{reason}:{email[:50]}')
@@ -6442,13 +6693,28 @@ def sanitize_single_lead(lead_dict):
                 email_type = classify_email_type(email)
                 lead['email_type'] = email_type
 
-    # 3. Recalcular quality_score com dados atualizados
+    # 3. Validar e normalizar telefone
+    phone = lead.get('phone') or ''
+    if phone:
+        cleaned_phone, phone_valid = validate_phone_br(phone)
+        if not phone_valid:
+            issues.append(f'phone_invalid:{phone[:20]}')
+            lead['phone'] = None
+        else:
+            lead['phone'] = cleaned_phone
+
+    # 4. Recalcular quality_score (tier) e lead_score (numérico 0-100)
     lead['quality_score'] = calculate_quality_score(lead)
+    lead['lead_score'] = calculate_lead_score_numeric(lead)
 
     # Lead é válido se tem pelo menos email ou telefone ou rede social
     has_contact = bool(lead.get('email') or lead.get('phone') or
                        lead.get('instagram') or lead.get('linkedin') or
                        lead.get('whatsapp'))
+
+    # Empresa estrangeira sem contato BR = descartar
+    if 'foreign_company' in ' '.join(issues) and not has_contact:
+        return lead, issues, False
 
     return lead, issues, has_contact
 
@@ -11976,6 +12242,7 @@ def auto_sanitize_background(batch_id):
 
             ids_to_delete = []
             seen_emails = {}
+            domain_counts = {}  # domínio → lista de (lead_id, lead_score)
             sanitized_leads = []
 
             # Pass 1: sanitizar cada lead
@@ -11986,15 +12253,15 @@ def auto_sanitize_background(batch_id):
                     continue
                 sanitized_leads.append(sanitized)
 
-            # Pass 2: dedup por email dentro do batch
-            final_leads = []
+            # Pass 2: dedup por email exato dentro do batch
+            after_email_dedup = []
             for sanitized in sanitized_leads:
                 email = (sanitized.get('email') or '').strip().lower()
                 if email:
                     if email in seen_emails:
                         existing = seen_emails[email]
-                        existing_score = existing.get('quality_score') or 0
-                        new_score = sanitized.get('quality_score') or 0
+                        existing_score = existing.get('lead_score') or 0
+                        new_score = sanitized.get('lead_score') or 0
                         if new_score > existing_score:
                             ids_to_delete.append(existing['id'])
                             seen_emails[email] = sanitized
@@ -12003,9 +12270,32 @@ def auto_sanitize_background(batch_id):
                         continue
                     else:
                         seen_emails[email] = sanitized
-                final_leads.append(sanitized)
+                after_email_dedup.append(sanitized)
 
-            # Pass 3: atualizar leads válidos
+            # Pass 3: limite por domínio de email (máx MAX_LEADS_PER_EMAIL_DOMAIN por batch)
+            final_leads = []
+            for sanitized in after_email_dedup:
+                email = (sanitized.get('email') or '').strip().lower()
+                domain = email.split('@')[-1] if '@' in email else '__no_email__'
+                lead_score = sanitized.get('lead_score') or 0
+
+                if domain not in domain_counts:
+                    domain_counts[domain] = []
+                domain_counts[domain].append((sanitized['id'], lead_score, sanitized))
+
+            for domain, entries in domain_counts.items():
+                if domain == '__no_email__' or len(entries) <= MAX_LEADS_PER_EMAIL_DOMAIN:
+                    final_leads.extend(e[2] for e in entries)
+                else:
+                    # Ordenar por score desc, manter os melhores
+                    entries.sort(key=lambda x: x[1], reverse=True)
+                    kept = entries[:MAX_LEADS_PER_EMAIL_DOMAIN]
+                    dropped = entries[MAX_LEADS_PER_EMAIL_DOMAIN:]
+                    final_leads.extend(e[2] for e in kept)
+                    ids_to_delete.extend(e[0] for e in dropped)
+                    print(f"[SANITIZE] Domain limit: {domain} → kept {len(kept)}, dropped {len(dropped)}")
+
+            # Pass 4: atualizar leads válidos (com lead_score numérico)
             updated = 0
             for lead in final_leads:
                 try:
@@ -12013,13 +12303,14 @@ def auto_sanitize_background(batch_id):
                         '''UPDATE leads SET
                             company_name = %s, email = %s, phone = %s, website = %s,
                             address = %s, city = %s, state = %s, contact_name = %s,
-                            quality_score = %s
+                            quality_score = %s, lead_score = %s
                            WHERE id = %s''',
                         (
                             lead.get('company_name'), lead.get('email'), lead.get('phone'),
                             lead.get('website'), lead.get('address'), lead.get('city'),
                             lead.get('state'), lead.get('contact_name'),
-                            lead.get('quality_score'), lead['id']
+                            lead.get('quality_score'), lead.get('lead_score', 0),
+                            lead['id']
                         )
                     )
                     updated += 1
@@ -12030,7 +12321,7 @@ def auto_sanitize_background(batch_id):
                     except Exception:
                         pass
 
-            # Pass 4: deletar leads inválidos/duplicados
+            # Pass 5: deletar leads inválidos/duplicados/excedentes
             deleted = 0
             if ids_to_delete:
                 unique_ids = list(set(ids_to_delete))
