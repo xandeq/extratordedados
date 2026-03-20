@@ -1,12 +1,14 @@
 import { useRouter } from 'next/router'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import Sidebar from './Sidebar'
+import { Header } from './Header'
 import { motion, AnimatePresence } from 'framer-motion'
 
 const noLayoutPages = ['/login', '/']
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const router = useRouter()
+  const [sidebarOpen, setSidebarOpen] = useState(true)
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -58,22 +60,25 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <div className="flex h-screen overflow-hidden bg-gray-50">
-      <Sidebar />
-      <main className="flex-1 overflow-y-auto">
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={router.pathname}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }}
-            transition={{ duration: 0.2 }}
-            className="p-4 md:p-8 max-w-[1400px] mx-auto"
-          >
-            {children}
-          </motion.div>
-        </AnimatePresence>
-      </main>
+    <div className="flex h-screen overflow-hidden bg-gray-50 dark:bg-gray-900">
+      <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <Header onSidebarToggle={() => setSidebarOpen(!sidebarOpen)} />
+        <main className="flex-1 overflow-y-auto">
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={router.pathname}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.2 }}
+              className="p-4 md:p-8 max-w-[1400px] mx-auto"
+            >
+              {children}
+            </motion.div>
+          </AnimatePresence>
+        </main>
+      </div>
     </div>
   )
 }

@@ -5,19 +5,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Visão Geral
 Sistema web de extração automatizada de leads empresariais (emails, telefones, WhatsApp, redes sociais, CNPJ). Permite scraping de URLs, busca por motores de busca, importação JSON, extração de texto e colagem direta. Inclui CRM básico, CRM sync externo, export multi-formato, dashboard analítico, busca massiva (7 métodos paralelos) e pipeline diário automatizado.
 
-**Métodos de extração**: Scraping tradicional (requests+BeautifulSoup), Playwright (Google Maps, LinkedIn), Instagram API (instaloader), Busca em motores (DuckDuckGo, Bing), APIs de enrichment (Hunter.io, Snov.io), Local Business Data (RapidAPI), Diretórios BR (empresas.com.br, Páginas Amarelas, Catálogo.br, GuiaMais, TeleListas, Apontador)
+**Métodos de extração**: Scraping tradicional (requests+BeautifulSoup), Playwright (Google Maps, LinkedIn), Instagram API (instaloader), Busca em motores (DuckDuckGo, Bing), APIs de enrichment (Hunter.io, Snov.io), Local Business Data (RapidAPI), Diretórios BR (empresas.com.br, Páginas Amarelas, Catálogo.br, GuiaMais, TeleListas, Apontador), Apify (Google Maps actor: `lukaskrivka~google-maps-with-contact-details`)
 
 ## Arquitetura
 
 ### Backend
-- **Framework**: Flask (Python 3) — monolito em `project/backend/app.py` (~9200 linhas)
+- **Framework**: Flask (Python 3) — monolito em `project/backend/app.py` (~10k+ linhas)
+- **Módulos auxiliares**: `lead_enrichment.py` (enrichment externo), `scraping_apify_massive.py` (Apify actor jobs)
 - **Banco**: PostgreSQL 16 (Docker container na VPS)
 - **Pool**: psycopg2 SimpleConnectionPool (1-10 conexões)
 - **Rate Limiting**: Flask-Limiter (200/hour default, memory storage)
 - **CORS**: Flask-CORS (aberto)
 - **Proxy**: Traefik → Gunicorn (2 workers, 120s timeout)
 - **Background Jobs**: `threading.Thread(daemon=True)` com conexão dedicada ao DB
-- **Scheduler**: APScheduler `BackgroundScheduler` — pipeline diário às 02:00 (pytz America/Sao_Paulo)
+- **Scheduler**: APScheduler `BackgroundScheduler` — pipeline diário às 02:00 + CRM sync automático às 09:00 (pytz America/Sao_Paulo)
 - **Scraping Básico**: requests + BeautifulSoup4 + lxml
 - **Scraping Avançado**: Playwright (Chromium headless) + Instaloader
 - **Anti-blocking**: User-Agent rotation (30+ agents), delays obrigatórios, CAPTCHA detection, SafetyTracker
@@ -99,18 +100,30 @@ project/
       login.tsx         # Autenticação
       dashboard.tsx     # Analytics com Recharts
       scrape.tsx        # Hub de extração (tabs: busca, url, json, texto, colar)
-      leads.tsx         # CRM com filtros, bulk actions, drawer, botão Sanitizar
+      leads.tsx         # CRM com filtros, bulk actions, drawer, botão Sanitizar, Send to CRM
       massive-search.tsx # Busca massiva 7 métodos — PÁGINA PRINCIPAL
+      app-logs.tsx      # Centro de diagnóstico — logs com classificação de erros + AI prompts
+      plans.tsx         # Planos e uso (free/paid) — usa useClientPlan hook
       batch/[id].tsx    # Progresso e resultados de batch
       results/[id].tsx  # Resultados de job individual
+      admin/
+        index.tsx       # Admin dashboard
+        users.tsx       # Gerenciamento de usuários
+        plans.tsx       # Gerenciamento de planos
+        massive-search.tsx  # Admin: busca massiva centralizada
     components/
       Layout.tsx        # Wrapper com keyboard shortcuts, transitions
+      Header.tsx        # Cabeçalho com UserMenu
       Sidebar.tsx       # Navegação lateral, dark mode toggle
+      UserMenu.tsx      # Menu do usuário logado (avatar, logout)
       ExportModal.tsx   # Modal de exportação (CSV, JSON, WhatsApp, etc.)
+      PlanCard.tsx      # Card de plano/uso (limites de leads/exports)
+      UpgradeModal.tsx  # Modal de upgrade de plano
       InfoBox.tsx       # Caixas informativas com ícones Lucide
       Tooltip.tsx       # Tooltips de hover para rate limits/descrições
     lib/
       api.ts            # Axios instance, baseURL, token interceptor
+      useClientPlan.ts  # Hook: busca /api/client/usage, expõe canViewLeads(), canExport()
     styles/
       globals.css       # Dark mode com CSS raw (NUNCA @apply)
     public/
@@ -204,6 +217,15 @@ deploy.py               # Deploy unificado (SSH backend + FTP frontend)
 - `GET /api/admin/daily-job/status` — últimas 10 execuções
 - `POST /api/admin/daily-job/run` — disparar manualmente (2/hour)
 
+### Admin
+- `GET /api/admin/users` — listar usuários
+- `GET/PUT /api/admin/users/<id>` — detalhar/atualizar usuário
+- `GET /api/admin/plans` — listar planos
+- `GET /api/admin/massive-search` — histórico de buscas massivas (admin view)
+
+### Client / Plans
+- `GET /api/client/usage` — plano atual + limites + uso mensal (leads_viewed, leads_exported)
+
 ### Dashboard / Misc
 - `GET /api/analytics` — métricas do dashboard
 - `GET /api/health` — health check
@@ -273,14 +295,17 @@ process_local_business_data_massive()       # Thread 7: RapidAPI Local Biz
 ## CRM Sync
 
 - Auto-sync disparado após cada batch/search completado (`auto_sync_new_leads_background()`)
-- Destino: `https://api.alexandrequeiroz.com.br` (xandeq@gmail.com)
+- Sync diário agendado às 09:00 America/Sao_Paulo (APScheduler)
+- Destino padrão: `https://api.alexandrequeiroz.com.br` (xandeq@gmail.com)
+- "Send to CRM" na página de Leads: permite enviar para CRM externo com URL + token configuráveis
 - Credenciais no AWS SM `extratordedados/prod` — chaves `CRM_EMAIL`, `CRM_PASS`
+- Normalização de campos antes do sync (branch `feat/crm-sync-normalization`)
 - Max 200 leads por sync, deduplica antes de enviar
 
 ## Convenções de Código
 
 ### Backend (Python)
-- Monolito em `backend/app.py` — **não criar arquivos separados**
+- Monolito em `backend/app.py` — código novo vai aqui; `lead_enrichment.py` e `scraping_apify_massive.py` são exceções já existentes que podem ser importados
 - Funções de scraping são `sync` (requests, não async)
 - Background jobs via `threading.Thread(daemon=True)` com conexão DB dedicada
 - Rate limiting via `@limiter.limit()`
@@ -331,3 +356,4 @@ process_local_business_data_massive()       # Thread 7: RapidAPI Local Biz
 | `name 'fn' is not defined` em threads | Nome de função errado | Verificar nome exato no módulo |
 | Quota RapidAPI esgotada | 500 leads/mês free tier | Flag `quota_exceeded`, nunca para o workflow |
 | AWS SM timeout no Windows | boto3 lento | Timeout 10s + fallback `.deploy.env` |
+| 403 em `/registros` no HostGator | Servidor bloqueia rota por nome | Rota renomeada para `/app-logs` — não voltar para `/registros` |

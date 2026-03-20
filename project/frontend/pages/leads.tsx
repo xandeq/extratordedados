@@ -47,6 +47,21 @@ interface Lead {
   batch_name: string
   batch_id: number
   lead_score: number
+  quality_score: string | null
+  source: string | null
+}
+
+interface SendToCrmPayload {
+  lead_ids: number[]
+  filters: {
+    status: string
+    tag: string
+    city: string
+    state: string
+    search: string
+  }
+  crm_api_url: string
+  crm_auth_token: string
 }
 
 const CRM_STATUSES = [
@@ -102,6 +117,7 @@ export default function Leads() {
   const [tagFilter, setTagFilter] = useState('')
   const [cityFilter, setCityFilter] = useState('')
   const [stateFilter, setStateFilter] = useState('')
+  const [qualityFilter, setQualityFilter] = useState('')
   const [sort, setSort] = useState('newest')
 
   // Location options
@@ -123,6 +139,7 @@ export default function Leads() {
   const [showSendToCrmModal, setShowSendToCrmModal] = useState(false)
   const [crmApiUrl, setCrmApiUrl] = useState('')
   const [crmAuthToken, setCrmAuthToken] = useState('')
+  const [loadingCrmToken, setLoadingCrmToken] = useState(false)
   const [sendingToCrm, setSendingToCrm] = useState(false)
   const [crmSyncResult, setCrmSyncResult] = useState<{
     success: boolean
@@ -164,6 +181,43 @@ export default function Leads() {
   const [deleteAllConfirmText, setDeleteAllConfirmText] = useState('')
   const [deletingAll, setDeletingAll] = useState(false)
 
+  const buildSendToCrmPayload = (): SendToCrmPayload => ({
+    lead_ids: selected.size > 0 ? Array.from(selected) : [],
+    filters: selected.size === 0 ? {
+      status: statusFilter,
+      tag: tagFilter,
+      city: cityFilter,
+      state: stateFilter,
+      search: searchDebounced,
+    } : {
+      status: '',
+      tag: '',
+      city: '',
+      state: '',
+      search: '',
+    },
+    crm_api_url: crmApiUrl.trim(),
+    crm_auth_token: crmAuthToken.trim(),
+  })
+
+  const reportSendToCrmFrontendError = async (payload: SendToCrmPayload, err: any) => {
+    try {
+      await api.post('/api/client-logs/send-to-crm-error', {
+        lead_ids: payload.lead_ids,
+        filters: payload.filters,
+        crm_api_url: payload.crm_api_url,
+        total_leads: payload.lead_ids.length || total,
+        status_code: err?.response?.status,
+        response_data: err?.response?.data,
+        error: err?.response?.data?.error || err?.message || 'Erro ao enviar leads para o CRM',
+        stack: err?.stack || '',
+        stage: err?.response ? 'frontend_api_error' : 'frontend_network_error',
+      })
+    } catch {
+      // best effort only
+    }
+  }
+
 
   // Saved Filters
   interface SavedFilter {
@@ -190,6 +244,20 @@ export default function Leads() {
     no_contact_removed: number
     quality_updated: number
     ids_deleted: number
+  } | null>(null)
+
+  // AI Normalize
+  const [aiNormalizing, setAiNormalizing] = useState(false)
+  const [aiNormalizeReport, setAiNormalizeReport] = useState<{
+    analyzed: number
+    normalized: number
+    name_fixed: number
+    email_fixed: number
+    contact_fixed: number
+    discarded_foreign: number
+    batches_processed: number
+    errors: string[]
+    tokens?: { prompt: number; completion: number; total: number; provider: string; cost_usd: number }
   } | null>(null)
 
   const tagInputRef = useRef<HTMLInputElement>(null)
@@ -220,6 +288,13 @@ export default function Leads() {
   useEffect(() => {
     if (showTagInput && tagInputRef.current) tagInputRef.current.focus()
   }, [showTagInput])
+
+  // Load CRM token automatically when modal opens
+  useEffect(() => {
+    if (showSendToCrmModal && !crmAuthToken) {
+      loadCrmToken()
+    }
+  }, [showSendToCrmModal])
 
   // Debounce search
   useEffect(() => {
@@ -268,6 +343,7 @@ export default function Leads() {
       if (tagFilter) params.append('tag', tagFilter)
       if (cityFilter) params.append('city', cityFilter)
       if (stateFilter) params.append('state', stateFilter)
+      if (qualityFilter) params.append('quality', qualityFilter)
 
       const res = await api.get(`/api/leads?${params.toString()}`, { signal: controller.signal })
       setLeads(res.data.leads)
@@ -281,7 +357,7 @@ export default function Leads() {
     } finally {
       if (!controller.signal.aborted) setLoading(false)
     }
-  }, [page, sort, searchDebounced, statusFilter, tagFilter, cityFilter, stateFilter])
+  }, [page, sort, searchDebounced, statusFilter, tagFilter, cityFilter, stateFilter, qualityFilter])
 
   useEffect(() => { fetchLeads() }, [fetchLeads])
 
@@ -457,6 +533,20 @@ export default function Leads() {
     }
   }
 
+  const handleAiNormalize = async () => {
+    setAiNormalizing(true)
+    try {
+      const payload = selected.size > 0 ? { lead_ids: Array.from(selected) } : {}
+      const res = await api.post('/api/leads/ai-normalize', payload)
+      setAiNormalizeReport(res.data.report)
+      fetchLeads()
+    } catch {
+      addToast('Erro ao normalizar leads com IA', 'error')
+    } finally {
+      setAiNormalizing(false)
+    }
+  }
+
   const handleDrawerUpdate = (updatedLead: Lead) => {
     setLeads(prev => prev.map(l => l.id === updatedLead.id ? updatedLead : l))
     setDrawerLead(updatedLead)
@@ -491,28 +581,43 @@ export default function Leads() {
     }
   }
 
-  const handleSendToCrm = async () => {
-    if (!crmApiUrl.trim() || !crmAuthToken.trim()) {
-      addToast('URL e token do CRM são obrigatórios', 'error')
-      return
+  const loadCrmToken = async () => {
+    setLoadingCrmToken(true)
+    try {
+      const res = await api.get('/api/crm/auto-token')
+      setCrmApiUrl(res.data.crm_url)
+      setCrmAuthToken(res.data.token)
+    } catch (err: any) {
+      const errorMsg = err.response?.data?.error || 'Erro ao obter token do CRM'
+      addToast(errorMsg, 'error')
+    } finally {
+      setLoadingCrmToken(false)
     }
+  }
 
+  const handleSendToCrm = async () => {
     setSendingToCrm(true)
     setCrmSyncResult(null)
-    try {
-      const payload = {
-        lead_ids: selected.size > 0 ? Array.from(selected) : [],
-        filters: selected.size === 0 ? {
-          status: statusFilter,
-          tag: tagFilter,
-          city: cityFilter,
-          state: stateFilter,
-          search: searchDebounced,
-        } : {},
-        crm_api_url: crmApiUrl.trim(),
-        crm_auth_token: crmAuthToken.trim(),
-      }
 
+    // Auto-fetch CRM credentials if not loaded
+    let apiUrl = crmApiUrl
+    let authToken = crmAuthToken
+    if (!apiUrl || !authToken) {
+      try {
+        const tokenRes = await api.get('/api/crm/auto-token')
+        apiUrl = tokenRes.data.crm_url
+        authToken = tokenRes.data.token
+        setCrmApiUrl(apiUrl)
+        setCrmAuthToken(authToken)
+      } catch {
+        setSendingToCrm(false)
+        addToast('Erro ao obter credenciais do CRM', 'error')
+        return
+      }
+    }
+
+    const payload = { ...buildSendToCrmPayload(), crm_api_url: apiUrl, crm_auth_token: authToken }
+    try {
       const res = await api.post('/api/leads/send-to-crm', payload)
       setCrmSyncResult({
         success: true,
@@ -523,11 +628,12 @@ export default function Leads() {
       addToast(`✅ ${res.data.sent_count} leads enviados com sucesso!`, 'success')
     } catch (err: any) {
       const errorMsg = err.response?.data?.error || 'Erro ao enviar leads para o CRM'
+      await reportSendToCrmFrontendError(payload, err)
       setCrmSyncResult({
         success: false,
-        error: errorMsg,
+        error: `Falha ao enviar leads para o CRM: ${errorMsg}`,
       })
-      addToast(errorMsg, 'error')
+      addToast(`Falha ao enviar leads para o CRM: ${errorMsg}`, 'error')
     } finally {
       setSendingToCrm(false)
     }
@@ -592,6 +698,21 @@ export default function Leads() {
               </button>
               <Tooltip
                 text="Corrige nomes com caracteres errados (ex: Caf?? → Café), padroniza maiusculas/minusculas e extrai o nome correto do dominio. Seguro de usar a qualquer momento."
+                position="bottom"
+              />
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={handleAiNormalize}
+                disabled={aiNormalizing}
+                title={selected.size > 0 ? `Normalizar com IA ${selected.size} leads selecionados` : 'Normalizar nomes e emails com IA'}
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white text-sm font-semibold rounded-xl shadow-sm transition-colors"
+              >
+                <Sparkles className="w-4 h-4" />
+                {aiNormalizing ? 'Normalizando...' : selected.size > 0 ? `IA (${selected.size})` : 'Normalizar com IA'}
+              </button>
+              <Tooltip
+                text="Usa IA para corrigir: sufixos jurídicos (LTDA, ME), hifens em nomes, slogans substituídos pelo nome real, typos em emails (gmaiil→gmail), emails inválidos removidos e capitalização correta."
                 position="bottom"
               />
             </div>
@@ -742,6 +863,21 @@ export default function Leads() {
             <Tooltip text="Tags sao etiquetas que voce adiciona manualmente ou o sistema cria automaticamente por segmento (ex: saude, beleza, educacao)." />
           </div>
         )}
+
+        {/* Quality filter */}
+        <div className="flex items-center gap-1">
+          <select
+            value={qualityFilter}
+            onChange={(e) => { setQualityFilter(e.target.value); setPage(1) }}
+            className="px-3 py-2.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500/30 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200"
+          >
+            <option value="">Todos os níveis</option>
+            <option value="premium">Premium (65+)</option>
+            <option value="medio">Médio (35-64)</option>
+            <option value="basico">Básico (&lt;35)</option>
+          </select>
+          <Tooltip text="Filtra leads por qualidade calculada: pontuação 0-100 baseada em email corporativo, telefone válido, WhatsApp, CNPJ, redes sociais." />
+        </div>
 
         {/* Sort */}
         <div className="flex items-center gap-1">
@@ -1114,38 +1250,16 @@ export default function Leads() {
                   </p>
 
                   <div className="space-y-4 mb-6">
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                        URL do CRM *
-                      </label>
-                      <input
-                        type="url"
-                        value={crmApiUrl}
-                        onChange={(e) => setCrmApiUrl(e.target.value)}
-                        placeholder="http://localhost:5062 ou https://api.seucrm.com"
-                        className="w-full px-4 py-3 bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-xl text-sm text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-400 transition-all"
-                      />
-                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        (localhost, 127.0.0.1 ou https://)
-                      </p>
+                    {/* Auto-configured status */}
+                    <div className="p-4 bg-gray-50 dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600">
+                      <div className="flex items-center gap-2">
+                        <span className="inline-block w-2 h-2 bg-emerald-500 rounded-full" />
+                        <span className="text-sm text-gray-700 dark:text-gray-300 font-medium">Conexão CRM auto-configurada</span>
+                      </div>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">api.alexandrequeiroz.com.br</p>
                     </div>
 
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                        Token JWT do CRM *
-                      </label>
-                      <input
-                        type="password"
-                        value={crmAuthToken}
-                        onChange={(e) => setCrmAuthToken(e.target.value)}
-                        placeholder="eyJhbGciOiJIUzI1NiIs..."
-                        className="w-full px-4 py-3 bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-xl text-sm text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-400 transition-all"
-                      />
-                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        Guardado apenas em sessão (sessionStorage)
-                      </p>
-                    </div>
-
+                    {/* Leads Count */}
                     <div className="p-3 bg-indigo-50 dark:bg-indigo-900/30 rounded-lg border border-indigo-100 dark:border-indigo-800">
                       <p className="text-xs text-indigo-700 dark:text-indigo-300">
                         <strong>Leads a enviar:</strong> {selected.size > 0 ? selected.size : total}
@@ -1162,7 +1276,7 @@ export default function Leads() {
                     </button>
                     <button
                       onClick={handleSendToCrm}
-                      disabled={sendingToCrm || !crmApiUrl.trim() || !crmAuthToken.trim()}
+                      disabled={sendingToCrm}
                       className="flex-1 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-semibold rounded-xl transition-colors"
                     >
                       {sendingToCrm ? 'Enviando...' : '📤 Enviar'}
@@ -1414,6 +1528,111 @@ export default function Leads() {
               <button
                 onClick={() => setSanitizeReport(null)}
                 className="w-full px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-semibold text-sm transition-colors"
+              >
+                Fechar
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* AI Normalize Report Modal */}
+      {aiNormalizeReport && (
+        <>
+          <div className="fixed inset-0 bg-black/30 z-40" onClick={() => setAiNormalizeReport(null)} />
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md p-6 animate-fade-in">
+              <div className="flex items-center gap-3 mb-5">
+                <div className="w-12 h-12 rounded-full bg-violet-100 dark:bg-violet-900/30 flex items-center justify-center">
+                  <Sparkles className="w-6 h-6 text-violet-600 dark:text-violet-400" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-gray-900 dark:text-gray-100">Normalização com IA Concluída</h3>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">{aiNormalizeReport.analyzed} leads analisados em {aiNormalizeReport.batches_processed} lote{aiNormalizeReport.batches_processed !== 1 ? 's' : ''}</p>
+                </div>
+              </div>
+
+              <div className="space-y-2 mb-5">
+                <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
+                  <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                    <CheckCircle2 className="w-4 h-4 text-violet-500" />
+                    Leads normalizados
+                  </div>
+                  <span className="font-bold text-violet-600 dark:text-violet-400">{aiNormalizeReport.normalized}</span>
+                </div>
+                <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
+                  <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                    <Building2 className="w-4 h-4 text-blue-500" />
+                    Nomes de empresa corrigidos
+                  </div>
+                  <span className="font-bold text-blue-600 dark:text-blue-400">{aiNormalizeReport.name_fixed}</span>
+                </div>
+                <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
+                  <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                    <Mail className="w-4 h-4 text-emerald-500" />
+                    Emails corrigidos / removidos
+                  </div>
+                  <span className="font-bold text-emerald-600 dark:text-emerald-400">{aiNormalizeReport.email_fixed}</span>
+                </div>
+                <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl">
+                  <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                    <Users className="w-4 h-4 text-orange-500" />
+                    Nomes de contato corrigidos
+                  </div>
+                  <span className="font-bold text-orange-600 dark:text-orange-400">{aiNormalizeReport.contact_fixed}</span>
+                </div>
+                {(aiNormalizeReport.discarded_foreign ?? 0) > 0 && (
+                  <div className="flex items-center justify-between p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl">
+                    <div className="flex items-center gap-2 text-sm text-red-700 dark:text-red-300">
+                      <XCircle className="w-4 h-4 text-red-500" />
+                      Empresas estrangeiras descartadas
+                    </div>
+                    <span className="font-bold text-red-600 dark:text-red-400">{aiNormalizeReport.discarded_foreign}</span>
+                  </div>
+                )}
+                {aiNormalizeReport.errors.length > 0 && (
+                  <div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl">
+                    <p className="text-xs text-red-600 dark:text-red-400 font-medium mb-1">Avisos:</p>
+                    {aiNormalizeReport.errors.map((e, i) => (
+                      <p key={i} className="text-xs text-red-500 dark:text-red-400">{e}</p>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {aiNormalizeReport.tokens && aiNormalizeReport.tokens.total > 0 && (
+                <div className="mb-4 p-3 bg-gray-50 dark:bg-gray-700/50 rounded-xl text-xs text-gray-500 dark:text-gray-400 space-y-1">
+                  <p className="font-semibold text-gray-600 dark:text-gray-300 mb-1">Uso de IA ({aiNormalizeReport.tokens.provider})</p>
+                  <div className="flex justify-between">
+                    <span>Tokens de entrada</span>
+                    <span className="font-mono">{aiNormalizeReport.tokens.prompt.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Tokens de saída</span>
+                    <span className="font-mono">{aiNormalizeReport.tokens.completion.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between font-semibold text-gray-700 dark:text-gray-200">
+                    <span>Total de tokens</span>
+                    <span className="font-mono">{aiNormalizeReport.tokens.total.toLocaleString()}</span>
+                  </div>
+                  {aiNormalizeReport.tokens.cost_usd > 0 && (
+                    <div className="flex justify-between text-emerald-600 dark:text-emerald-400 font-semibold pt-1 border-t border-gray-200 dark:border-gray-600">
+                      <span>Custo estimado</span>
+                      <span className="font-mono">~${aiNormalizeReport.tokens.cost_usd.toFixed(4)} USD</span>
+                    </div>
+                  )}
+                  {aiNormalizeReport.tokens.cost_usd === 0 && (
+                    <div className="flex justify-between text-emerald-600 dark:text-emerald-400 font-semibold pt-1 border-t border-gray-200 dark:border-gray-600">
+                      <span>Custo</span>
+                      <span>Gratuito (Groq)</span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <button
+                onClick={() => setAiNormalizeReport(null)}
+                className="w-full px-4 py-2.5 bg-violet-600 hover:bg-violet-700 text-white rounded-xl font-semibold text-sm transition-colors"
               >
                 Fechar
               </button>

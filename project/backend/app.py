@@ -5841,6 +5841,9 @@ def list_leads():
     batch_id = request.args.get('batch_id', '').strip()
     city = request.args.get('city', '').strip()
     state = request.args.get('state', '').strip()
+    quality = request.args.get('quality', '').strip()  # premium | medio | basico
+    source_filter = request.args.get('source', '').strip()
+    min_score = request.args.get('min_score', '').strip()
     sort = request.args.get('sort', 'newest')
     page = max(1, int(request.args.get('page', 1)))
     per_page = min(100, max(10, int(request.args.get('per_page', 50))))
@@ -5876,6 +5879,21 @@ def list_leads():
     if state:
         query += ' AND l.state ILIKE %s'
         params.append(f'%{state}%')
+
+    # Filtro por tier de qualidade
+    if quality in ('premium', 'medio', 'basico'):
+        query += ' AND l.quality_score = %s'
+        params.append(quality)
+
+    # Filtro por fonte de captura
+    if source_filter:
+        query += ' AND l.source = %s'
+        params.append(source_filter)
+
+    # Filtro por score mínimo numérico
+    if min_score and min_score.isdigit():
+        query += ' AND COALESCE(l.lead_score, 0) >= %s'
+        params.append(int(min_score))
 
     # Count total
     count_query = f'SELECT COUNT(*) FROM ({query}) sub'
@@ -10134,7 +10152,7 @@ def start_massive_search():
     city = (data.get('city') or '').strip()
     state = (data.get('state') or '').strip()
     # Todos os métodos ativos por padrão
-    methods = data.get('methods', ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin'])
+    methods = data.get('methods', ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data'])
     max_pages = min(3, max(1, int(data.get('max_pages', 2))))
     # Semana 7: admin draft mode — batch starts unpublished (is_shared=FALSE)
     is_draft = bool(data.get('is_draft', False))
@@ -14069,6 +14087,276 @@ def admin_reset_user_usage(target_id):
         return jsonify({'error': str(e)}), 500
 
 
+# ============= Admin Quality Endpoints =============
+
+@app.route('/api/admin/rescore-all', methods=['POST'])
+def admin_rescore_all():
+    """
+    Recalcula lead_score (0-100) e quality_score para TODOS os leads.
+    Roda em background. Retorna imediatamente com contagem estimada.
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    if not _is_admin(user_id):
+        return jsonify({'error': 'Admin only'}), 403
+
+    def _rescore_background():
+        conn = psycopg2.connect(**DB_CONFIG)
+        c = conn.cursor()
+        try:
+            c.execute('''SELECT id, company_name, email, phone, website, instagram, facebook,
+                                linkedin, whatsapp, cnpj, quality_score
+                         FROM leads ORDER BY id''')
+            rows = c.fetchall()
+            cols = ['id', 'company_name', 'email', 'phone', 'website', 'instagram', 'facebook',
+                    'linkedin', 'whatsapp', 'cnpj', 'quality_score']
+            total = len(rows)
+            updated = 0
+            for row in rows:
+                lead = dict(zip(cols, row))
+                new_score = calculate_lead_score_numeric(lead)
+                new_tier = calculate_quality_score(lead)
+                try:
+                    c.execute('UPDATE leads SET lead_score = %s, quality_score = %s WHERE id = %s',
+                              (new_score, new_tier, lead['id']))
+                    updated += 1
+                except Exception as e:
+                    print(f'[RESCORE] Error lead {lead["id"]}: {e}')
+                    try: conn.rollback()
+                    except: pass
+            conn.commit()
+            print(f'[RESCORE] ✅ {updated}/{total} leads rescored')
+        except Exception as e:
+            print(f'[RESCORE] ❌ {e}')
+        finally:
+            c.close()
+            conn.close()
+
+    # Conta leads para informar
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM leads')
+        total = c.fetchone()[0]
+
+    threading.Thread(target=_rescore_background, daemon=True).start()
+    return jsonify({'message': f'Rescore iniciado em background para {total} leads', 'total': total})
+
+
+@app.route('/api/admin/global-dedup', methods=['POST'])
+def admin_global_dedup():
+    """
+    Deduplicação global cross-batch:
+    1. Email exato: mantém lead com maior lead_score, remove os outros.
+    2. Fuzzy por nome+cidade (threshold 88): marca como duplicado.
+    Roda em background.
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    if not _is_admin(user_id):
+        return jsonify({'error': 'Admin only'}), 403
+
+    def _global_dedup_background():
+        conn = psycopg2.connect(**DB_CONFIG)
+        c = conn.cursor()
+        try:
+            # --- Pass 1: dedup por email exato ---
+            c.execute('''SELECT id, email, COALESCE(lead_score, 0) as score
+                         FROM leads
+                         WHERE email IS NOT NULL AND email != ''
+                           AND email NOT LIKE '%@%.local'
+                         ORDER BY COALESCE(lead_score, 0) DESC, id ASC''')
+            rows = c.fetchall()
+            seen_emails = {}
+            ids_to_delete = []
+            for lid, email, score in rows:
+                email_clean = email.strip().lower()
+                if email_clean in seen_emails:
+                    ids_to_delete.append(lid)  # já tem um com score maior
+                else:
+                    seen_emails[email_clean] = lid
+
+            deleted_exact = 0
+            if ids_to_delete:
+                c.execute('DELETE FROM leads WHERE id = ANY(%s)', (ids_to_delete,))
+                deleted_exact = len(ids_to_delete)
+                conn.commit()
+            print(f'[GLOBAL-DEDUP] Email exato: {deleted_exact} deletados')
+
+            # --- Pass 2: fuzzy dedup por nome+cidade ---
+            if not _RAPIDFUZZ_AVAILABLE:
+                print('[GLOBAL-DEDUP] rapidfuzz indisponível, pulando fuzzy pass')
+                return
+
+            from rapidfuzz import fuzz
+            c.execute('''SELECT id, LOWER(TRIM(COALESCE(company_name, ''))),
+                                LOWER(TRIM(COALESCE(city, '')))
+                         FROM leads
+                         WHERE company_name IS NOT NULL AND company_name != ''
+                           AND crm_status != 'duplicado'
+                         ORDER BY COALESCE(lead_score, 0) DESC''')
+            rows = c.fetchall()
+            seen_names = []  # list of (id, name_city_key)
+            fuzzy_dups = []
+            for lid, name, city in rows:
+                if not name or len(name) < 4:
+                    continue
+                key = f"{name}|{city}"
+                is_dup = False
+                for sid, skey in seen_names:
+                    sname = skey.split('|')[0]
+                    scity = skey.split('|')[1]
+                    # Só compara mesma cidade
+                    if city and scity and city != scity:
+                        continue
+                    similarity = fuzz.token_sort_ratio(name, sname)
+                    if similarity >= 88:
+                        fuzzy_dups.append(lid)
+                        is_dup = True
+                        break
+                if not is_dup:
+                    seen_names.append((lid, key))
+
+            marked_fuzzy = 0
+            if fuzzy_dups:
+                c.execute('''UPDATE leads SET crm_status = 'duplicado',
+                                tags = CASE WHEN tags IS NULL OR tags = '' THEN 'duplicado_fuzzy'
+                                            WHEN tags NOT LIKE '%%duplicado_fuzzy%%' THEN tags || ',duplicado_fuzzy'
+                                            ELSE tags END
+                             WHERE id = ANY(%s)''', (fuzzy_dups,))
+                marked_fuzzy = len(fuzzy_dups)
+                conn.commit()
+
+            print(f'[GLOBAL-DEDUP] ✅ Email: {deleted_exact} deletados | Fuzzy: {marked_fuzzy} marcados')
+        except Exception as e:
+            print(f'[GLOBAL-DEDUP] ❌ {e}')
+            import traceback; traceback.print_exc()
+        finally:
+            c.close()
+            conn.close()
+
+    threading.Thread(target=_global_dedup_background, daemon=True).start()
+    return jsonify({'message': 'Deduplicação global iniciada em background'})
+
+
+@app.route('/api/admin/bulk-cnpj-enrich', methods=['POST'])
+def admin_bulk_cnpj_enrich():
+    """
+    Enriquecimento CNPJ em massa via BrasilAPI para leads com website .com.br sem CNPJ.
+    Roda em background com throttle (2s entre requisições).
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    if not _is_admin(user_id):
+        return jsonify({'error': 'Admin only'}), 403
+
+    def _bulk_cnpj_background():
+        conn = psycopg2.connect(**DB_CONFIG)
+        c = conn.cursor()
+        try:
+            c.execute('''SELECT id, website, company_name
+                         FROM leads
+                         WHERE (cnpj IS NULL OR cnpj = '')
+                           AND website IS NOT NULL AND website != ''
+                           AND (website ILIKE '%.com.br%' OR website ILIKE '%.med.br%'
+                                OR website ILIKE '%.adv.br%' OR website ILIKE '%.eng.br%')
+                         ORDER BY id
+                         LIMIT 300''')
+            rows = c.fetchall()
+            enriched = 0
+            for lid, website, name in rows:
+                try:
+                    # Extrai domínio do website
+                    domain = re.sub(r'https?://', '', website or '').split('/')[0].strip()
+                    if not domain:
+                        continue
+                    # Tenta buscar CNPJ via BrasilAPI por razão social
+                    # Usa endpoint de busca por nome
+                    search_url = f'https://brasilapi.com.br/api/cnpj/v1/search?query={requests.utils.quote(domain)}'
+                    try:
+                        resp = http_requests.get(search_url, timeout=8,
+                                                  headers={'User-Agent': random.choice(USER_AGENTS)})
+                        if resp.status_code == 200:
+                            results = resp.json()
+                            if isinstance(results, list) and results:
+                                cnpj_found = results[0].get('cnpj', '')
+                                if cnpj_found:
+                                    c.execute('UPDATE leads SET cnpj = %s WHERE id = %s',
+                                              (cnpj_found, lid))
+                                    enriched += 1
+                    except Exception:
+                        pass
+                    time.sleep(2)  # throttle BrasilAPI
+                except Exception as e:
+                    print(f'[BULK-CNPJ] Error lead {lid}: {e}')
+            conn.commit()
+            print(f'[BULK-CNPJ] ✅ {enriched}/{len(rows)} leads enriquecidos com CNPJ')
+        except Exception as e:
+            print(f'[BULK-CNPJ] ❌ {e}')
+        finally:
+            c.close()
+            conn.close()
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('''SELECT COUNT(*) FROM leads
+                     WHERE (cnpj IS NULL OR cnpj = '') AND website IS NOT NULL
+                       AND (website ILIKE '%.com.br%' OR website ILIKE '%.med.br%')''')
+        candidates = c.fetchone()[0]
+
+    threading.Thread(target=_bulk_cnpj_background, daemon=True).start()
+    return jsonify({'message': f'Enriquecimento CNPJ iniciado para ~{candidates} leads', 'candidates': candidates})
+
+
+@app.route('/api/admin/auto-categorize-all', methods=['POST'])
+def admin_auto_categorize_all():
+    """
+    Auto-categoriza leads sem categoria usando auto_tag_lead().
+    Também preenche campos source 'desconhecido' de leads antigos.
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    if not _is_admin(user_id):
+        return jsonify({'error': 'Admin only'}), 403
+
+    with get_db() as conn:
+        c = conn.cursor()
+        # Categorizar leads sem categoria
+        c.execute('''SELECT id, company_name, email, city
+                     FROM leads
+                     WHERE (category IS NULL OR category = '')
+                     ORDER BY id''')
+        rows = c.fetchall()
+        categorized = 0
+        for lid, name, email, city in rows:
+            tags = auto_tag_lead(name or '', email=email, city=city)
+            if tags:
+                category = tags[0]  # usa primeiro tag como categoria
+                tag_str = ','.join(tags)
+                c.execute('''UPDATE leads SET category = %s,
+                                tags = CASE WHEN tags IS NULL OR tags = '' THEN %s
+                                            ELSE tags END
+                             WHERE id = %s''',
+                          (category, tag_str, lid))
+                categorized += 1
+
+        # Normalizar source NULL → 'search_engine' para leads antigos sem source
+        c.execute('''UPDATE leads SET source = 'search_engine'
+                     WHERE (source IS NULL OR source = '')''')
+        source_fixed = c.rowcount
+
+        conn.commit()
+
+    return jsonify({
+        'categorized': categorized,
+        'source_normalized': source_fixed,
+        'message': f'{categorized} leads categorizados, {source_fixed} sources normalizados'
+    })
+
+
 # ============= Scheduler Setup =============
 try:
     if _APSCHEDULER_AVAILABLE:
@@ -14089,9 +14377,82 @@ try:
             id='daily_crm_sync',
             replace_existing=True
         )
+
+        def trigger_weekly_quality_maintenance():
+            """Domingo 03:30 — rescore + global dedup + sanitize de todos os leads."""
+            print('[SCHEDULER] Iniciando manutenção semanal de qualidade...')
+            # Guard: evita double-fire com 2 workers
+            conn = psycopg2.connect(**DB_CONFIG)
+            c = conn.cursor()
+            try:
+                # Rescore
+                c.execute('SELECT id, company_name, email, phone, website, instagram, facebook, linkedin, whatsapp, cnpj FROM leads ORDER BY id')
+                rows = c.fetchall()
+                cols = ['id','company_name','email','phone','website','instagram','facebook','linkedin','whatsapp','cnpj']
+                updated = 0
+                for row in rows:
+                    lead = dict(zip(cols, row))
+                    new_score = calculate_lead_score_numeric(lead)
+                    new_tier = calculate_quality_score(lead)
+                    try:
+                        c.execute('UPDATE leads SET lead_score = %s, quality_score = %s WHERE id = %s',
+                                  (new_score, new_tier, lead['id']))
+                        updated += 1
+                    except Exception:
+                        try: conn.rollback()
+                        except: pass
+                conn.commit()
+                print(f'[WEEKLY-QUALITY] Rescore: {updated} leads atualizados')
+
+                # Global dedup por email
+                c.execute('''SELECT id, email, COALESCE(lead_score, 0)
+                             FROM leads
+                             WHERE email IS NOT NULL AND email != ''
+                               AND email NOT LIKE '%%@%%.local'
+                             ORDER BY COALESCE(lead_score, 0) DESC, id ASC''')
+                email_rows = c.fetchall()
+                seen_e = {}
+                del_ids = []
+                for lid, email, score in email_rows:
+                    ec = (email or '').strip().lower()
+                    if ec in seen_e:
+                        del_ids.append(lid)
+                    else:
+                        seen_e[ec] = lid
+                if del_ids:
+                    c.execute('DELETE FROM leads WHERE id = ANY(%s)', (del_ids,))
+                    conn.commit()
+                print(f'[WEEKLY-QUALITY] Global dedup: {len(del_ids)} removidos')
+
+                # Auto-categorize sem categoria
+                c.execute('SELECT id, company_name, email, city FROM leads WHERE (category IS NULL OR category = \'\')')
+                cat_rows = c.fetchall()
+                categorized = 0
+                for lid, name, email, city in cat_rows:
+                    tags = auto_tag_lead(name or '', email=email, city=city)
+                    if tags:
+                        c.execute('UPDATE leads SET category = %s WHERE id = %s', (tags[0], lid))
+                        categorized += 1
+                conn.commit()
+                print(f'[WEEKLY-QUALITY] Auto-categorize: {categorized} leads categorizados')
+                print('[SCHEDULER] ✅ Manutenção semanal concluída')
+            except Exception as e:
+                print(f'[SCHEDULER] ❌ Erro na manutenção semanal: {e}')
+            finally:
+                c.close()
+                conn.close()
+
+        _scheduler.add_job(
+            trigger_weekly_quality_maintenance,
+            CronTrigger(day_of_week='sun', hour=3, minute=30, timezone=_tz),
+            id='weekly_quality_maintenance',
+            replace_existing=True
+        )
+
         _scheduler.start()
         print(f"[SCHEDULER] Pipeline diário agendado: {DAILY_JOB_HOUR:02d}:00 America/Sao_Paulo")
         print(f"[SCHEDULER] CRM sync diário agendado: {DAILY_CRM_SYNC_HOUR:02d}:00 America/Sao_Paulo")
+        print(f"[SCHEDULER] Manutenção semanal agendada: Domingo 03:30 America/Sao_Paulo")
     else:
         print("[SCHEDULER] APScheduler indisponível — instale: pip install APScheduler pytz")
 except Exception as _sched_err:

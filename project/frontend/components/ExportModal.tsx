@@ -9,6 +9,7 @@ import { useToast } from './Toast'
 interface ExportModalProps {
   onClose: () => void
   totalLeads: number
+  onUpgradeRequired?: () => void
   filters?: {
     search?: string
     status?: string
@@ -71,7 +72,7 @@ const FORMATS = [
 
 const WA_VARIABLES = ['{empresa}', '{email}', '{website}', '{telefone}', '{contato}']
 
-export default function ExportModal({ onClose, totalLeads, filters = {} }: ExportModalProps) {
+export default function ExportModal({ onClose, totalLeads, onUpgradeRequired, filters = {} }: ExportModalProps) {
   const { addToast } = useToast()
   const [selectedFormat, setSelectedFormat] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
@@ -108,7 +109,10 @@ export default function ExportModal({ onClose, totalLeads, filters = {} }: Expor
       addToast(`${filename} baixado com sucesso!`, 'success')
       onClose()
     } catch (err: any) {
-      if (err.response?.status === 404) {
+      if (err.response?.status === 403 && err.response?.data?.plan) {
+        onClose()
+        onUpgradeRequired?.()
+      } else if (err.response?.status === 404) {
         addToast('Nenhum lead para exportar com esses filtros', 'error')
       } else {
         addToast('Erro ao exportar leads', 'error')

@@ -27,6 +27,7 @@ FRONTEND_DIR = os.path.join(ROOT, 'project', 'frontend')
 OUT_DIR      = os.path.join(FRONTEND_DIR, 'out')
 APP_PY       = os.path.join(ROOT, 'project', 'backend', 'app.py')
 REQ_TXT      = os.path.join(ROOT, 'project', 'backend', 'requirements.txt')
+SECRETS_CACHE_PATH = os.path.join(ROOT, '.secrets.cache.json')
 
 # ?? Credenciais ??????????????????????????????????????????????????????????????
 
@@ -43,8 +44,27 @@ def _load_deploy_env():
                     data[k.strip()] = v.strip()
     return data
 
+def _load_secrets_cache():
+    try:
+        with open(SECRETS_CACHE_PATH, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_secret_cache(secret_id, secret_data):
+    if not secret_id or not isinstance(secret_data, dict):
+        return
+    cache = _load_secrets_cache()
+    cache[secret_id] = secret_data
+    try:
+        with open(SECRETS_CACHE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 def _load_aws_secrets():
-    """Tenta AWS SM via CLI (subprocess) com timeout de 10s para nao travar no Windows."""
+    """Tenta AWS SM via CLI; se falhar, usa cache local persistido."""
     try:
         import subprocess, json as _json
         result = subprocess.run(
@@ -54,10 +74,14 @@ def _load_aws_secrets():
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0 and result.stdout.strip():
-            return _json.loads(result.stdout.strip())
+            data = _json.loads(result.stdout.strip())
+            if isinstance(data, dict):
+                _save_secret_cache('extratordedados/prod', data)
+                return data
     except Exception as e:
         print(f"   [AWS SM] indisponivel ({type(e).__name__}) -- usando fallback")
-    return {}
+    cached = _load_secrets_cache().get('extratordedados/prod')
+    return cached if isinstance(cached, dict) else {}
 
 def get_credentials():
     print("Carregando credenciais...")
@@ -196,8 +220,10 @@ def deploy_frontend(creds):
 
     write_htaccess()
 
-    ftp = ftplib.FTP(creds['FTP_HOST'])
+    ftp = ftplib.FTP()
+    ftp.connect(creds['FTP_HOST'], 21, timeout=60)
     ftp.login(creds['FTP_USER'], creds['FTP_PASS'])
+    ftp.set_pasv(True)
     ftp.encoding = 'utf-8'
     print(f"Conectado ao FTP: {creds['FTP_HOST']}\n")
 
@@ -214,17 +240,17 @@ def deploy_frontend(creds):
             except ftplib.error_perm:
                 try:
                     ftp.mkd(cur)
-                    # Garante permissao 755 (rwxr-xr-x) para o Apache ler o diretorio
                     try:
                         ftp.voidcmd(f'SITE CHMOD 755 {cur}')
                     except Exception:
                         pass
+                    ftp.cwd(cur)
                 except ftplib.error_perm:
                     pass
 
     def upload_dir(local, remote):
         ensure_dir(remote)
-        for item in os.listdir(local):
+        for item in sorted(os.listdir(local)):
             lp = os.path.join(local, item)
             rp = remote + '/' + item
             if os.path.isdir(lp):
@@ -233,7 +259,6 @@ def deploy_frontend(creds):
                 try:
                     with open(lp, 'rb') as f:
                         ftp.storbinary(f'STOR {rp}', f)
-                    # Garante permissao 644 (rw-r--r--) para o Apache ler o arquivo
                     try:
                         ftp.voidcmd(f'SITE CHMOD 644 {rp}')
                     except Exception:
