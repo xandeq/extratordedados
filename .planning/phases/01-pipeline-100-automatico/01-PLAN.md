@@ -9,9 +9,10 @@ files_modified:
   - tests/test_pipeline_config.py
 autonomous: true
 requirements:
-  - FASE1-BACK-01
-  - FASE1-BACK-02
-  - FASE1-BACK-03
+  - pipeline_config-table
+  - config-endpoints
+  - pipeline-reads-db
+  - scheduler-reschedule
 
 must_haves:
   truths:
@@ -25,7 +26,7 @@ must_haves:
       provides: "pipeline_config table DDL in init_db(), get_pipeline_config(), updated trigger_daily_pipeline(), GET/PUT /api/admin/pipeline-config endpoints"
       contains: "pipeline_config"
     - path: "tests/test_pipeline_config.py"
-      provides: "Pytest tests for config endpoints"
+      provides: "Pytest smoke tests for config endpoints against live API"
       exports: ["test_get_config_unauthenticated_returns_401", "test_get_config_admin_returns_keys", "test_put_config_updates_niches"]
   key_links:
     - from: "trigger_daily_pipeline()"
@@ -213,15 +214,6 @@ Note: `json` is already imported at the top of app.py (verify with grep before a
     <automated>cd "C:/Users/acq20/Desktop/Trabalho/Alexandre Queiroz Marketing Digital/DIAX/extrator-de-dados" && python -c "import ast, sys; ast.parse(open('app/backend/app.py').read()); print('syntax OK')"</automated>
   </verify>
 
-  <acceptance_criteria>
-    - grep confirms `CREATE TABLE IF NOT EXISTS pipeline_config` exists in app/backend/app.py
-    - grep confirms `def get_pipeline_config():` exists in app/backend/app.py
-    - grep confirms `ON CONFLICT (key) DO NOTHING` in the INSERT seed block
-    - grep confirms `json.loads(v)` inside get_pipeline_config (values stored as JSON)
-    - grep confirms fallback: `return {` with `DAILY_JOB_NICHES` inside the except block of get_pipeline_config
-    - Python syntax check passes: `python -c "import ast; ast.parse(open('app/backend/app.py').read())"`
-  </acceptance_criteria>
-
   <done>pipeline_config table created in init_db() with seed data; get_pipeline_config() implemented with fallback to module constants.</done>
 </task>
 
@@ -234,7 +226,8 @@ Note: `json` is already imported at the top of app.py (verify with grep before a
     - app/backend/app.py lines 13300-13348 (GET /api/admin/daily-job/status endpoint — insert new endpoints nearby)
     - app/backend/app.py lines 14571-14665 (APScheduler initialization block — reschedule_job call location)
     - .planning/research/pipeline-automation.md lines 107-144 (exact PUT endpoint code with reschedule_job)
-    - tests/conftest.py (existing test fixtures and patterns)
+    - tests/conftest.py (existing live-API fixtures: api_base, auth_headers)
+    - tests/test_health.py (live-API test pattern — match this exactly)
   </read_first>
 
   <behavior>
@@ -243,9 +236,9 @@ Note: `json` is already imported at the top of app.py (verify with grep before a
     - PUT /api/admin/pipeline-config accepts JSON body: {niches?: string[], region?: string, hour?: int, minute?: int, notify_email?: string|null, healthcheck_url?: string|null}
     - PUT persists each provided key as JSON string via INSERT ... ON CONFLICT DO UPDATE
     - PUT calls scheduler.reschedule_job('daily_pipeline', ...) only when hour or minute is in the request body
-    - test_get_config_unauthenticated_returns_401: GET without token returns 401
-    - test_get_config_admin_returns_keys: mocked admin GET returns JSON with keys niches, region, hour, minute
-    - test_put_config_updates_niches: mocked admin PUT {niches: ['foo']} returns 200 with {success: true}
+    - test_get_config_unauthenticated_returns_401: GET without token → live API → 401
+    - test_get_config_admin_returns_keys: GET with auth_headers → live API → JSON with keys niches, region, hour, minute
+    - test_put_config_updates_niches: PUT with auth_headers → live API → 200 with {success: true}
   </behavior>
 
   <action>
@@ -344,34 +337,50 @@ def admin_update_pipeline_config():
 
 **Step 3: Create tests/test_pipeline_config.py**
 
+Use the live-API pattern from tests/test_health.py and tests/conftest.py.
+The existing conftest.py provides: `api_base` (str URL), `auth_headers` (dict with Bearer token).
+Do NOT use Flask test client (`client`, `admin_client`) — those fixtures do not exist.
+
 ```python
-"""Tests for pipeline config endpoints — Phase 1."""
-import json
-import pytest
+"""Smoke tests for pipeline config endpoints — Phase 1.
+Uses live-API fixtures from conftest.py (api_base, auth_headers).
+Hits https://api.extratordedados.com.br — requires deploy before running.
+"""
+import requests
 
-# These tests use the existing conftest.py fixtures from tests/conftest.py
-# They mock DB calls — no live DB required for CI.
 
-def test_get_config_unauthenticated_returns_401(client):
-    resp = client.get('/api/admin/pipeline-config')
+def test_get_config_unauthenticated_returns_401(api_base):
+    """GET /api/admin/pipeline-config without token returns 401."""
+    resp = requests.get(f"{api_base}/api/admin/pipeline-config", timeout=10)
     assert resp.status_code == 401
 
-def test_put_config_unauthenticated_returns_401(client):
-    resp = client.put('/api/admin/pipeline-config',
-                      data=json.dumps({'niches': ['foo']}),
-                      content_type='application/json')
-    assert resp.status_code == 401
 
-def test_put_config_returns_success_structure(admin_client):
-    """Admin PUT with valid niches list returns {success: true}."""
-    resp = admin_client.put('/api/admin/pipeline-config',
-                            data=json.dumps({'niches': ['restaurante', 'academia']}),
-                            content_type='application/json')
-    # Accept 200 or 403 if admin_client fixture is not admin — test structure only
-    if resp.status_code == 200:
-        data = resp.get_json()
-        assert 'success' in data
-        assert data['success'] is True
+def test_get_config_admin_returns_keys(api_base, auth_headers):
+    """GET /api/admin/pipeline-config with admin token returns expected keys."""
+    resp = requests.get(
+        f"{api_base}/api/admin/pipeline-config",
+        headers=auth_headers,
+        timeout=10,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    for key in ('niches', 'region', 'hour', 'minute'):
+        assert key in data, f"Missing key: {key}"
+    assert isinstance(data['niches'], list)
+    assert isinstance(data['hour'], int)
+
+
+def test_put_config_updates_niches(api_base, auth_headers):
+    """PUT /api/admin/pipeline-config with valid body returns {success: true}."""
+    resp = requests.put(
+        f"{api_base}/api/admin/pipeline-config",
+        headers={**auth_headers, "Content-Type": "application/json"},
+        json={"niches": ["restaurante", "academia"]},
+        timeout=10,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data.get("success") is True
 ```
   </action>
 
@@ -379,18 +388,7 @@ def test_put_config_returns_success_structure(admin_client):
     <automated>cd "C:/Users/acq20/Desktop/Trabalho/Alexandre Queiroz Marketing Digital/DIAX/extrator-de-dados" && python -c "import ast, sys; ast.parse(open('app/backend/app.py').read()); print('syntax OK')" && python -m pytest tests/test_pipeline_config.py -x -q 2>&1 | head -30</automated>
   </verify>
 
-  <acceptance_criteria>
-    - grep confirms `cfg = get_pipeline_config()` inside `trigger_daily_pipeline` function body (not fallback to DAILY_JOB_NICHES directly)
-    - grep confirms `def admin_get_pipeline_config():` exists in app/backend/app.py
-    - grep confirms `def admin_update_pipeline_config():` exists in app/backend/app.py
-    - grep confirms `reschedule_job` call inside `admin_update_pipeline_config`
-    - grep confirms `ON CONFLICT (key) DO UPDATE` inside `admin_update_pipeline_config`
-    - tests/test_pipeline_config.py exists with at least 3 test functions
-    - Python syntax check passes on app/backend/app.py
-    - `python -m pytest tests/test_pipeline_config.py -x -q` exits 0 (or only skips, no failures)
-  </acceptance_criteria>
-
-  <done>trigger_daily_pipeline() reads config from DB; GET and PUT endpoints live; tests pass.</done>
+  <done>trigger_daily_pipeline() reads config from DB; GET and PUT endpoints live; live-API smoke tests in tests/test_pipeline_config.py pass against deployed API.</done>
 </task>
 
 </tasks>
@@ -421,7 +419,7 @@ python -m pytest tests/test_pipeline_config.py -v
 - `trigger_daily_pipeline()` calls `get_pipeline_config()` — NOT bare module constants
 - `GET /api/admin/pipeline-config` returns JSON with keys: niches, region, hour, minute, notify_email, healthcheck_url
 - `PUT /api/admin/pipeline-config` persists updates and triggers `reschedule_job` on time change
-- All tests in `tests/test_pipeline_config.py` pass
+- All tests in `tests/test_pipeline_config.py` pass against live API
 </success_criteria>
 
 <output>

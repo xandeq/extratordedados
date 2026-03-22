@@ -11,9 +11,8 @@ files_modified:
   - app/frontend/pages/admin/index.tsx
 autonomous: false
 requirements:
-  - FASE1-FRONT-01
-  - FASE1-FRONT-02
-  - FASE1-FRONT-03
+  - frontend-config-page
+  - frontend-health-card
 
 must_haves:
   truths:
@@ -242,20 +241,7 @@ interface PipelineConfig {
     <automated>cd "C:/Users/acq20/Desktop/Trabalho/Alexandre Queiroz Marketing Digital/DIAX/extrator-de-dados/app/frontend" && npx tsc --noEmit --skipLibCheck 2>&1 | grep -E "pipeline-config|error TS" | head -20</automated>
   </verify>
 
-  <acceptance_criteria>
-    - File exists: app/frontend/pages/admin/pipeline-config.tsx
-    - grep confirms `api.get('/api/admin/pipeline-config')` in the file
-    - grep confirms `api.put('/api/admin/pipeline-config'` in the file
-    - grep confirms `PIPELINE_NICHES` constant array in the file
-    - grep confirms `REGIONS` constant array in the file
-    - grep confirms `notify_email` state/form field in the file
-    - grep confirms `healthcheck_url` state/form field in the file
-    - grep confirms `dark:bg-gray-800` or similar dark mode class (not @apply)
-    - TypeScript check: `npx tsc --noEmit --skipLibCheck` produces no errors for this file
-    - File is at least 150 lines (substantive implementation, not stub)
-  </acceptance_criteria>
-
-  <done>Pipeline config editor page at /admin/pipeline-config: loads config from API, shows niche toggles, region picker, schedule inputs, notification fields, Save button.</done>
+  <done>Pipeline config editor page at /admin/pipeline-config: loads config from API, shows niche toggles, region picker, schedule inputs, notification fields, Save button with success/error toast.</done>
 </task>
 
 <task type="checkpoint:human-verify" gate="blocking">
@@ -399,17 +385,7 @@ Do NOT break existing page functionality — only ADD new state variables, impor
     <automated>cd "C:/Users/acq20/Desktop/Trabalho/Alexandre Queiroz Marketing Digital/DIAX/extrator-de-dados/app/frontend" && npx tsc --noEmit --skipLibCheck 2>&1 | grep -E "admin/index|error TS" | head -20</automated>
   </verify>
 
-  <acceptance_criteria>
-    - grep confirms `pipeline/health` in app/frontend/pages/admin/index.tsx (API call)
-    - grep confirms `pipeline-config` href in QUICK_LINKS or JSX link in the file
-    - grep confirms `stats_30d` or `pipelineHealth` state usage in JSX (health data rendered)
-    - grep confirms `pipelineJobs` state with history table rows (or similar variable name)
-    - grep confirms status badge logic: `completed` mapped to green color class
-    - TypeScript check produces no errors for admin/index.tsx
-    - Existing QUICK_LINKS still intact (users, plans, leads, logs links not removed)
-  </acceptance_criteria>
-
-  <done>Admin index shows pipeline health card with last run status, 4 metrics, 30-day history table, and link to /admin/pipeline-config.</done>
+  <done>Admin index page updated with pipeline health card showing last run status badge, 4 metric tiles, 30-day history table, and quick-link to /admin/pipeline-config; existing quick links and page sections intact.</done>
 </task>
 
 </tasks>

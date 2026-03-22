@@ -10,11 +10,10 @@ files_modified:
   - tests/test_pipeline_health.py
 autonomous: true
 requirements:
-  - FASE1-BACK-04
-  - FASE1-BACK-05
-  - FASE1-BACK-06
-  - FASE1-BACK-07
-  - FASE1-BACK-08
+  - health-endpoint
+  - brevo-email-report
+  - healthchecks-ping
+  - pipeline-reads-db
 
 must_haves:
   truths:
@@ -29,7 +28,7 @@ must_haves:
       provides: "GET /api/admin/pipeline/health, _generate_and_send_pipeline_report(), send_pipeline_email_report(), _ping_healthcheck(), _get_brevo_credentials()"
       contains: "pipeline/health"
     - path: "tests/test_pipeline_health.py"
-      provides: "Tests for health endpoint structure"
+      provides: "Live-API smoke tests for health endpoint structure"
       exports: ["test_health_unauthenticated", "test_health_response_keys"]
   key_links:
     - from: "run_daily_pipeline() step 7 (UPDATE daily_jobs SET status='completed')"
@@ -107,7 +106,7 @@ leads_found   — int (updated incrementally by pipeline)
 sanitized_count — int (tracked in step 3)
 synced        — int (tracked in step 6)
 skipped       — int (tracked in step 6)
-pipeline_start — datetime (capture at start of function)
+pipeline_start — datetime (MUST be captured as absolute first line of function body)
 ```
 
 AWS Secrets Manager pattern in app.py:
@@ -147,7 +146,8 @@ import requests as http_requests
     - app/backend/app.py lines 13300-13350 (GET /api/admin/daily-job/status endpoint — insert new endpoint nearby)
     - app/backend/app.py lines 1389-1402 (daily_jobs table columns for query reference)
     - .planning/research/pipeline-automation.md lines 323-385 (exact SQL queries for health endpoint)
-    - tests/conftest.py (test client fixtures)
+    - tests/conftest.py (existing live-API fixtures: api_base, auth_headers)
+    - tests/test_health.py (live-API test pattern — match this exactly)
   </read_first>
 
   <behavior>
@@ -156,8 +156,8 @@ import requests as http_requests
     - last_run contains: id, status, started_at (ISO), finished_at (ISO)|null, leads_found, leads_sanitized, leads_synced, error_message, region_used, duration_min (float|null)
     - stats_30d.total and stats_30d.successful are integers; avg_leads is float rounded to 1 decimal
     - If no daily_jobs rows exist, last_run is null and all stats_30d values are 0
-    - test_health_unauthenticated: GET without token returns 401
-    - test_health_response_keys: mock test verifies response JSON has keys last_run, next_scheduled, stats_30d, scheduler_running
+    - test_health_unauthenticated: GET /api/admin/pipeline/health without token → live API → 401
+    - test_health_response_keys: GET with auth_headers → live API → JSON has keys last_run, next_scheduled, stats_30d, scheduler_running
   </behavior>
 
   <action>
@@ -236,29 +236,40 @@ def admin_pipeline_health():
     }), 200
 ```
 
-Create tests/test_pipeline_health.py:
+Create tests/test_pipeline_health.py using the live-API pattern from tests/test_health.py.
+The existing conftest.py provides: `api_base` (str URL), `auth_headers` (dict with Bearer token).
+Do NOT use Flask test client (`client`, `admin_client`) — those fixtures do not exist.
 
 ```python
-"""Tests for GET /api/admin/pipeline/health — Phase 1."""
+"""Smoke tests for GET /api/admin/pipeline/health — Phase 1.
+Uses live-API fixtures from conftest.py (api_base, auth_headers).
+Hits https://api.extratordedados.com.br — requires deploy before running.
+"""
+import requests
 
 
-def test_health_unauthenticated_returns_401(client):
-    resp = client.get('/api/admin/pipeline/health')
+def test_health_unauthenticated_returns_401(api_base):
+    """GET /api/admin/pipeline/health without token returns 401."""
+    resp = requests.get(f"{api_base}/api/admin/pipeline/health", timeout=10)
     assert resp.status_code == 401
 
 
-def test_health_response_has_required_keys(admin_client):
-    """If admin_client fixture provides admin auth, check response shape."""
-    resp = admin_client.get('/api/admin/pipeline/health')
-    if resp.status_code == 200:
-        data = resp.get_json()
-        assert 'last_run' in data
-        assert 'next_scheduled' in data
-        assert 'stats_30d' in data
-        assert 'scheduler_running' in data
-        stats = data['stats_30d']
-        for key in ('total', 'successful', 'avg_leads', 'max_leads'):
-            assert key in stats
+def test_health_response_has_required_keys(api_base, auth_headers):
+    """GET /api/admin/pipeline/health with admin token returns expected shape."""
+    resp = requests.get(
+        f"{api_base}/api/admin/pipeline/health",
+        headers=auth_headers,
+        timeout=10,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert 'last_run' in data
+    assert 'next_scheduled' in data
+    assert 'stats_30d' in data
+    assert 'scheduler_running' in data
+    stats = data['stats_30d']
+    for key in ('total', 'successful', 'avg_leads', 'max_leads'):
+        assert key in stats, f"Missing stats_30d key: {key}"
 ```
   </action>
 
@@ -266,17 +277,7 @@ def test_health_response_has_required_keys(admin_client):
     <automated>cd "C:/Users/acq20/Desktop/Trabalho/Alexandre Queiroz Marketing Digital/DIAX/extrator-de-dados" && python -c "import ast; ast.parse(open('app/backend/app.py').read()); print('syntax OK')" && python -m pytest tests/test_pipeline_health.py -x -q 2>&1 | head -20</automated>
   </verify>
 
-  <acceptance_criteria>
-    - grep confirms `def admin_pipeline_health():` exists in app/backend/app.py
-    - grep confirms `@app.route('/api/admin/pipeline/health'` exists in app/backend/app.py
-    - grep confirms `stats_30d` in the return jsonify block
-    - grep confirms `scheduler_running` in the return jsonify block
-    - grep confirms `duration_min` in the SQL query (EXTRACT(EPOCH...))
-    - tests/test_pipeline_health.py exists with 2 test functions
-    - Python syntax check passes
-  </acceptance_criteria>
-
-  <done>Health endpoint live; returns last_run, next_scheduled, stats_30d, scheduler_running, config.</done>
+  <done>Health endpoint live at GET /api/admin/pipeline/health; returns last_run, next_scheduled, stats_30d, scheduler_running, config; live-API smoke tests in tests/test_pipeline_health.py pass.</done>
 </task>
 
 <task type="auto">
@@ -403,9 +404,12 @@ def _generate_and_send_pipeline_report(daily_job_id: int, report_data: dict) -> 
 
 **Step 2: Capture pipeline_start and call report at end of run_daily_pipeline()**
 
-At the very start of `run_daily_pipeline` function body (line ~12855, just after the `print` statement), add:
+`pipeline_start = datetime.now()` MUST be the **absolute first line** of `run_daily_pipeline()` function body — before any other statement, including print calls. This guarantees it is always bound even if an exception fires at any point in the function.
+
 ```python
-    pipeline_start = datetime.now()
+def run_daily_pipeline(daily_job_id, niches, region_id, user_id):
+    pipeline_start = datetime.now()   # MUST be first — before any other line
+    # ... rest of function follows
 ```
 
 After step 7 (`c.execute("UPDATE daily_jobs SET status='completed'...")`) and BEFORE `finally`, add the report call — it must be inside the main `try` block but AFTER the UPDATE, to ensure DB is already committed:
@@ -433,41 +437,29 @@ Also add a failure ping in the `except Exception as e:` block of run_daily_pipel
 ```python
         try:
             _generate_and_send_pipeline_report(daily_job_id, {
-                'date':          datetime.now().strftime('%Y-%m-%d'),
-                'region':        region_id,
-                'niches':        niches,
-                'leads_found':   0,
-                'leads_sanitized': 0,
-                'leads_synced':  0,
-                'status':        'failed',
-                'error_message': str(e)[:200],
-                'duration_min':  round((datetime.now() - pipeline_start).total_seconds() / 60, 1),
-                'batch_id':      locals().get('batch_id'),
+                'date':            datetime.now().strftime('%Y-%m-%d'),
+                'region':          region_id,
+                'niches':          niches,
+                'leads_found':     locals().get('leads_found', 0),
+                'leads_sanitized': locals().get('sanitized_count', 0),
+                'leads_synced':    locals().get('synced', 0),
+                'status':          'failed',
+                'error_message':   str(e)[:200],
+                'duration_min':    round((datetime.now() - pipeline_start).total_seconds() / 60, 1) if 'pipeline_start' in locals() else 0,
+                'batch_id':        locals().get('batch_id'),
             })
         except Exception:
             pass
 ```
 
-Note: `sanitized_count`, `synced`, `leads_found`, `batch_id` are local variables tracked during pipeline steps. If they are not yet defined when the exception fires (early failure), use `locals().get()` with a default of 0.
+Note: Using `if 'pipeline_start' in locals() else 0` in the failure path is a safety guard only. Because `pipeline_start = datetime.now()` is set as the absolute first line of the function, `pipeline_start` will always be bound in practice. The guard is defensive code for any unexpected early-exit scenario.
   </action>
 
   <verify>
     <automated>cd "C:/Users/acq20/Desktop/Trabalho/Alexandre Queiroz Marketing Digital/DIAX/extrator-de-dados" && python -c "import ast; ast.parse(open('app/backend/app.py').read()); print('syntax OK')"</automated>
   </verify>
 
-  <acceptance_criteria>
-    - grep confirms `def _get_brevo_credentials():` in app/backend/app.py
-    - grep confirms `def send_pipeline_email_report(` in app/backend/app.py
-    - grep confirms `def _ping_healthcheck(` in app/backend/app.py
-    - grep confirms `def _generate_and_send_pipeline_report(` in app/backend/app.py
-    - grep confirms `_generate_and_send_pipeline_report(daily_job_id,` inside run_daily_pipeline function
-    - grep confirms `pipeline_start = datetime.now()` inside run_daily_pipeline
-    - grep confirms `api.brevo.com/v3/smtp/email` in send_pipeline_email_report
-    - grep confirms `check_url + suffix` in _ping_healthcheck (handles both success and /fail)
-    - Python syntax check passes
-  </acceptance_criteria>
-
-  <done>Brevo email report and healthchecks.io ping implemented; run_daily_pipeline calls _generate_and_send_pipeline_report after step 7; all notification code is try/except protected.</done>
+  <done>_get_brevo_credentials(), send_pipeline_email_report(), _ping_healthcheck(), and _generate_and_send_pipeline_report() implemented; pipeline_start captured as the absolute first line of run_daily_pipeline(); report called after both success (step 8) and failure paths; all notification code is try/except protected.</done>
 </task>
 
 </tasks>
@@ -496,6 +488,7 @@ python -m pytest tests/test_pipeline_health.py -v
 - send_pipeline_email_report() uses Brevo API key from AWS SM (via _fetch_secret_blob_from_aws)
 - _ping_healthcheck() sends /fail suffix on failure, bare URL on success
 - _generate_and_send_pipeline_report() called after both success and failure paths in run_daily_pipeline
+- pipeline_start = datetime.now() is the absolute first line of run_daily_pipeline()
 - No new library imports required (requests already imported as http_requests)
 - All notification functions wrapped in try/except
 </success_criteria>
