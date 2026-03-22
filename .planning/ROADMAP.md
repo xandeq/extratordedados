@@ -13,7 +13,7 @@
 
 ---
 
-### Phase 1 — Pipeline 100% Automático
+### Phase 1: Pipeline 100% Automático
 
 **Goal**: Operador abre o sistema de manhã e vê relatório do que rodou à noite. Nichos configuráveis sem editar código.
 
@@ -21,7 +21,7 @@
 
 **Scope**:
 - Tabela `pipeline_config` no DB (nichos, região, hora, ativo)
-- `GET/PUT /api/admin/pipeline/config`
+- `GET/PUT /api/admin/pipeline-config`
 - `run_daily_pipeline()` lê do DB (não mais hardcoded)
 - Reschedule dinâmico via `scheduler.reschedule_job()`
 - `GET /api/admin/pipeline/health` — última execução, taxa 30d, próxima
@@ -34,9 +34,16 @@
 
 **Out of scope**: WhatsApp notifications (Fase posterior), Redis
 
+**Plans:** 3 plans
+
+Plans:
+- [ ] 01-PLAN.md — DB migration + pipeline_config table + GET/PUT config endpoints + trigger_daily_pipeline() wired to DB
+- [ ] 02-PLAN.md — GET /api/admin/pipeline/health + Brevo email report + healthchecks.io ping
+- [ ] 03-PLAN.md — Frontend /admin/pipeline-config editor + admin index health card + 30-day history
+
 ---
 
-### Phase 2 — Qualidade de Leads
+### Phase 2: Qualidade de Leads
 
 **Goal**: Cada lead tem score A-F auditável. Emails inválidos não entram na base. Telefones normalizados.
 
@@ -59,7 +66,7 @@
 
 ---
 
-### Phase 3 — Novas Fontes (Receita Federal + Outscraper)
+### Phase 3: Novas Fontes (Receita Federal + Outscraper)
 
 **Goal**: Base enriquecida com dados oficiais de 60M+ empresas brasileiras. Novos métodos de extração.
 
@@ -88,7 +95,7 @@
 
 ---
 
-### Phase 4 — Tier Cliente + Reveal Gate + Busca Avançada
+### Phase 4: Tier Cliente + Reveal Gate + Busca Avançada
 
 **Goal**: Clientes se cadastram e acessam base mascarada com sistema de créditos. Reveal gate converte free → paid.
 
@@ -113,7 +120,7 @@
 
 ---
 
-### Phase 5 — Export com Cotas + Niche Request Queue
+### Phase 5: Export com Cotas + Niche Request Queue
 
 **Goal**: Clientes exportam listas pagas. Solicitam nichos que ainda não existem na base.
 
@@ -130,7 +137,7 @@
 
 ---
 
-### Phase 6 — Saved Searches + Notificações de Novos Leads
+### Phase 6: Saved Searches + Notificações de Novos Leads
 
 **Goal**: Clientes recebem email quando chegam novos leads nos filtros salvos. Máxima retenção.
 
