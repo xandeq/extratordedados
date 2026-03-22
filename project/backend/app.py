@@ -510,6 +510,36 @@ except ImportError:
     def wait_exponential(**kw): return None
     def retry_if_exception_type(t): return None
 
+import logging
+import logging.handlers
+
+# ============= Logging Setup =============
+# Structured logging with levels — replaces print() for critical paths.
+# Existing print() calls are still captured by Gunicorn stdout.
+_log_formatter = logging.Formatter(
+    '[%(asctime)s] %(levelname)s %(name)s — %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger('extrator')
+logger.setLevel(logging.DEBUG)
+
+# Console handler (Gunicorn captures stderr)
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(_log_formatter)
+logger.addHandler(_console_handler)
+
+# Rotating file handler (errors only, 5MB × 3)
+try:
+    _file_handler = logging.handlers.RotatingFileHandler(
+        'app_errors.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'
+    )
+    _file_handler.setLevel(logging.WARNING)
+    _file_handler.setFormatter(_log_formatter)
+    logger.addHandler(_file_handler)
+except Exception:
+    pass  # Non-fatal if log directory is not writable
+
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -585,6 +615,24 @@ DB_CONFIG = {
     'user': os.environ.get('DB_USER', 'extrator'),
     'password': os.environ.get('DB_PASSWORD', ''),
 }
+
+def _validate_startup():
+    """Validate required environment variables at startup. Logs warnings for missing values."""
+    warnings = []
+    if not os.environ.get('DB_PASSWORD'):
+        warnings.append('DB_PASSWORD is not set — DB connections will use empty password')
+    if not os.environ.get('ADMIN_PASSWORD'):
+        warnings.append('ADMIN_PASSWORD is not set — admin account will have no password')
+    if not os.environ.get('SECRET_KEY') and not os.environ.get('FLASK_SECRET_KEY'):
+        warnings.append('SECRET_KEY/FLASK_SECRET_KEY not set — using insecure default')
+    for w in warnings:
+        logger.warning('[STARTUP] %s', w)
+    if warnings:
+        logger.warning('[STARTUP] %d configuration warning(s) — review environment variables', len(warnings))
+    else:
+        logger.info('[STARTUP] Environment validation passed')
+
+_validate_startup()
 
 ADMIN_USERNAME = "admin"
 def _make_admin_hash():
@@ -7483,10 +7531,42 @@ def api_fuzzy_dedup():
     if not batch_id:
         return jsonify({'error': 'batch_id required'}), 400
 
+    # Count leads first to decide sync vs async
+    try:
+        with get_db() as _conn:
+            _cur = _conn.cursor()
+            _cur.execute('SELECT COUNT(*) FROM leads WHERE batch_id = %s', (batch_id,))
+            lead_count = _cur.fetchone()[0]
+    except Exception as e:
+        return jsonify({'error': f'Falha ao contar leads: {e}'}), 500
+
+    ASYNC_THRESHOLD = 1000
+
+    if lead_count > ASYNC_THRESHOLD:
+        # Large batch — run in background, return immediately
+        def _run_dedup_bg(b_id=batch_id, thr=threshold):
+            bg_conn = psycopg2.connect(**DB_CONFIG)
+            try:
+                dupes = fuzzy_deduplicate_leads(b_id, bg_conn, threshold=thr)
+                print(f'[fuzzy-dedup] batch {b_id}: {dupes} duplicatas marcadas (async, {lead_count} leads)')
+            except Exception as _e:
+                print(f'[fuzzy-dedup] batch {b_id}: erro async — {_e}')
+            finally:
+                bg_conn.close()
+
+        threading.Thread(target=_run_dedup_bg, daemon=True).start()
+        return jsonify({
+            'status': 'queued',
+            'message': f'Deduplicação iniciada em background ({lead_count} leads). Resultado disponível nos logs.',
+            'batch_id': batch_id,
+            'lead_count': lead_count,
+        })
+
+    # Small batch — run synchronously
     conn = psycopg2.connect(**DB_CONFIG)
     try:
         dupes = fuzzy_deduplicate_leads(batch_id, conn, threshold=threshold)
-        return jsonify({'duplicates_marked': dupes, 'batch_id': batch_id})
+        return jsonify({'duplicates_marked': dupes, 'batch_id': batch_id, 'lead_count': lead_count})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
