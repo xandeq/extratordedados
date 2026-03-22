@@ -4686,6 +4686,18 @@ def login():
     token = create_session(user[0])
     return jsonify({'token': token, 'user_id': user[0], 'is_admin': user[2]})
 
+@app.route('/api/logout', methods=['POST'])
+@limiter.limit("20/minute")
+def logout():
+    """Revoke current session token server-side."""
+    token = get_auth_header()
+    if not token:
+        return jsonify({'error': 'No token provided'}), 400
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('DELETE FROM sessions WHERE token = %s', (token,))
+    return jsonify({'message': 'Logged out successfully'})
+
 @app.route('/api/me', methods=['GET'])
 @limiter.limit("60/minute")
 def get_me():
@@ -6285,8 +6297,8 @@ def delete_all_leads():
         return jsonify({'error': 'Unauthorized'}), 401
 
     data = request.get_json() or {}
-    if not data.get('confirm'):
-        return jsonify({'error': 'confirm: true is required'}), 400
+    if data.get('confirm') != 'DELETAR':
+        return jsonify({'error': 'confirm: "DELETAR" é obrigatório para confirmar a exclusão irreversível'}), 400
 
     with get_db() as conn:
         c = conn.cursor()
@@ -9194,11 +9206,18 @@ def import_leads():
         return jsonify({'error': 'Unauthorized'}), 401
 
     data = request.get_json()
-    contacts = data.get('contacts', [])
-    batch_name = data.get('batch_name', '').strip()
+    if not data:
+        return jsonify({'error': 'JSON body required'}), 400
 
-    if not contacts:
+    contacts = data.get('contacts', [])
+    if not isinstance(contacts, list):
+        return jsonify({'error': '"contacts" deve ser uma lista'}), 400
+    if len(contacts) == 0:
         return jsonify({'error': 'Nenhum contato para importar'}), 400
+    if len(contacts) > 5000:
+        return jsonify({'error': '"contacts" máximo de 5000 por importação'}), 400
+
+    batch_name = str(data.get('batch_name') or '').strip()[:255]
     if not batch_name:
         batch_name = f'Importacao Texto - {datetime.now().strftime("%d/%m/%Y %H:%M")}'
 
@@ -10204,19 +10223,36 @@ def start_massive_search():
     if not data:
         return jsonify({'error': 'JSON body required'}), 400
 
+    # --- Input validation ---
+    niches = data.get('niches', [])
+    if not isinstance(niches, list):
+        return jsonify({'error': '"niches" deve ser uma lista'}), 400
+    if len(niches) == 0:
+        return jsonify({'error': 'Pelo menos um nicho é obrigatório'}), 400
+    if len(niches) > 20:
+        return jsonify({'error': '"niches" máximo de 20 nichos por busca'}), 400
+    niches = [str(n).strip()[:200] for n in niches if str(n).strip()]
+    if not niches:
+        return jsonify({'error': 'Nichos inválidos após sanitização'}), 400
+
+    try:
+        max_pages = min(3, max(1, int(data.get('max_pages', 2))))
+    except (TypeError, ValueError):
+        return jsonify({'error': '"max_pages" deve ser um número inteiro entre 1 e 3'}), 400
+
+    methods = data.get('methods')
+    if methods is not None and not isinstance(methods, list):
+        return jsonify({'error': '"methods" deve ser uma lista'}), 400
+    if methods is None:
+        methods = ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data']
+
     # Parameters
-    niches = data.get('niches', [])  # Lista de nichos
     region_id = (data.get('region') or '').strip()
     city = (data.get('city') or '').strip()
     state = (data.get('state') or '').strip()
-    # Todos os métodos ativos por padrão
-    methods = data.get('methods', ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data'])
-    max_pages = min(3, max(1, int(data.get('max_pages', 2))))
     # Semana 7: admin draft mode — batch starts unpublished (is_shared=FALSE)
     is_draft = bool(data.get('is_draft', False))
-
-    if not niches or len(niches) == 0:
-        return jsonify({'error': 'Pelo menos um nicho é obrigatório'}), 400
+    # --- End validation ---
 
     # Build cities list
     cities_to_search = []
@@ -13152,7 +13188,15 @@ def trigger_daily_pipeline(niches=None, region_id=None):
     try:
         with get_db() as conn:
             cur = conn.cursor()
-            # Guard: evita double-fire quando Gunicorn usa múltiplos workers
+            # Advisory lock (transaction-scoped) — atomic, prevents race condition
+            # between 2 Gunicorn workers checking daily_jobs simultaneously.
+            # pg_try_advisory_xact_lock returns FALSE if another session holds the lock;
+            # released automatically on commit/rollback (end of this with-block).
+            cur.execute("SELECT pg_try_advisory_xact_lock(20260322)")
+            if not cur.fetchone()[0]:
+                print("[DAILY] Lock não obtido — outro worker já está iniciando — abortando.")
+                return None
+            # Secondary guard: prevent re-fire if job already started in last 5 min
             cur.execute(
                 "SELECT id FROM daily_jobs WHERE started_at > NOW() - INTERVAL '5 minutes'"
             )
