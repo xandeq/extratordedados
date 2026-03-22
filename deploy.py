@@ -97,13 +97,18 @@ def get_credentials():
         'DB_PASS':  pick('DB_PASS'),
         'FTP_HOST': pick('FTP_HOST', 'ftp.extratordedados.com.br'),
         'FTP_USER': pick('FTP_USER', 'alexa084'),
-        'FTP_PASS': pick('FTP_PASS', 'Alexandre10#'),
+        'FTP_PASS': pick('FTP_PASS'),
         'FTP_ROOT': pick('FTP_ROOT', '/'),
     }
     if not creds['VPS_PASS']:
         print("\nERRO: VPS_PASS não encontrado.")
         print("Adicione ao arquivo .deploy.env:")
         print("  VPS_PASS=sua_senha_aqui")
+        sys.exit(1)
+    if not creds['FTP_PASS']:
+        print("\nERRO: FTP_PASS não encontrado.")
+        print("Adicione ao AWS SM (extratordedados/prod) ou .deploy.env:")
+        print("  FTP_PASS=sua_senha_ftp_aqui")
         sys.exit(1)
     print("   Credenciais OK\n")
     return creds
@@ -292,10 +297,64 @@ def deploy_frontend(creds):
 
 # ?? Main ??????????????????????????????????????????????????????????????????????
 
+def rollback_backend(creds):
+    """Restore app.py from .bak created during last deploy."""
+    print("=" * 55)
+    print("ROLLBACK -- Restaurando backup do backend")
+    print("=" * 55)
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    print(f"Conectando a {creds['VPS_HOST']}...")
+    ssh.connect(creds['VPS_HOST'], username=creds['VPS_USER'],
+                password=creds['VPS_PASS'], timeout=15)
+    print("   Conectado\n")
+
+    def run(cmd, timeout=60):
+        _, out, err = ssh.exec_command(cmd, timeout=timeout)
+        return (out.read().decode('utf-8', errors='replace').strip(),
+                err.read().decode('utf-8', errors='replace').strip())
+
+    # Verify backup exists
+    out, _ = run('ls -lh /opt/extrator-api/app.py.bak 2>/dev/null || echo MISSING')
+    if 'MISSING' in out:
+        print("ERRO: /opt/extrator-api/app.py.bak não encontrado.")
+        print("   Faça um deploy primeiro para criar o backup.")
+        ssh.close()
+        return False
+    print(f"1. Backup encontrado: {out}")
+
+    # Restore
+    print("\n2. Restaurando app.py.bak -> app.py...")
+    run('cp /opt/extrator-api/app.py.bak /opt/extrator-api/app.py')
+    print("   OK")
+
+    # Restart
+    print("\n3. Reiniciando serviço...")
+    run('systemctl restart extrator-api')
+    time.sleep(3)
+    status, _ = run('systemctl is-active extrator-api')
+    print(f"   Status: {status}")
+
+    if status != 'active':
+        logs, _ = run('journalctl -u extrator-api -n 20 --no-pager')
+        print(f"   Logs:\n{logs}")
+        ssh.close()
+        return False
+
+    # Health check
+    print("\n4. Health check...")
+    health, _ = run('curl -s http://127.0.0.1:8000/api/health')
+    print(f"   {health}")
+
+    ssh.close()
+    return True
+
+
 def main():
     mode = sys.argv[1].lower() if len(sys.argv) > 1 else 'all'
-    if mode not in ('all', 'backend', 'frontend'):
-        print("Uso: python deploy.py [all|backend|frontend]")
+    if mode not in ('all', 'backend', 'frontend', 'rollback'):
+        print("Uso: python deploy.py [all|backend|frontend|rollback]")
         sys.exit(1)
 
     print("\n[DEPLOY] DEPLOY PIPELINE - extratordedados.com.br")
@@ -304,6 +363,16 @@ def main():
 
     creds = get_credentials()
     ok_backend = ok_frontend = True
+
+    if mode == 'rollback':
+        ok = rollback_backend(creds)
+        elapsed = time.time() - t0
+        print("=" * 55)
+        print(f"  Rollback: {'✓ OK' if ok else '✗ FALHOU'}")
+        print(f"  Tempo:    {elapsed:.0f}s")
+        print("=" * 55)
+        print(f"\n  API:  https://api.extratordedados.com.br/api/health\n")
+        sys.exit(0 if ok else 1)
 
     if mode in ('all', 'backend'):
         ok_backend = deploy_backend(creds)

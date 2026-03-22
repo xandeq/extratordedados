@@ -2,6 +2,7 @@ import type { AppProps } from 'next/app'
 import Head from 'next/head'
 import Layout from '../components/Layout'
 import { ToastProvider } from '../components/Toast'
+import ErrorBoundary from '../components/ErrorBoundary'
 import '../styles/globals.css'
 
 export default function App({ Component, pageProps, router }: AppProps) {
@@ -15,7 +16,9 @@ export default function App({ Component, pageProps, router }: AppProps) {
       </Head>
       <ToastProvider>
         <Layout>
-          <Component {...pageProps} key={router.pathname} />
+          <ErrorBoundary pageName={router.pathname}>
+            <Component {...pageProps} key={router.pathname} />
+          </ErrorBoundary>
         </Layout>
       </ToastProvider>
     </>

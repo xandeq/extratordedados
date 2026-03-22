@@ -510,6 +510,36 @@ except ImportError:
     def wait_exponential(**kw): return None
     def retry_if_exception_type(t): return None
 
+import logging
+import logging.handlers
+
+# ============= Logging Setup =============
+# Structured logging with levels — replaces print() for critical paths.
+# Existing print() calls are still captured by Gunicorn stdout.
+_log_formatter = logging.Formatter(
+    '[%(asctime)s] %(levelname)s %(name)s — %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger('extrator')
+logger.setLevel(logging.DEBUG)
+
+# Console handler (Gunicorn captures stderr)
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(_log_formatter)
+logger.addHandler(_console_handler)
+
+# Rotating file handler (errors only, 5MB × 3)
+try:
+    _file_handler = logging.handlers.RotatingFileHandler(
+        'app_errors.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'
+    )
+    _file_handler.setLevel(logging.WARNING)
+    _file_handler.setFormatter(_log_formatter)
+    logger.addHandler(_file_handler)
+except Exception:
+    pass  # Non-fatal if log directory is not writable
+
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -517,6 +547,11 @@ from flask_limiter.util import get_remote_address
 import json
 import hashlib
 import secrets
+try:
+    import bcrypt as _bcrypt
+    _BCRYPT_AVAILABLE = True
+except ImportError:
+    _BCRYPT_AVAILABLE = False
 from datetime import datetime, timedelta
 import requests as http_requests
 from bs4 import BeautifulSoup
@@ -551,7 +586,12 @@ try:
 except ImportError:
     _APSCHEDULER_AVAILABLE = False
 
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": [
+    "https://extratordedados.com.br",
+    "https://www.extratordedados.com.br",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]}})
 
 # ============= Rate Limiting =============
 
@@ -576,8 +616,33 @@ DB_CONFIG = {
     'password': os.environ.get('DB_PASSWORD', ''),
 }
 
+def _validate_startup():
+    """Validate required environment variables at startup. Logs warnings for missing values."""
+    warnings = []
+    if not os.environ.get('DB_PASSWORD'):
+        warnings.append('DB_PASSWORD is not set — DB connections will use empty password')
+    if not os.environ.get('ADMIN_PASSWORD'):
+        warnings.append('ADMIN_PASSWORD is not set — admin account will have no password')
+    if not os.environ.get('SECRET_KEY') and not os.environ.get('FLASK_SECRET_KEY'):
+        warnings.append('SECRET_KEY/FLASK_SECRET_KEY not set — using insecure default')
+    for w in warnings:
+        logger.warning('[STARTUP] %s', w)
+    if warnings:
+        logger.warning('[STARTUP] %d configuration warning(s) — review environment variables', len(warnings))
+    else:
+        logger.info('[STARTUP] Environment validation passed')
+
+_validate_startup()
+
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD_HASH = hashlib.sha256(os.environ.get('ADMIN_PASSWORD', '').encode()).hexdigest()
+def _make_admin_hash():
+    pw = os.environ.get('ADMIN_PASSWORD', '')
+    if not pw:
+        return ''
+    if _BCRYPT_AVAILABLE:
+        return _bcrypt.hashpw(pw.encode(), _bcrypt.gensalt()).decode()
+    return hashlib.sha256(pw.encode()).hexdigest()
+ADMIN_PASSWORD_HASH = _make_admin_hash()
 
 # ============= Anti-Blocking =============
 
@@ -1104,7 +1169,7 @@ db_pool = None
 def get_pool():
     global db_pool
     if db_pool is None or db_pool.closed:
-        db_pool = pool.SimpleConnectionPool(1, 10, **DB_CONFIG)
+        db_pool = pool.ThreadedConnectionPool(1, 10, **DB_CONFIG)
     return db_pool
 
 @contextmanager
@@ -1485,7 +1550,27 @@ def init_db():
 # ============= Auth =============
 
 def hash_password(password):
+    """Hash password using bcrypt (preferred) or SHA-256 fallback."""
+    if _BCRYPT_AVAILABLE:
+        return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
     return hashlib.sha256(password.encode()).hexdigest()
+
+def _check_password(password, stored_hash):
+    """Verify password against stored hash. Supports bcrypt and legacy SHA-256.
+    If legacy SHA-256 match is found, returns (True, new_bcrypt_hash) to trigger migration.
+    Returns (valid: bool, new_hash: str|None)."""
+    if stored_hash.startswith('$2b$') or stored_hash.startswith('$2a$'):
+        if _BCRYPT_AVAILABLE:
+            valid = _bcrypt.checkpw(password.encode(), stored_hash.encode())
+        else:
+            valid = False
+        return valid, None
+    # Legacy SHA-256 path — migrate to bcrypt on success
+    sha_hash = hashlib.sha256(password.encode()).hexdigest()
+    if sha_hash == stored_hash:
+        new_hash = hash_password(password) if _BCRYPT_AVAILABLE else stored_hash
+        return True, new_hash
+    return False, None
 
 def create_session(user_id):
     """Create auth token for user"""
@@ -4630,11 +4715,36 @@ def login():
         c.execute('SELECT id, password_hash, is_admin FROM users WHERE username = %s', (username,))
         user = c.fetchone()
 
-    if not user or hash_password(password) != user[1]:
+    if not user:
         return jsonify({'error': 'Invalid credentials'}), 401
+
+    valid, new_hash = _check_password(password, user[1])
+    if not valid:
+        return jsonify({'error': 'Invalid credentials'}), 401
+
+    # Migrate legacy SHA-256 hash to bcrypt transparently
+    if new_hash:
+        try:
+            with get_db() as _mconn:
+                _mc = _mconn.cursor()
+                _mc.execute('UPDATE users SET password_hash = %s WHERE id = %s', (new_hash, user[0]))
+        except Exception:
+            pass  # Migration failure is non-fatal
 
     token = create_session(user[0])
     return jsonify({'token': token, 'user_id': user[0], 'is_admin': user[2]})
+
+@app.route('/api/logout', methods=['POST'])
+@limiter.limit("20/minute")
+def logout():
+    """Revoke current session token server-side."""
+    token = get_auth_header()
+    if not token:
+        return jsonify({'error': 'No token provided'}), 400
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('DELETE FROM sessions WHERE token = %s', (token,))
+    return jsonify({'message': 'Logged out successfully'})
 
 @app.route('/api/me', methods=['GET'])
 @limiter.limit("60/minute")
@@ -6235,8 +6345,8 @@ def delete_all_leads():
         return jsonify({'error': 'Unauthorized'}), 401
 
     data = request.get_json() or {}
-    if not data.get('confirm'):
-        return jsonify({'error': 'confirm: true is required'}), 400
+    if data.get('confirm') != 'DELETAR':
+        return jsonify({'error': 'confirm: "DELETAR" é obrigatório para confirmar a exclusão irreversível'}), 400
 
     with get_db() as conn:
         c = conn.cursor()
@@ -7421,10 +7531,42 @@ def api_fuzzy_dedup():
     if not batch_id:
         return jsonify({'error': 'batch_id required'}), 400
 
+    # Count leads first to decide sync vs async
+    try:
+        with get_db() as _conn:
+            _cur = _conn.cursor()
+            _cur.execute('SELECT COUNT(*) FROM leads WHERE batch_id = %s', (batch_id,))
+            lead_count = _cur.fetchone()[0]
+    except Exception as e:
+        return jsonify({'error': f'Falha ao contar leads: {e}'}), 500
+
+    ASYNC_THRESHOLD = 1000
+
+    if lead_count > ASYNC_THRESHOLD:
+        # Large batch — run in background, return immediately
+        def _run_dedup_bg(b_id=batch_id, thr=threshold):
+            bg_conn = psycopg2.connect(**DB_CONFIG)
+            try:
+                dupes = fuzzy_deduplicate_leads(b_id, bg_conn, threshold=thr)
+                print(f'[fuzzy-dedup] batch {b_id}: {dupes} duplicatas marcadas (async, {lead_count} leads)')
+            except Exception as _e:
+                print(f'[fuzzy-dedup] batch {b_id}: erro async — {_e}')
+            finally:
+                bg_conn.close()
+
+        threading.Thread(target=_run_dedup_bg, daemon=True).start()
+        return jsonify({
+            'status': 'queued',
+            'message': f'Deduplicação iniciada em background ({lead_count} leads). Resultado disponível nos logs.',
+            'batch_id': batch_id,
+            'lead_count': lead_count,
+        })
+
+    # Small batch — run synchronously
     conn = psycopg2.connect(**DB_CONFIG)
     try:
         dupes = fuzzy_deduplicate_leads(batch_id, conn, threshold=threshold)
-        return jsonify({'duplicates_marked': dupes, 'batch_id': batch_id})
+        return jsonify({'duplicates_marked': dupes, 'batch_id': batch_id, 'lead_count': lead_count})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
@@ -9144,11 +9286,18 @@ def import_leads():
         return jsonify({'error': 'Unauthorized'}), 401
 
     data = request.get_json()
-    contacts = data.get('contacts', [])
-    batch_name = data.get('batch_name', '').strip()
+    if not data:
+        return jsonify({'error': 'JSON body required'}), 400
 
-    if not contacts:
+    contacts = data.get('contacts', [])
+    if not isinstance(contacts, list):
+        return jsonify({'error': '"contacts" deve ser uma lista'}), 400
+    if len(contacts) == 0:
         return jsonify({'error': 'Nenhum contato para importar'}), 400
+    if len(contacts) > 5000:
+        return jsonify({'error': '"contacts" máximo de 5000 por importação'}), 400
+
+    batch_name = str(data.get('batch_name') or '').strip()[:255]
     if not batch_name:
         batch_name = f'Importacao Texto - {datetime.now().strftime("%d/%m/%Y %H:%M")}'
 
@@ -10154,19 +10303,36 @@ def start_massive_search():
     if not data:
         return jsonify({'error': 'JSON body required'}), 400
 
+    # --- Input validation ---
+    niches = data.get('niches', [])
+    if not isinstance(niches, list):
+        return jsonify({'error': '"niches" deve ser uma lista'}), 400
+    if len(niches) == 0:
+        return jsonify({'error': 'Pelo menos um nicho é obrigatório'}), 400
+    if len(niches) > 20:
+        return jsonify({'error': '"niches" máximo de 20 nichos por busca'}), 400
+    niches = [str(n).strip()[:200] for n in niches if str(n).strip()]
+    if not niches:
+        return jsonify({'error': 'Nichos inválidos após sanitização'}), 400
+
+    try:
+        max_pages = min(3, max(1, int(data.get('max_pages', 2))))
+    except (TypeError, ValueError):
+        return jsonify({'error': '"max_pages" deve ser um número inteiro entre 1 e 3'}), 400
+
+    methods = data.get('methods')
+    if methods is not None and not isinstance(methods, list):
+        return jsonify({'error': '"methods" deve ser uma lista'}), 400
+    if methods is None:
+        methods = ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data']
+
     # Parameters
-    niches = data.get('niches', [])  # Lista de nichos
     region_id = (data.get('region') or '').strip()
     city = (data.get('city') or '').strip()
     state = (data.get('state') or '').strip()
-    # Todos os métodos ativos por padrão
-    methods = data.get('methods', ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data'])
-    max_pages = min(3, max(1, int(data.get('max_pages', 2))))
     # Semana 7: admin draft mode — batch starts unpublished (is_shared=FALSE)
     is_draft = bool(data.get('is_draft', False))
-
-    if not niches or len(niches) == 0:
-        return jsonify({'error': 'Pelo menos um nicho é obrigatório'}), 400
+    # --- End validation ---
 
     # Build cities list
     cities_to_search = []
@@ -13102,7 +13268,15 @@ def trigger_daily_pipeline(niches=None, region_id=None):
     try:
         with get_db() as conn:
             cur = conn.cursor()
-            # Guard: evita double-fire quando Gunicorn usa múltiplos workers
+            # Advisory lock (transaction-scoped) — atomic, prevents race condition
+            # between 2 Gunicorn workers checking daily_jobs simultaneously.
+            # pg_try_advisory_xact_lock returns FALSE if another session holds the lock;
+            # released automatically on commit/rollback (end of this with-block).
+            cur.execute("SELECT pg_try_advisory_xact_lock(20260322)")
+            if not cur.fetchone()[0]:
+                print("[DAILY] Lock não obtido — outro worker já está iniciando — abortando.")
+                return None
+            # Secondary guard: prevent re-fire if job already started in last 5 min
             cur.execute(
                 "SELECT id FROM daily_jobs WHERE started_at > NOW() - INTERVAL '5 minutes'"
             )

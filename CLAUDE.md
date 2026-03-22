@@ -13,9 +13,9 @@ Sistema web de extração automatizada de leads empresariais (emails, telefones,
 - **Framework**: Flask (Python 3) — monolito em `project/backend/app.py` (~10k+ linhas)
 - **Módulos auxiliares**: `lead_enrichment.py` (enrichment externo), `scraping_apify_massive.py` (Apify actor jobs)
 - **Banco**: PostgreSQL 16 (Docker container na VPS)
-- **Pool**: psycopg2 SimpleConnectionPool (1-10 conexões)
-- **Rate Limiting**: Flask-Limiter (200/hour default, memory storage)
-- **CORS**: Flask-CORS (aberto)
+- **Pool**: psycopg2 ThreadedConnectionPool (1-10 conexões) — thread-safe
+- **Rate Limiting**: Flask-Limiter (200/hour default, memory storage per worker) — **tech debt**: Redis não instalado no VPS; rate limits são por worker (2×), não globais. Para globalizar: instalar Redis + `pip install flask-limiter[redis]` + `storage_uri="redis://localhost:6379"`
+- **CORS**: Flask-CORS restrito a `extratordedados.com.br` e `localhost:3000`
 - **Proxy**: Traefik → Gunicorn (2 workers, 120s timeout)
 - **Background Jobs**: `threading.Thread(daemon=True)` com conexão dedicada ao DB
 - **Scheduler**: APScheduler `BackgroundScheduler` — pipeline diário às 02:00 + CRM sync automático às 09:00 (pytz America/Sao_Paulo)
