@@ -517,6 +517,11 @@ from flask_limiter.util import get_remote_address
 import json
 import hashlib
 import secrets
+try:
+    import bcrypt as _bcrypt
+    _BCRYPT_AVAILABLE = True
+except ImportError:
+    _BCRYPT_AVAILABLE = False
 from datetime import datetime, timedelta
 import requests as http_requests
 from bs4 import BeautifulSoup
@@ -551,7 +556,12 @@ try:
 except ImportError:
     _APSCHEDULER_AVAILABLE = False
 
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": [
+    "https://extratordedados.com.br",
+    "https://www.extratordedados.com.br",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]}})
 
 # ============= Rate Limiting =============
 
@@ -577,7 +587,14 @@ DB_CONFIG = {
 }
 
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD_HASH = hashlib.sha256(os.environ.get('ADMIN_PASSWORD', '').encode()).hexdigest()
+def _make_admin_hash():
+    pw = os.environ.get('ADMIN_PASSWORD', '')
+    if not pw:
+        return ''
+    if _BCRYPT_AVAILABLE:
+        return _bcrypt.hashpw(pw.encode(), _bcrypt.gensalt()).decode()
+    return hashlib.sha256(pw.encode()).hexdigest()
+ADMIN_PASSWORD_HASH = _make_admin_hash()
 
 # ============= Anti-Blocking =============
 
@@ -1104,7 +1121,7 @@ db_pool = None
 def get_pool():
     global db_pool
     if db_pool is None or db_pool.closed:
-        db_pool = pool.SimpleConnectionPool(1, 10, **DB_CONFIG)
+        db_pool = pool.ThreadedConnectionPool(1, 10, **DB_CONFIG)
     return db_pool
 
 @contextmanager
@@ -1485,7 +1502,27 @@ def init_db():
 # ============= Auth =============
 
 def hash_password(password):
+    """Hash password using bcrypt (preferred) or SHA-256 fallback."""
+    if _BCRYPT_AVAILABLE:
+        return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
     return hashlib.sha256(password.encode()).hexdigest()
+
+def _check_password(password, stored_hash):
+    """Verify password against stored hash. Supports bcrypt and legacy SHA-256.
+    If legacy SHA-256 match is found, returns (True, new_bcrypt_hash) to trigger migration.
+    Returns (valid: bool, new_hash: str|None)."""
+    if stored_hash.startswith('$2b$') or stored_hash.startswith('$2a$'):
+        if _BCRYPT_AVAILABLE:
+            valid = _bcrypt.checkpw(password.encode(), stored_hash.encode())
+        else:
+            valid = False
+        return valid, None
+    # Legacy SHA-256 path — migrate to bcrypt on success
+    sha_hash = hashlib.sha256(password.encode()).hexdigest()
+    if sha_hash == stored_hash:
+        new_hash = hash_password(password) if _BCRYPT_AVAILABLE else stored_hash
+        return True, new_hash
+    return False, None
 
 def create_session(user_id):
     """Create auth token for user"""
@@ -4630,8 +4667,21 @@ def login():
         c.execute('SELECT id, password_hash, is_admin FROM users WHERE username = %s', (username,))
         user = c.fetchone()
 
-    if not user or hash_password(password) != user[1]:
+    if not user:
         return jsonify({'error': 'Invalid credentials'}), 401
+
+    valid, new_hash = _check_password(password, user[1])
+    if not valid:
+        return jsonify({'error': 'Invalid credentials'}), 401
+
+    # Migrate legacy SHA-256 hash to bcrypt transparently
+    if new_hash:
+        try:
+            with get_db() as _mconn:
+                _mc = _mconn.cursor()
+                _mc.execute('UPDATE users SET password_hash = %s WHERE id = %s', (new_hash, user[0]))
+        except Exception:
+            pass  # Migration failure is non-fatal
 
     token = create_session(user[0])
     return jsonify({'token': token, 'user_id': user[0], 'is_admin': user[2]})

@@ -97,13 +97,18 @@ def get_credentials():
         'DB_PASS':  pick('DB_PASS'),
         'FTP_HOST': pick('FTP_HOST', 'ftp.extratordedados.com.br'),
         'FTP_USER': pick('FTP_USER', 'alexa084'),
-        'FTP_PASS': pick('FTP_PASS', 'Alexandre10#'),
+        'FTP_PASS': pick('FTP_PASS'),
         'FTP_ROOT': pick('FTP_ROOT', '/'),
     }
     if not creds['VPS_PASS']:
         print("\nERRO: VPS_PASS não encontrado.")
         print("Adicione ao arquivo .deploy.env:")
         print("  VPS_PASS=sua_senha_aqui")
+        sys.exit(1)
+    if not creds['FTP_PASS']:
+        print("\nERRO: FTP_PASS não encontrado.")
+        print("Adicione ao AWS SM (extratordedados/prod) ou .deploy.env:")
+        print("  FTP_PASS=sua_senha_ftp_aqui")
         sys.exit(1)
     print("   Credenciais OK\n")
     return creds
