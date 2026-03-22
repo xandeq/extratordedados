@@ -9301,72 +9301,71 @@ def import_leads():
     if not batch_name:
         batch_name = f'Importacao Texto - {datetime.now().strftime("%d/%m/%Y %H:%M")}'
 
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO batches (user_id, name, total_urls, status) VALUES (%s, %s, %s, 'completed') RETURNING id",
-            (user_id, batch_name, len(contacts))
-        )
-        batch_id = cur.fetchone()[0]
+    with get_db() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO batches (user_id, name, total_urls, status) VALUES (%s, %s, %s, 'completed') RETURNING id",
+                (user_id, batch_name, len(contacts))
+            )
+            batch_id = cur.fetchone()[0]
 
-        imported = 0
-        skipped = 0
-        for c in contacts:
-            email = (c.get('email') or '').strip().lower()
-            phone = (c.get('phone') or '').strip()
-            company = (c.get('company_name') or '').strip()
-            if not company and email:
-                company = derive_company_name(email)
-            website = (c.get('website') or '').strip()
-            whatsapp = (c.get('whatsapp') or phone or '').strip()
-            contact_name = (c.get('contact_name') or '').strip()
+            imported = 0
+            skipped = 0
+            for c in contacts:
+                email = (c.get('email') or '').strip().lower()
+                phone = (c.get('phone') or '').strip()
+                company = (c.get('company_name') or '').strip()
+                if not company and email:
+                    company = derive_company_name(email)
+                website = (c.get('website') or '').strip()
+                whatsapp = (c.get('whatsapp') or phone or '').strip()
+                contact_name = (c.get('contact_name') or '').strip()
 
-            # Intelligent contact name extraction
-            if not contact_name and email:
-                contact_name = derive_contact_name(email)
+                # Intelligent contact name extraction
+                if not contact_name and email:
+                    contact_name = derive_contact_name(email)
 
-            if not email and not phone:
-                skipped += 1
-                continue
-
-            # Check duplicate by email within same user
-            if email:
-                cur.execute(
-                    "SELECT id FROM leads WHERE email = %s AND batch_id IN (SELECT id FROM batches WHERE user_id = %s) LIMIT 1",
-                    (email, user_id)
-                )
-                if cur.fetchone():
+                if not email and not phone:
                     skipped += 1
                     continue
 
-            cur.execute(
-                """INSERT INTO leads (batch_id, email, phone, company_name, website, whatsapp, contact_name, source_url, crm_status)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'novo')""",
-                (batch_id, email or None, phone or None, company or None, website or None,
-                 whatsapp or None, contact_name or None, website or None)
-            )
-            imported += 1
+                # Check duplicate by email within same user
+                if email:
+                    cur.execute(
+                        "SELECT id FROM leads WHERE email = %s AND batch_id IN (SELECT id FROM batches WHERE user_id = %s) LIMIT 1",
+                        (email, user_id)
+                    )
+                    if cur.fetchone():
+                        skipped += 1
+                        continue
 
-        # Update batch count
-        cur.execute("UPDATE batches SET total_urls = %s WHERE id = %s", (imported, batch_id))
-        conn.commit()
+                cur.execute(
+                    """INSERT INTO leads (batch_id, email, phone, company_name, website, whatsapp, contact_name, source_url, crm_status)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'novo')""",
+                    (batch_id, email or None, phone or None, company or None, website or None,
+                     whatsapp or None, contact_name or None, website or None)
+                )
+                imported += 1
 
-        # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
-        threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
+            # Update batch count
+            cur.execute("UPDATE batches SET total_urls = %s WHERE id = %s", (imported, batch_id))
+            conn.commit()
 
-        return jsonify({
-            'batch_id': batch_id,
-            'imported': imported,
-            'skipped': skipped,
-            'total': len(contacts),
-        })
-    except Exception as e:
-        conn.rollback()
-        return jsonify({'error': str(e)}), 500
-    finally:
-        cur.close()
-        conn.close()
+            # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
+            threading.Thread(target=auto_sanitize_background, args=(batch_id,), daemon=True).start()
+
+            return jsonify({
+                'batch_id': batch_id,
+                'imported': imported,
+                'skipped': skipped,
+                'total': len(contacts),
+            })
+        except Exception as e:
+            conn.rollback()
+            return jsonify({'error': str(e)}), 500
+        finally:
+            cur.close()
 
 
 # ============= Lead Scoring (Semana 2) =============

@@ -23,10 +23,10 @@ import ftplib
 import paramiko
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-FRONTEND_DIR = os.path.join(ROOT, 'project', 'frontend')
+FRONTEND_DIR = os.path.join(ROOT, 'app', 'frontend')
 OUT_DIR      = os.path.join(FRONTEND_DIR, 'out')
-APP_PY       = os.path.join(ROOT, 'project', 'backend', 'app.py')
-REQ_TXT      = os.path.join(ROOT, 'project', 'backend', 'requirements.txt')
+APP_PY       = os.path.join(ROOT, 'app', 'backend', 'app.py')
+REQ_TXT      = os.path.join(ROOT, 'app', 'backend', 'requirements.txt')
 SECRETS_CACHE_PATH = os.path.join(ROOT, '.secrets.cache.json')
 
 # ?? Credenciais ??????????????????????????????????????????????????????????????

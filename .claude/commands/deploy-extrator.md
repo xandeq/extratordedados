@@ -27,7 +27,15 @@ O script está na raiz do projeto: `deploy.py`
 
 4. Em caso de erro, diagnostique e informe o usuário.
 
+## Estrutura do Projeto (pós-reorganização)
+- App: `app/backend/app.py` (Flask), `app/frontend/` (Next.js)
+- Scripts utilitários: `scripts/{import,crm,extraction,analysis,deploy}/`
+- Testes CI: `tests/`
+- Docs: `docs/`
+- Dados: `data/`
+
 ## Notas
 - O script lê credenciais de `.deploy.env` (gitignored) automaticamente
 - Build do frontend é feito automaticamente antes do FTP
 - `.htaccess` é recriado automaticamente após o build
+- `deploy.py` referencia `app/backend/app.py` e `app/frontend/` (não mais `project/`)

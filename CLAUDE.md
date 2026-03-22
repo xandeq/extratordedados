@@ -10,7 +10,7 @@ Sistema web de extração automatizada de leads empresariais (emails, telefones,
 ## Arquitetura
 
 ### Backend
-- **Framework**: Flask (Python 3) — monolito em `project/backend/app.py` (~10k+ linhas)
+- **Framework**: Flask (Python 3) — monolito em `app/backend/app.py` (~10k+ linhas)
 - **Módulos auxiliares**: `lead_enrichment.py` (enrichment externo), `scraping_apify_massive.py` (Apify actor jobs)
 - **Banco**: PostgreSQL 16 (Docker container na VPS)
 - **Pool**: psycopg2 ThreadedConnectionPool (1-10 conexões) — thread-safe
@@ -90,51 +90,71 @@ RewriteRule ^(.*)$ $1.html [L]
 ## Estrutura de Arquivos
 
 ```
-project/
-  backend/
-    app.py              # Monolito Flask (~9200 linhas)
-    requirements.txt    # Flask, psycopg2, playwright, APScheduler, rapidfuzz, ftfy, etc.
-  frontend/
-    pages/
-      _app.tsx          # Layout global, Head, ToastProvider
-      login.tsx         # Autenticação
-      dashboard.tsx     # Analytics com Recharts
-      scrape.tsx        # Hub de extração (tabs: busca, url, json, texto, colar)
-      leads.tsx         # CRM com filtros, bulk actions, drawer, botão Sanitizar, Send to CRM
-      massive-search.tsx # Busca massiva 7 métodos — PÁGINA PRINCIPAL
-      app-logs.tsx      # Centro de diagnóstico — logs com classificação de erros + AI prompts
-      plans.tsx         # Planos e uso (free/paid) — usa useClientPlan hook
-      batch/[id].tsx    # Progresso e resultados de batch
-      results/[id].tsx  # Resultados de job individual
-      admin/
-        index.tsx       # Admin dashboard
-        users.tsx       # Gerenciamento de usuários
-        plans.tsx       # Gerenciamento de planos
-        massive-search.tsx  # Admin: busca massiva centralizada
-    components/
-      Layout.tsx        # Wrapper com keyboard shortcuts, transitions
-      Header.tsx        # Cabeçalho com UserMenu
-      Sidebar.tsx       # Navegação lateral, dark mode toggle
-      UserMenu.tsx      # Menu do usuário logado (avatar, logout)
-      ExportModal.tsx   # Modal de exportação (CSV, JSON, WhatsApp, etc.)
-      PlanCard.tsx      # Card de plano/uso (limites de leads/exports)
-      UpgradeModal.tsx  # Modal de upgrade de plano
-      InfoBox.tsx       # Caixas informativas com ícones Lucide
-      Tooltip.tsx       # Tooltips de hover para rate limits/descrições
-    lib/
-      api.ts            # Axios instance, baseURL, token interceptor
-      useClientPlan.ts  # Hook: busca /api/client/usage, expõe canViewLeads(), canExport()
-    styles/
-      globals.css       # Dark mode com CSS raw (NUNCA @apply)
-    public/
-      logo.png          # 800x200 horizontal
-      favicon.png       # 512x512 cube
-    next.config.js      # output: 'export', trailingSlash: true, images unoptimized
-    tailwind.config.js  # darkMode: 'class', cores primary blue
-deploy.py               # Deploy unificado (SSH backend + FTP frontend)
-.deploy.env             # Credenciais (gitignored) — VPS_PASS, DB_PASS, FTP_PASS
-.claude/commands/
-  deploy-extrator.md    # Skill /deploy-extrator (específica deste projeto)
+extrator-de-dados/
+├── CLAUDE.md                        # Guia para Claude Code (este arquivo)
+├── deploy.py                        # ⭐ Deploy unificado (SSH backend + FTP frontend)
+├── pytest.ini                       # Config pytest
+├── .deploy.env                      # Credenciais (gitignored) — VPS_PASS, DB_PASS, FTP_PASS
+├── .secrets.cache.json              # Cache de segredos AWS SM (gitignored)
+│
+├── app/                             # ⭐ APLICAÇÃO — backend + frontend
+│   ├── backend/
+│   │   ├── app.py                   # Monolito Flask (~10k+ linhas) — ARQUIVO PRINCIPAL
+│   │   ├── lead_enrichment.py       # Enrichment externo (Hunter.io, Snov.io)
+│   │   ├── scraping_apify_massive.py# Apify actor jobs
+│   │   ├── requirements.txt         # Dependências Python
+│   │   └── db_alter_leads.sql       # Schema alterations
+│   └── frontend/
+│       ├── pages/
+│       │   ├── _app.tsx             # Layout global, Head, ToastProvider
+│       │   ├── login.tsx            # Autenticação
+│       │   ├── dashboard.tsx        # Analytics com Recharts
+│       │   ├── scrape.tsx           # Hub de extração (tabs: busca, url, json, texto, colar)
+│       │   ├── leads.tsx            # CRM com filtros, bulk actions, drawer, Sanitizar, Send to CRM
+│       │   ├── massive-search.tsx   # ⭐ Busca massiva 7 métodos — PÁGINA PRINCIPAL
+│       │   ├── app-logs.tsx         # Centro de diagnóstico — logs + AI prompts
+│       │   ├── plans.tsx            # Planos e uso (free/paid)
+│       │   ├── batch/[id].tsx       # Progresso e resultados de batch
+│       │   ├── results/[id].tsx     # Resultados de job individual
+│       │   └── admin/               # Admin: dashboard, users, plans, massive-search
+│       ├── components/              # Layout, Header, Sidebar, UserMenu, ExportModal, etc.
+│       ├── lib/
+│       │   ├── api.ts               # Axios instance, baseURL, token interceptor
+│       │   └── useClientPlan.ts     # Hook: /api/client/usage, canViewLeads(), canExport()
+│       ├── styles/globals.css       # Dark mode CSS raw (NUNCA @apply)
+│       ├── public/                  # logo.png (800x200), favicon.png (512x512)
+│       ├── next.config.js           # output: 'export', trailingSlash: true
+│       └── tailwind.config.js       # darkMode: 'class', cores primary blue
+│
+├── scripts/                         # Scripts utilitários (não fazem parte do app)
+│   ├── import/                      # Importação de dados: import_*.py, importar_*.py
+│   ├── crm/                         # CRM sync/update: atualizar_*.py, sync_*.py, algoritmo_*.py
+│   ├── extraction/                  # Extração avulsa: apify_*.py, extrair_*.py, rodar_*.py
+│   ├── analysis/                    # Análise/debug: analyze_*.py, test_*.py, verificar_*.py
+│   └── deploy/                      # Infraestrutura: ssh_*.py, ftp_*.py, deploy_*.py
+│
+├── tests/                           # ⭐ Pytest (CI-ready)
+│   ├── conftest.py
+│   ├── test_auth.py
+│   ├── test_health.py
+│   └── test_validation.py
+│
+├── docs/                            # Documentação e relatórios históricos
+│   ├── NEXT_STEPS.md
+│   ├── SEMANA1_SUMMARY.md / SEMANA2_ROADMAP.md
+│   ├── SECURITY_PERFORMANCE_AUDIT.md
+│   ├── VALIDATION_CHECKLIST.md
+│   └── DEPLOY_*.md / RELATORIO_*.md
+│
+├── data/                            # Dados de exemplo e resultados de extração
+│   └── vitoria_leads_*.json, apify_leads.json, etc.
+│
+├── .planning/                       # ⭐ GSD planning (fases, roadmap, contexto)
+│
+└── .claude/
+    ├── commands/
+    │   └── deploy-extrator.md       # Skill /deploy-extrator
+    └── skills/
 ```
 
 ## Database Schema (12 tabelas)
