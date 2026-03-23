@@ -153,19 +153,127 @@ To update:
 
 ---
 
-## 7. Minha Receita (Optional — Local API)
+## 7. Minha Receita (Optional — Level 2 Fallback)
 
-Minha Receita is an open-source tool that serves the RF data via a local REST API on port 3000.
-It provides faster lookups with full HTTP interface.
+Minha Receita is an open-source tool by @cuducos that serves the Receita Federal data via a local
+REST API on port 3000. When deployed, it provides HTTP-based CNPJ lookups with all 47 RF fields.
 
-> **Status**: To be completed in Plan 03. Currently not deployed on the VPS.
+> **Level placement**: `enrich_cnpj_with_fallback()` already calls `http://localhost:3000/{cnpj}`
+> as Level 2 — no code change needed. It silently skips if the container is not running.
 
-When deployed, Level 2 of `enrich_cnpj_with_fallback()` will automatically use it:
+### 7.1 Prerequisites Check
+
+```bash
+# Check available disk — Minha Receita downloads the same RF dataset (~15-25 GB)
+df -h /
+
+# Ensure Docker is installed
+docker --version
 ```
-GET http://localhost:3000/00.000.000/0001-91
+
+> **Warning — Double Download**: If `cnpj_rf` table is already populated from Step 4 above,
+> deploying Minha Receita will require downloading the same RF dataset again (~15-25 GB).
+> This doubles disk usage. If disk space is tight (< 30 GB free after the import), skip this
+> section — Level 1 (SQL lookup in `cnpj_rf`) already provides < 10ms enrichment without overhead.
+
+### 7.2 Create docker-compose.yml on VPS
+
+SSH into the VPS and create the following file at `/opt/minha-receita/docker-compose.yml`:
+
+```bash
+ssh root@185.173.110.180
+mkdir -p /opt/minha-receita
+cat > /opt/minha-receita/docker-compose.yml << 'EOF'
+version: "3.8"
+services:
+  minhareceita:
+    image: cuducos/minha-receita:latest
+    ports:
+      - "127.0.0.1:3000:8080"
+    environment:
+      - DATABASE_URL=postgres://extrator:${DB_PASS}@localhost:5432/extrator
+    restart: unless-stopped
+EOF
 ```
 
-Setup instructions will be added here after Plan 03.
+Replace `${DB_PASS}` with the actual database password from AWS SM:
+
+```bash
+# Fetch DB_PASS from AWS SM
+python3 -c "
+import boto3, json
+sm = boto3.client('secretsmanager', region_name='us-east-1')
+s = sm.get_secret_value(SecretId='extratordedados/prod')['SecretString']
+print(json.loads(s)['DB_PASS'])
+"
+# Then replace in the docker-compose.yml
+```
+
+### 7.3 Initial Data Load
+
+Minha Receita must download and import the RF data into its internal format. This can take
+30-90 minutes depending on disk I/O:
+
+```bash
+cd /opt/minha-receita
+docker-compose run minhareceita update
+```
+
+This command downloads the current RF dataset and imports it into the PostgreSQL database
+configured via `DATABASE_URL`.
+
+### 7.4 Start the Service
+
+```bash
+cd /opt/minha-receita
+docker-compose up -d
+```
+
+Check the container is running:
+
+```bash
+docker-compose ps
+docker-compose logs --tail=20
+```
+
+### 7.5 Verification
+
+Test the API with a known CNPJ (Banco do Brasil):
+
+```bash
+curl -s http://localhost:3000/33.000.167/0001-01 | python3 -m json.tool
+```
+
+Expected output: JSON object with 47 fields including `razao_social`, `email`, `uf`, `municipio`, etc.
+
+```json
+{
+  "cnpj": "33000167000101",
+  "razao_social": "BANCO DO BRASIL SA",
+  "nome_fantasia": "BB",
+  "situacao_cadastral": "ATIVA",
+  ...
+}
+```
+
+### 7.6 Flask Integration
+
+No code change needed. `enrich_cnpj_with_fallback()` already calls Minha Receita as Level 2
+of the fallback chain. After the container is running, enrichment will automatically use it:
+
+```
+Level 1: SQL lookup in cnpj_rf table (< 10ms)
+Level 2: Minha Receita local API (http://localhost:3000/{cnpj}) ← active after this deploy
+Level 3: BrasilAPI (public, rate-limited)
+Level 4: ReceitaWS (public, limited)
+Level 5: OpenCNPJ (public, limited)
+```
+
+### 7.7 Note on Double Download
+
+If disk space is tight after the `cnpj_rf` import (Level 1), deploying Minha Receita is
+**not required**. Level 1 provides equivalent or faster lookups (direct SQL with index).
+Minha Receita is only beneficial if you need the full HTTP API interface externally.
 
 ---
 
