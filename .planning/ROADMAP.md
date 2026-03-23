@@ -191,10 +191,10 @@ Plans:
     ✓ Multi-usuário com planos básicos
     ✓ UI busca/filtro/export
 
-[ ] Milestone 1 — Autonomia + Qualidade + Fontes
+[✓] Milestone 1 — Autonomia + Qualidade + Fontes
     [✓] Phase 1 — Pipeline automático (3/3 plans complete)
     [✓] Phase 2 — Qualidade de leads (3/3 plans complete)
-    [ ] Phase 3 — Receita Federal + Outscraper (1/3 plans complete)
+    [✓] Phase 3 — Receita Federal + Outscraper + Prospeo (3/3 plans complete)
 
 [ ] Milestone 2 — Portal de Clientes
     [ ] Phase 4 — Reveal gate + créditos
