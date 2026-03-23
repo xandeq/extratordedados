@@ -568,6 +568,33 @@ except ImportError:
     _DNS_AVAILABLE = False
     _dns_resolver = None
 
+# Phase 2 — Lead Quality: email-validator, disposable-email-domains, phonenumbers
+try:
+    from email_validator import validate_email as _ev_validate, EmailNotValidError
+    _EMAIL_VALIDATOR_AVAILABLE = True
+except ImportError:
+    _EMAIL_VALIDATOR_AVAILABLE = False
+    _ev_validate = None
+    EmailNotValidError = Exception
+
+try:
+    from disposable_email_domains import blocklist as _DISPOSABLE_BLOCKLIST
+    _DISPOSABLE_BLOCKLIST_AVAILABLE = True
+except ImportError:
+    _DISPOSABLE_BLOCKLIST_AVAILABLE = False
+    _DISPOSABLE_BLOCKLIST = set()
+
+try:
+    import phonenumbers
+    from phonenumbers import PhoneNumberFormat, NumberParseException, PhoneNumberType
+    _PHONENUMBERS_AVAILABLE = True
+except ImportError:
+    _PHONENUMBERS_AVAILABLE = False
+    phonenumbers = None
+    PhoneNumberFormat = None
+    NumberParseException = Exception
+    PhoneNumberType = None
+
 # PDF extraction (Phase 2 — imported lazily per call)
 # rapidfuzz for fuzzy dedup (Phase 3 — imported lazily per call)
 
@@ -1337,11 +1364,93 @@ def init_db():
             ('pdf_emails_found', 'BOOLEAN DEFAULT FALSE'),
         ]
 
+        # Phase 2 — Lead Quality columns
+        new_columns += [
+            ('captured_at', 'TIMESTAMPTZ DEFAULT NOW()'),
+            ('last_verified_at', 'TIMESTAMPTZ'),
+            ('freshness_score', 'INTEGER DEFAULT 100'),
+            ('quality_grade', 'CHAR(1)'),
+        ]
+
         for col_name, col_type in new_columns:
             try:
-                c.execute(f'ALTER TABLE leads ADD COLUMN {col_name} {col_type}')
-            except psycopg2.errors.DuplicateColumn:
+                c.execute(f'ALTER TABLE leads ADD COLUMN IF NOT EXISTS {col_name} {col_type}')
+            except Exception as _e:
+                print(f"[init_db] ADD COLUMN {col_name}: {_e}")
                 conn.rollback()
+
+        # Phase 2: Backfill captured_at from extracted_at for pre-migration rows
+        try:
+            c.execute("UPDATE leads SET captured_at = extracted_at WHERE captured_at IS NULL")
+        except Exception as e:
+            print(f"[init_db] backfill captured_at: {e}")
+            conn.rollback()
+
+        # Phase 2: Dedup cross-batch — keep row with highest lead_score per real email
+        # DRY-RUN first: log count before deleting
+        try:
+            c.execute("""
+                SELECT COUNT(*) FROM (
+                    SELECT id FROM (
+                        SELECT id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY email
+                                   ORDER BY COALESCE(lead_score, 0) DESC, id ASC
+                               ) AS rn
+                        FROM leads
+                        WHERE email IS NOT NULL AND email != ''
+                          AND email NOT LIKE '%@directory.local'
+                          AND email NOT LIKE '%@instagram.local'
+                          AND email NOT LIKE '%@linkedin.local'
+                    ) ranked WHERE rn > 1
+                ) dup
+            """)
+            dup_count = c.fetchone()[0]
+            if dup_count > 0:
+                print(f"[init_db] Phase 2 dedup: removing {dup_count} duplicate email rows")
+                c.execute("""
+                    DELETE FROM leads WHERE id IN (
+                        SELECT id FROM (
+                            SELECT id,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY email
+                                       ORDER BY COALESCE(lead_score, 0) DESC, id ASC
+                                   ) AS rn
+                            FROM leads
+                            WHERE email IS NOT NULL AND email != ''
+                              AND email NOT LIKE '%@directory.local'
+                              AND email NOT LIKE '%@instagram.local'
+                              AND email NOT LIKE '%@linkedin.local'
+                        ) ranked WHERE rn > 1
+                    )
+                """)
+                print(f"[init_db] Phase 2 dedup: {c.rowcount} duplicate rows removed")
+            else:
+                print("[init_db] Phase 2 dedup: no duplicates found")
+        except Exception as e:
+            print(f"[init_db] Phase 2 dedup error: {e}")
+            conn.rollback()
+
+        # Phase 2: Drop old per-batch UNIQUE constraint, add global partial unique index
+        try:
+            c.execute("ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_batch_id_email_key")
+        except Exception as e:
+            print(f"[init_db] drop old constraint: {e}")
+            conn.rollback()
+
+        try:
+            c.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_email_global
+                  ON leads(email)
+                  WHERE email IS NOT NULL
+                    AND email != ''
+                    AND email NOT LIKE '%@directory.local'
+                    AND email NOT LIKE '%@instagram.local'
+                    AND email NOT LIKE '%@linkedin.local'
+            """)
+        except Exception as e:
+            print(f"[init_db] create global email index: {e}")
+            conn.rollback()
 
         # Search jobs table
         c.execute('''CREATE TABLE IF NOT EXISTS search_jobs (
@@ -4142,8 +4251,7 @@ def process_search_job(batch_id, search_jobs_data, user_id):
                                            VALUES (%s, %s, %s, %s, %s, %s, %s,
                                                    %s, %s, %s, %s, %s,
                                                    %s, %s, %s, %s, %s, %s,
-                                                   %s, %s)
-                                           ON CONFLICT (batch_id, email) DO NOTHING''',
+                                                   %s, %s)''',
                                         (batch_id, crawl_data['company_name'], email, first_phone,
                                          crawl_data['website'], result_url, 'search_engine',
                                          crawl_data.get('instagram'), crawl_data.get('facebook'),
@@ -4321,8 +4429,7 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                                    (batch_id, company_name, email, phone, website, source_url, source,
                                     address, city, state, category, quality_score, extracted_at)
                                    VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                           %s, %s, %s, %s, %s, %s)
-                                   ON CONFLICT (batch_id, email) DO NOTHING''',
+                                           %s, %s, %s, %s, %s, %s)''',
                                 (batch_id, company, dedup_email, phone, website,
                                  website or '', f'diretorio_{dl.get("source", "br")}',
                                  dl.get('address'), city, state, niche, quality, now)
@@ -4431,8 +4538,7 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                                         city, state, category, contact_name, quality_score,
                                         extra_data, extracted_at)
                                        VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                               %s, %s, %s, %s, %s, %s, %s)
-                                       ON CONFLICT (batch_id, email) DO NOTHING''',
+                                               %s, %s, %s, %s, %s, %s, %s)''',
                                     (batch_id, company, email, phone or None,
                                      f'https://{domain}', result_url, job_source,
                                      city, state, niche, contact_name or None, quality,
@@ -4495,8 +4601,7 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                                                    VALUES (%s, %s, %s, %s, %s, %s, %s,
                                                            %s, %s, %s, %s, %s,
                                                            %s, %s, %s, %s, %s, %s,
-                                                           %s, %s)
-                                                   ON CONFLICT (batch_id, email) DO NOTHING''',
+                                                           %s, %s)''',
                                                 (batch_id, crawl_data['company_name'], email, first_phone,
                                                  crawl_data['website'], result_url, 'search_engine',
                                                  crawl_data.get('instagram'), crawl_data.get('facebook'),
@@ -4661,25 +4766,27 @@ def process_batch(batch_id, urls):
                 pdf_emails_found = bool(result.get('pdf_emails_found'))
 
                 for email in result['emails']:
-                    c.execute(
-                        '''INSERT INTO leads
-                           (batch_id, company_name, email, phone, website, source_url, source,
-                            instagram, facebook, linkedin, twitter, youtube,
-                            whatsapp, cnpj, address, city, state, extracted_at,
-                            email_pattern, team_members, pdf_emails_found)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                   %s, %s, %s, %s, %s,
-                                   %s, %s, %s, %s, %s, %s,
-                                   %s, %s, %s)
-                           ON CONFLICT (batch_id, email) DO NOTHING''',
-                        (batch_id, result['company_name'], email, first_phone,
-                         result['website'], url, 'website_crawl',
-                         result.get('instagram'), result.get('facebook'),
-                         result.get('linkedin'), result.get('twitter'), result.get('youtube'),
-                         result.get('whatsapp'), result.get('cnpj'),
-                         result.get('address'), result.get('city'), result.get('state'), now,
-                         email_pattern_val, team_members_val, pdf_emails_found)
-                    )
+                    try:
+                        c.execute(
+                            '''INSERT INTO leads
+                               (batch_id, company_name, email, phone, website, source_url, source,
+                                instagram, facebook, linkedin, twitter, youtube,
+                                whatsapp, cnpj, address, city, state, extracted_at,
+                                email_pattern, team_members, pdf_emails_found)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s,
+                                       %s, %s, %s, %s, %s,
+                                       %s, %s, %s, %s, %s, %s,
+                                       %s, %s, %s)''',
+                            (batch_id, result['company_name'], email, first_phone,
+                             result['website'], url, 'website_crawl',
+                             result.get('instagram'), result.get('facebook'),
+                             result.get('linkedin'), result.get('twitter'), result.get('youtube'),
+                             result.get('whatsapp'), result.get('cnpj'),
+                             result.get('address'), result.get('city'), result.get('state'), now,
+                             email_pattern_val, team_members_val, pdf_emails_found)
+                        )
+                    except Exception:
+                        pass  # UniqueViolation from global index — skip duplicate email
 
                 # If no emails but phones found, still record the company
                 if not result['emails'] and (result['phones'] or result['company_name']):
@@ -5484,8 +5591,7 @@ def scrape_google_maps_endpoint():
                         c.execute(
                             '''INSERT INTO leads (batch_id, company_name, email, phone, website, address,
                                                   city, state, source, source_url, quality_score, extracted_at)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                               ON CONFLICT (batch_id, email) DO NOTHING''',
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                             (batch_id, lead.get('company_name'), lead.get('email'), lead.get('phone'),
                              lead.get('website'), lead.get('address'), city, state,
                              'google_maps', lead.get('website') or f"maps:{lead.get('company_name')}",
@@ -5558,8 +5664,7 @@ def scrape_instagram_endpoint():
                         c.execute(
                             '''INSERT INTO leads (batch_id, company_name, email, phone, website, instagram,
                                                   city, state, source, source_url, quality_score, extracted_at)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                               ON CONFLICT (batch_id, email) DO NOTHING''',
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                             (batch_id, lead.get('company_name'), email, lead.get('phone'),
                              lead.get('website'), lead.get('instagram'), city, state,
                              'instagram', lead.get('instagram'), 'medio', datetime.now())
@@ -5625,8 +5730,7 @@ def scrape_linkedin_endpoint():
                         c.execute(
                             '''INSERT INTO leads (batch_id, company_name, linkedin, address,
                                                   city, state, source, source_url, quality_score, extracted_at)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                               ON CONFLICT (batch_id, email) DO NOTHING''',
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                             (batch_id, lead.get('company_name'), lead.get('linkedin'), lead.get('address'),
                              city, state, 'linkedin', lead.get('linkedin'), 'premium', datetime.now())
                         )
@@ -5897,7 +6001,7 @@ SHARED_LEADS_SELECT = '''SELECT l.id, l.company_name, l.email, l.phone, l.websit
                                 l.whatsapp, l.cnpj, l.address,
                                 l.crm_status, l.tags, l.notes, l.contact_name, l.updated_at,
                                 b.name as batch_name, l.batch_id, COALESCE(l.lead_score, 0) as lead_score,
-                                l.source, l.quality_score
+                                l.source, l.quality_score, l.quality_grade
                          FROM leads l JOIN batches b ON l.batch_id = b.id
                          WHERE b.is_shared = TRUE'''
 
@@ -5916,6 +6020,7 @@ def lead_row_to_dict(row):
         'batch_name': row[23], 'batch_id': row[24],
         'lead_score': row[25] if row[25] is not None else 0,
         'source': row[26] or '', 'quality_score': row[27] or 'basico',
+        'quality_grade': row[28],  # Phase 2: quality grade (A/B/C/D/F), null until scoring runs
     }
 
 
@@ -11146,14 +11251,11 @@ def _save_leads_to_batch(c, conn, batch_id, leads, source, city, state, provider
             c.execute(
                 '''INSERT INTO leads (batch_id, company_name, email, phone, website, address,
                                       instagram, linkedin, whatsapp, city, state, source, extracted_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (batch_id, email) DO NOTHING''',
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
                 (batch_id, company, dedup_email, phone, website, address,
                  instagram_url, linkedin_url, whatsapp, city, state, source, now)
             )
-            # Bug 3 fix: only count rows actually inserted (rowcount=0 means ON CONFLICT skipped)
-            if c.rowcount == 1:
-                saved += 1
+            saved += 1
         except Exception as e:
             print(f"[{provider.upper()}] Erro ao salvar lead: {e}")
             try:
