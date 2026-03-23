@@ -9078,6 +9078,93 @@ def _get_outscraper_key():
     return None
 
 
+# ---- METHOD 6: Prospeo Social URL API (LinkedIn → email) ----
+_prospeo_key_cache = None
+_prospeo_key_failed = False
+
+
+def _get_prospeo_key():
+    """Fetch Prospeo API key — resolve_secret_value with module-level cache (same as _get_serper_key)."""
+    global _prospeo_key_cache, _prospeo_key_failed
+    if _prospeo_key_cache:
+        return _prospeo_key_cache
+    if _prospeo_key_failed:
+        return None
+    _prospeo_key_cache = resolve_secret_value(
+        'PROSPEO_API_KEY',
+        secret_ids=['tools/prospeo', 'extratordedados/prod'],
+        env_keys=['PROSPEO_API_KEY'],
+        db_provider='prospeo',
+    )
+    if _prospeo_key_cache:
+        return _prospeo_key_cache
+    _prospeo_key_failed = True
+    return None
+
+
+def enrich_linkedin_prospeo(linkedin_url):
+    """
+    Enrich a LinkedIn profile URL to find email via Prospeo Social URL API.
+    Returns {"email": ..., "email_type": ..., "email_status": ...} on success.
+    Returns {} if email not found.
+    Raises ConfigError on quota exhaustion (402) or missing key.
+    Never raises on other errors.
+    """
+    api_key = _get_prospeo_key()
+    if not api_key:
+        raise ConfigError("[PROSPEO] API key não configurada — cadastre em prospeo.io e salve em AWS SM tools/prospeo")
+
+    # Validate URL format
+    if not (linkedin_url.startswith('https://www.linkedin.com/in/')
+            or linkedin_url.startswith('https://linkedin.com/in/')):
+        return {}
+
+    try:
+        resp = http_requests.post(
+            'https://api.prospeo.io/social-url-enrichment',
+            headers={'X-KEY': api_key, 'Content-Type': 'application/json'},
+            json={'url': linkedin_url},
+            timeout=10,
+        )
+
+        # Quota / billing errors
+        if resp.status_code == 402 or 'credits' in resp.text.lower() or 'quota' in resp.text.lower():
+            raise ConfigError("[PROSPEO] Créditos esgotados")
+
+        if resp.status_code != 200:
+            print(f"[prospeo] HTTP {resp.status_code} for {linkedin_url}")
+            return {}
+
+        data = resp.json()
+        email_obj = data.get('response', {}).get('email') or data.get('email') or {}
+        if isinstance(email_obj, dict):
+            email_value = email_obj.get('value') or email_obj.get('email')
+            email_type = email_obj.get('type', '')
+            email_status = email_obj.get('verification', {}).get('status', '') if isinstance(email_obj.get('verification'), dict) else ''
+        else:
+            # Flat response structure
+            email_value = data.get('email')
+            email_type = data.get('type', '')
+            email_status = data.get('status', '')
+
+        if not email_value:
+            print(f"[prospeo] {linkedin_url} → not found")
+            return {}
+
+        print(f"[prospeo] {linkedin_url} → {email_value}")
+        return {
+            'email': email_value,
+            'email_type': email_type,
+            'email_status': email_status,
+        }
+
+    except ConfigError:
+        raise
+    except Exception as e:
+        print(f"[prospeo] Error enriching {linkedin_url}: {e}")
+        return {}
+
+
 def serper_email_search(niche, city, state, max_results=20):
     """
     Serper.dev: 2500 buscas grátis/mês. Retorna resultados estruturados do Google.
