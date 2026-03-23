@@ -12892,6 +12892,115 @@ def _build_massive_search_jobs(batch_id, c, niches, cities_to_search, methods, m
     }
 
 
+# ============= Pipeline Notification Helpers =============
+
+def _get_brevo_credentials():
+    """Fetch Brevo credentials from AWS Secrets Manager. Returns dict or None."""
+    try:
+        blob = _fetch_secret_blob_from_aws('tools/brevo')
+        if blob and blob.get('BREVO_API_KEY'):
+            return blob
+        return None
+    except Exception as e:
+        print(f"[BREVO] Erro ao buscar credenciais: {e}")
+        return None
+
+
+def send_pipeline_email_report(report: dict, to_email: str) -> bool:
+    """
+    Send HTML pipeline summary via Brevo transactional email API.
+    Returns True on success, False on any error. Never raises.
+    """
+    try:
+        creds = _get_brevo_credentials()
+        if not creds:
+            print("[NOTIFY] Brevo credentials unavailable — skipping email")
+            return False
+
+        api_key    = creds['BREVO_API_KEY']
+        from_email = creds.get('BREVO_FROM_EMAIL', 'noreply@extratordedados.com.br')
+        from_name  = creds.get('BREVO_FROM_NAME', 'Extrator DIAX')
+
+        status_color = '#22c55e' if report.get('status') == 'completed' else '#ef4444'
+        niches_str   = ', '.join(report.get('niches', [])) or 'N/A'
+        html = f"""
+        <div style="font-family:sans-serif;max-width:600px;margin:auto">
+          <h2 style="color:{status_color}">Pipeline Diario - {report.get('date','N/A')}</h2>
+          <table border="0" cellpadding="8" cellspacing="0" style="border-collapse:collapse;width:100%">
+            <tr style="background:#f3f4f6"><td><b>Regiao</b></td><td>{report.get('region','N/A')}</td></tr>
+            <tr><td><b>Status</b></td><td style="color:{status_color}">{report.get('status','N/A').upper()}</td></tr>
+            <tr style="background:#f3f4f6"><td><b>Leads coletados</b></td><td>{report.get('leads_found',0)}</td></tr>
+            <tr><td><b>Leads sanitizados</b></td><td>{report.get('leads_sanitized',0)}</td></tr>
+            <tr style="background:#f3f4f6"><td><b>Leads sincronizados</b></td><td>{report.get('leads_synced',0)}</td></tr>
+            <tr><td><b>Duracao</b></td><td>{report.get('duration_min','?')} min</td></tr>
+            {('<tr style="background:#fef2f2"><td><b>Erro</b></td><td style="color:#dc2626">' + str(report.get('error_message','')) + '</td></tr>') if report.get('error_message') else ''}
+          </table>
+          <p style="color:#6b7280;font-size:12px">Nichos: {niches_str}</p>
+        </div>
+        """
+
+        subject = f"[Pipeline] {report.get('date')} - {report.get('leads_found',0)} leads - {report.get('status','N/A').upper()}"
+        payload = {
+            "sender":      {"name": from_name, "email": from_email},
+            "to":          [{"email": to_email}],
+            "subject":     subject,
+            "htmlContent": html,
+        }
+
+        resp = http_requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={"api-key": api_key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        print(f"[NOTIFY] Email Brevo enviado para {to_email} (status {resp.status_code})")
+        return True
+
+    except Exception as e:
+        print(f"[NOTIFY] Erro ao enviar email Brevo: {e}")
+        return False
+
+
+def _ping_healthcheck(check_url: str, success: bool = True) -> None:
+    """
+    Dead man's switch: ping healthchecks.io after pipeline completes.
+    Appends '/fail' suffix when success=False. Never raises.
+    """
+    if not check_url:
+        return
+    try:
+        suffix = '' if success else '/fail'
+        http_requests.get(check_url + suffix, timeout=5)
+        print(f"[HEALTHCHECK] Pinged: {check_url}{suffix}")
+    except Exception as e:
+        print(f"[HEALTHCHECK] Ping failed (non-fatal): {e}")
+
+
+def _generate_and_send_pipeline_report(daily_job_id: int, report_data: dict) -> None:
+    """
+    Called at the end of run_daily_pipeline.
+    Sends email via Brevo and pings healthchecks.io.
+    Wrapped in try/except - must NEVER abort the pipeline.
+    """
+    try:
+        cfg = get_pipeline_config()
+
+        notify_email    = cfg.get('notify_email')
+        healthcheck_url = cfg.get('healthcheck_url')
+
+        if notify_email:
+            send_pipeline_email_report(report_data, notify_email)
+        else:
+            print("[REPORT] notify_email nao configurado - email nao enviado")
+
+        success = report_data.get('status') == 'completed'
+        _ping_healthcheck(healthcheck_url, success)
+
+    except Exception as e:
+        print(f"[REPORT] Erro no envio do relatorio (non-fatal): {e}")
+
+
 def run_daily_pipeline(daily_job_id, niches, region_id, cities_to_search):
     """
     Pipeline completo diário:
@@ -12901,6 +13010,7 @@ def run_daily_pipeline(daily_job_id, niches, region_id, cities_to_search):
       4. Sync para api.alexandrequeiroz.com.br (sem duplicar)
       5. Atualiza daily_jobs com resultado
     """
+    pipeline_start = datetime.now()   # MUST be first — before any other line
     print(f"\n[DAILY] ======= Pipeline iniciado (id={daily_job_id}) =======")
     methods    = ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'local_business_data', 'google_email_harvest', 'website_email_crawler', 'cnpj_open']
     max_pages  = 2
@@ -13084,6 +13194,23 @@ def run_daily_pipeline(daily_job_id, niches, region_id, cities_to_search):
         )
         print(f"[DAILY] ======= Pipeline CONCLUÍDO (id={daily_job_id}) =======\n")
 
+        # ── 8. Enviar relatório e ping healthcheck ────────────────────────
+        try:
+            _generate_and_send_pipeline_report(daily_job_id, {
+                'date':             datetime.now().strftime('%Y-%m-%d'),
+                'region':           region_id,
+                'niches':           niches,
+                'leads_found':      leads_found,
+                'leads_sanitized':  sanitized_count,
+                'leads_synced':     synced,
+                'status':           'completed',
+                'error_message':    None,
+                'duration_min':     round((datetime.now() - pipeline_start).total_seconds() / 60, 1),
+                'batch_id':         batch_id,
+            })
+        except Exception as _rep_err:
+            print(f"[DAILY] Erro no relatório (non-fatal): {_rep_err}")
+
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -13093,6 +13220,21 @@ def run_daily_pipeline(daily_job_id, niches, region_id, cities_to_search):
                 "UPDATE daily_jobs SET status='failed', finished_at=NOW(), error_message=%s WHERE id=%s",
                 (str(e)[:500], daily_job_id)
             )
+        except Exception:
+            pass
+        try:
+            _generate_and_send_pipeline_report(daily_job_id, {
+                'date':            datetime.now().strftime('%Y-%m-%d'),
+                'region':          region_id,
+                'niches':          niches,
+                'leads_found':     locals().get('leads_found', 0),
+                'leads_sanitized': locals().get('sanitized_count', 0),
+                'leads_synced':    locals().get('synced', 0),
+                'status':          'failed',
+                'error_message':   str(e)[:200],
+                'duration_min':    round((datetime.now() - pipeline_start).total_seconds() / 60, 1) if 'pipeline_start' in locals() else 0,
+                'batch_id':        locals().get('batch_id'),
+            })
         except Exception:
             pass
     finally:
