@@ -3,11 +3,12 @@ import { useRouter } from 'next/router'
 import Link from 'next/link'
 import {
   Users, LayoutGrid, Database, ScrollText, RefreshCw,
-  TrendingUp, Shield, UserCheck, ArrowRight
+  TrendingUp, Shield, UserCheck, ArrowRight, Settings,
+  CheckCircle, XCircle, Clock, AlertCircle, Activity
 } from 'lucide-react'
 import api from '../../lib/api'
 import { useToast } from '../../components/Toast'
-import { formatNumber } from '../../lib/formatters'
+import { formatNumber, formatDate } from '../../lib/formatters'
 
 interface AdminSummary {
   total_users: number
@@ -16,6 +17,45 @@ interface AdminSummary {
   users_by_plan: Record<string, number>
   total_leads: number
   leads_this_week: number
+}
+
+interface PipelineHealth {
+  last_run: {
+    status: string
+    started_at: string
+    finished_at: string | null
+    leads_found: number
+    leads_sanitized: number
+    leads_synced: number
+    error_message: string | null
+    region_used: string
+    duration_min: number | null
+  } | null
+  next_scheduled: string
+  stats_30d: {
+    total: number
+    successful: number
+    avg_leads: number
+    max_leads: number
+  }
+  scheduler_running: boolean
+  config: {
+    region: string
+    hour: number
+    niches: string[]
+  }
+}
+
+interface PipelineJob {
+  id: number
+  started_at: string
+  finished_at: string | null
+  status: string
+  leads_found: number
+  leads_sanitized: number
+  leads_synced: number
+  region: string
+  niches: string[]
 }
 
 const PLAN_LABELS: Record<string, string> = { free: 'Grátis', pro: 'Pro', enterprise: 'Enterprise' }
@@ -63,13 +103,74 @@ const QUICK_LINKS = [
     color: 'text-orange-600 dark:text-orange-400',
     bg: 'bg-orange-50 dark:bg-orange-900/20',
   },
+  {
+    href: '/admin/pipeline-config',
+    label: 'Pipeline Automático',
+    description: 'Nichos, região, horário e relatórios',
+    icon: Settings,
+    color: 'text-orange-600 dark:text-orange-400',
+    bg: 'bg-orange-50 dark:bg-orange-900/20',
+  },
 ]
+
+function getStatusBadge(status: string | undefined) {
+  if (!status) {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300">
+        <AlertCircle className="w-3 h-3" />
+        Nunca executou
+      </span>
+    )
+  }
+  if (status === 'completed') {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300">
+        <CheckCircle className="w-3 h-3" />
+        Concluído
+      </span>
+    )
+  }
+  if (status === 'failed') {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300">
+        <XCircle className="w-3 h-3" />
+        Falhou
+      </span>
+    )
+  }
+  if (status === 'running') {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300">
+        <Clock className="w-3 h-3 animate-spin" />
+        Rodando...
+      </span>
+    )
+  }
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300">
+      {status}
+    </span>
+  )
+}
+
+function computeDuration(startedAt: string, finishedAt: string | null): string {
+  if (!finishedAt) return '—'
+  const start = new Date(startedAt).getTime()
+  const end = new Date(finishedAt).getTime()
+  const diffMin = Math.round((end - start) / 60000)
+  if (diffMin < 60) return `${diffMin} min`
+  const h = Math.floor(diffMin / 60)
+  const m = diffMin % 60
+  return `${h}h${m > 0 ? ` ${m}m` : ''}`
+}
 
 export default function AdminHome() {
   const router = useRouter()
   const { addToast } = useToast()
   const [data, setData] = useState<AdminSummary | null>(null)
   const [loading, setLoading] = useState(true)
+  const [pipelineHealth, setPipelineHealth] = useState<PipelineHealth | null>(null)
+  const [pipelineJobs, setPipelineJobs] = useState<PipelineJob[]>([])
 
   const fetchSummary = useCallback(async () => {
     try {
@@ -88,12 +189,22 @@ export default function AdminHome() {
 
   useEffect(() => {
     fetchSummary()
+    api.get('/api/admin/pipeline/health')
+      .then(res => setPipelineHealth(res.data))
+      .catch(() => setPipelineHealth(null))
+    api.get('/api/admin/daily-job/status')
+      .then(res => setPipelineJobs(res.data.jobs || []))
+      .catch(() => setPipelineJobs([]))
   }, [fetchSummary])
 
   const planOrder = ['free', 'pro', 'enterprise']
   const maxPlanCount = data
     ? Math.max(1, ...planOrder.map((p) => data.users_by_plan[p] ?? 0))
     : 1
+
+  const successRate30d = pipelineHealth && pipelineHealth.stats_30d.total > 0
+    ? Math.round((pipelineHealth.stats_30d.successful / pipelineHealth.stats_30d.total) * 100)
+    : null
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -213,6 +324,132 @@ export default function AdminHome() {
           </div>
         </>
       )}
+
+      {/* Pipeline Health Card */}
+      <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5">
+        {/* Card Header */}
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <Activity className="w-4 h-4 text-orange-500" />
+            <h3 className="text-sm font-semibold text-gray-900 dark:text-white">Pipeline Automático</h3>
+            {pipelineHealth?.scheduler_running && (
+              <span className="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300">
+                Agendador ativo
+              </span>
+            )}
+          </div>
+          <Link
+            href="/admin/pipeline-config"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-orange-600 dark:text-orange-400 border border-orange-200 dark:border-orange-800 rounded-lg hover:bg-orange-50 dark:hover:bg-orange-900/20 transition-colors no-underline"
+          >
+            <Settings className="w-3.5 h-3.5" />
+            Configurar
+          </Link>
+        </div>
+
+        {/* Status Row */}
+        <div className="flex items-center gap-3 mb-5">
+          <span className="text-xs text-gray-500 dark:text-gray-400">Último run:</span>
+          {getStatusBadge(pipelineHealth?.last_run?.status)}
+          {pipelineHealth?.last_run?.started_at && (
+            <span className="text-xs text-gray-400 dark:text-gray-500">
+              {formatDate(pipelineHealth.last_run.started_at)}
+            </span>
+          )}
+          {pipelineHealth?.last_run?.error_message && (
+            <span className="text-xs text-red-500 dark:text-red-400 truncate max-w-xs" title={pipelineHealth.last_run.error_message}>
+              {pipelineHealth.last_run.error_message}
+            </span>
+          )}
+        </div>
+
+        {/* Metric Tiles */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+          <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
+            <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Leads ontem</p>
+            <p className="text-xl font-bold text-gray-900 dark:text-white">
+              {pipelineHealth?.last_run != null
+                ? formatNumber(pipelineHealth.last_run.leads_found)
+                : '—'}
+            </p>
+          </div>
+          <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
+            <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Próxima execução</p>
+            <p className="text-sm font-semibold text-gray-900 dark:text-white">
+              {pipelineHealth?.next_scheduled ?? '—'}
+            </p>
+          </div>
+          <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
+            <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Taxa 30d</p>
+            <p className="text-xl font-bold text-gray-900 dark:text-white">
+              {successRate30d != null ? `${successRate30d}%` : '—'}
+            </p>
+          </div>
+          <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
+            <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Média leads</p>
+            <p className="text-xl font-bold text-gray-900 dark:text-white">
+              {pipelineHealth?.stats_30d?.avg_leads != null
+                ? formatNumber(Math.round(pipelineHealth.stats_30d.avg_leads))
+                : '—'}
+            </p>
+          </div>
+        </div>
+
+        {/* 30-day History Table */}
+        <div>
+          <h4 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">
+            Histórico (últimas execuções)
+          </h4>
+          {pipelineJobs.length === 0 ? (
+            <p className="text-sm text-gray-400 dark:text-gray-500 py-4 text-center">
+              Nenhuma execução registrada
+            </p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-gray-100 dark:border-gray-700">
+                    <th className="text-left py-2 pr-3 font-medium text-gray-500 dark:text-gray-400 whitespace-nowrap">Data</th>
+                    <th className="text-left py-2 pr-3 font-medium text-gray-500 dark:text-gray-400 whitespace-nowrap">Região</th>
+                    <th className="text-right py-2 pr-3 font-medium text-gray-500 dark:text-gray-400 whitespace-nowrap">Leads</th>
+                    <th className="text-right py-2 pr-3 font-medium text-gray-500 dark:text-gray-400 whitespace-nowrap">Sanitizados</th>
+                    <th className="text-right py-2 pr-3 font-medium text-gray-500 dark:text-gray-400 whitespace-nowrap">Sincronizados</th>
+                    <th className="text-left py-2 pr-3 font-medium text-gray-500 dark:text-gray-400 whitespace-nowrap">Status</th>
+                    <th className="text-right py-2 font-medium text-gray-500 dark:text-gray-400 whitespace-nowrap">Duração</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pipelineJobs.slice(0, 10).map((job) => (
+                    <tr key={job.id} className="border-b border-gray-50 dark:border-gray-700/50 hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors">
+                      <td className="py-2 pr-3 text-gray-700 dark:text-gray-300 whitespace-nowrap">
+                        {formatDate(job.started_at)}
+                      </td>
+                      <td className="py-2 pr-3 text-gray-600 dark:text-gray-400 whitespace-nowrap">
+                        {job.region ?? '—'}
+                      </td>
+                      <td className="py-2 pr-3 text-right font-medium text-gray-900 dark:text-white">
+                        {formatNumber(job.leads_found)}
+                      </td>
+                      <td className="py-2 pr-3 text-right text-gray-600 dark:text-gray-400">
+                        {formatNumber(job.leads_sanitized)}
+                      </td>
+                      <td className="py-2 pr-3 text-right text-gray-600 dark:text-gray-400">
+                        {formatNumber(job.leads_synced)}
+                      </td>
+                      <td className="py-2 pr-3">
+                        {getStatusBadge(job.status)}
+                      </td>
+                      <td className="py-2 text-right text-gray-500 dark:text-gray-400 whitespace-nowrap">
+                        {computeDuration(job.started_at, job.finished_at)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
 
       {/* Quick Links */}
       <div>
