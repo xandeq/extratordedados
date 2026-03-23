@@ -271,7 +271,7 @@ def resolve_secret_value(key, secret_ids=None, env_keys=None, db_provider=None, 
 
 def warm_secrets_cache():
     """Best effort: hydrate local cache while AWS is available."""
-    for secret_id in ('extratordedados/prod', 'tools/rapidapi', 'tools/serper', 'tools/apify'):
+    for secret_id in ('extratordedados/prod', 'tools/rapidapi', 'tools/serper', 'tools/apify', 'tools/zerobounce'):
         _fetch_secret_blob_from_aws(secret_id)
 
 
@@ -7330,14 +7330,86 @@ def validate_batch_endpoint():
         return jsonify({'error': str(e)}), 500
 
 
+def validate_zerobounce(email: str) -> dict:
+    """
+    Validate a single email via ZeroBounce API v2.
+    Requires tools/zerobounce secret in AWS SM (ZEROBOUNCE_API_KEY).
+    Returns: {is_valid: bool, status: str|None, sub_status: str|None, did_you_mean: str|None, error: str|None}
+    """
+    api_key = resolve_secret_value(
+        'ZEROBOUNCE_API_KEY',
+        secret_ids=['tools/zerobounce'],
+        env_keys=['ZEROBOUNCE_API_KEY'],
+    )
+    if not api_key or api_key == 'PLACEHOLDER_REPLACE_WITH_ACTUAL_KEY':
+        return {'is_valid': False, 'status': None, 'sub_status': None,
+                'did_you_mean': None, 'error': 'zerobounce_key_missing'}
+    try:
+        resp = requests.get(
+            'https://api.zerobounce.net/v2/validate',
+            params={'api_key': api_key, 'email': email, 'ip_address': ''},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            'is_valid': data.get('status') == 'valid',
+            'status': data.get('status'),
+            'sub_status': data.get('sub_status'),
+            'did_you_mean': data.get('did_you_mean'),
+            'error': None,
+        }
+    except Exception as e:
+        return {'is_valid': False, 'status': None, 'sub_status': None,
+                'did_you_mean': None, 'error': str(e)}
+
+
 @app.route('/api/leads/<int:lead_id>/verify-email', methods=['POST'])
-def verify_email_endpoint(lead_id):
-    """Verify a single lead email (ZeroBounce or free fallback). Wave 2 implementation."""
+@limiter.limit("20 per hour")
+def verify_lead_email(lead_id: int):
+    """Verify a single lead email via ZeroBounce API. Updates last_verified_at and mx_valid."""
     user_id = verify_token(get_auth_header())
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    # Wave 2: call ZeroBounce / free verify and return result
-    return jsonify({'error': 'Not implemented yet — available in Wave 2'}), 501
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT email FROM leads WHERE id = %s", (lead_id,))
+        row = c.fetchone()
+        if not row:
+            return jsonify({'error': 'Lead not found'}), 404
+        email = row[0]
+        if not email:
+            return jsonify({'error': 'Lead has no email address'}), 400
+
+        zb = validate_zerobounce(email)
+        if zb.get('error') == 'zerobounce_key_missing':
+            return jsonify({'error': 'ZeroBounce API key not configured'}), 503
+
+        is_valid = zb['is_valid']
+        c.execute("""
+            UPDATE leads
+            SET last_verified_at = NOW(),
+                mx_valid = %s
+            WHERE id = %s
+        """, (is_valid, lead_id))
+        conn.commit()
+
+        return jsonify({
+            'lead_id': lead_id,
+            'email': email,
+            'is_valid': is_valid,
+            'status': zb['status'],
+            'sub_status': zb['sub_status'],
+            'did_you_mean': zb['did_you_mean'],
+        }), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        c.close()
+        conn.close()
 
 
 @app.route('/api/leads/sanitize', methods=['POST'])
