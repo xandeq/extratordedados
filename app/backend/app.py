@@ -2168,20 +2168,11 @@ def init_db():
         c.execute('CREATE INDEX IF NOT EXISTS idx_system_logs_provider ON system_logs(provider)')
 
         # fix_prompt column on system_logs (added later, migrate safely)
-        try:
-            c.execute("ALTER TABLE system_logs ADD COLUMN fix_prompt TEXT")
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback()
+        c.execute("ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS fix_prompt TEXT")
 
         # error_type + extra_data columns on system_logs (v2 logs)
-        try:
-            c.execute("ALTER TABLE system_logs ADD COLUMN error_type VARCHAR(50)")
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback()
-        try:
-            c.execute("ALTER TABLE system_logs ADD COLUMN extra_data JSONB")
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback()
+        c.execute("ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS error_type VARCHAR(50)")
+        c.execute("ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS extra_data JSONB")
         c.execute('CREATE INDEX IF NOT EXISTS idx_system_logs_error_type ON system_logs(error_type)')
 
         # Custom niches table (user-saved niches for massive search)
@@ -2193,16 +2184,10 @@ def init_db():
         )''')
 
         # enrichment_source column on search_jobs
-        try:
-            c.execute("ALTER TABLE search_jobs ADD COLUMN enrichment_source VARCHAR(30) DEFAULT 'scraping'")
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback()
+        c.execute("ALTER TABLE search_jobs ADD COLUMN IF NOT EXISTS enrichment_source VARCHAR(30) DEFAULT 'scraping'")
 
         # SaaS Foundation: plan column on users
-        try:
-            c.execute("ALTER TABLE users ADD COLUMN plan VARCHAR(20) DEFAULT 'free'")
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback()
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'free'")
 
         # SaaS Foundation: usage tracking table
         c.execute('''CREATE TABLE IF NOT EXISTS usage_tracking (
@@ -2268,10 +2253,7 @@ def init_db():
         c.execute('CREATE INDEX IF NOT EXISTS idx_api_cache_expires ON api_cache(expires_at)')
 
         # Semana 4: Shared lead base — mark all batches as shared by default
-        try:
-            c.execute("ALTER TABLE batches ADD COLUMN is_shared BOOLEAN DEFAULT TRUE")
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback()
+        c.execute("ALTER TABLE batches ADD COLUMN IF NOT EXISTS is_shared BOOLEAN DEFAULT TRUE")
         # Backfill: ensure all existing batches are marked as shared
         c.execute("UPDATE batches SET is_shared = TRUE WHERE is_shared IS NULL")
         c.execute('CREATE INDEX IF NOT EXISTS idx_batches_is_shared ON batches(is_shared)')
