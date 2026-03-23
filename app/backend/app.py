@@ -1767,6 +1767,46 @@ def init_db():
             print(f"[init_db] create global email index: {e}")
             conn.rollback()
 
+        # Phase 3: cnpj_rf table — Receita Federal local lookup
+        try:
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS cnpj_rf (
+                    cnpj            CHAR(14) PRIMARY KEY,
+                    razao_social    TEXT,
+                    nome_fantasia   TEXT,
+                    situacao        SMALLINT,
+                    cnae_principal  VARCHAR(7),
+                    logradouro      TEXT,
+                    numero          VARCHAR(10),
+                    complemento     TEXT,
+                    bairro          TEXT,
+                    cep             VARCHAR(8),
+                    municipio_cod   INTEGER,
+                    uf              CHAR(2),
+                    ddd1            VARCHAR(3),
+                    telefone1       VARCHAR(9),
+                    ddd2            VARCHAR(3),
+                    telefone2       VARCHAR(9),
+                    email           TEXT,
+                    data_abertura   DATE,
+                    porte           SMALLINT,
+                    matriz_filial   SMALLINT
+                )
+            ''')
+            # Partial indexes on active companies only (situacao=2 means ativa)
+            c.execute('''
+                CREATE INDEX IF NOT EXISTS idx_cnpj_rf_uf_municipio
+                  ON cnpj_rf (uf, municipio_cod) WHERE situacao = 2
+            ''')
+            c.execute('''
+                CREATE INDEX IF NOT EXISTS idx_cnpj_rf_cnae
+                  ON cnpj_rf (cnae_principal) WHERE situacao = 2
+            ''')
+            print("[init_db] Phase 3: cnpj_rf table ready")
+        except Exception as e:
+            print(f"[init_db] Phase 3 cnpj_rf: {e}")
+            conn.rollback()
+
         # Search jobs table
         c.execute('''CREATE TABLE IF NOT EXISTS search_jobs (
             id SERIAL PRIMARY KEY,
