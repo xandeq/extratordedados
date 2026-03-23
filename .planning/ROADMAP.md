@@ -64,12 +64,12 @@ Plans:
 
 **Out of scope**: MillionVerifier bulk (pago), Paid email validation tier
 
-**Plans:** 3 plans
+**Plans:** 1/3 plans executed
 
 Plans:
-- [ ] 02-01-PLAN.md — Wave 0 test scaffold + packages in requirements.txt + DB migrations (4 cols) + dedup cross-batch + global partial UNIQUE index on email
-- [ ] 02-02-PLAN.md — validate_email_free() + normalize_phone_br() + compute_lead_quality_score() + insert/sanitize hooks + POST /api/leads/validate-batch + quality_grade filter
-- [ ] 02-03-PLAN.md — ZeroBounce AWS SM secret + validate_zerobounce() + POST /api/leads/<id>/verify-email + frontend GradeBadge + FreshnessIndicator + A-F filter
+- [x] 02-01-PLAN.md — Wave 0 test scaffold + packages in requirements.txt + DB migrations (4 cols) + dedup cross-batch + global partial UNIQUE index on email
+- [x] 02-02-PLAN.md — validate_email_free() + normalize_phone_br() + compute_lead_quality_score() + insert/sanitize hooks + POST /api/leads/validate-batch + quality_grade filter
+- [x] 02-03-PLAN.md — ZeroBounce AWS SM secret + validate_zerobounce() + POST /api/leads/<id>/verify-email + frontend GradeBadge + FreshnessIndicator + A-F filter
 
 ---
 
