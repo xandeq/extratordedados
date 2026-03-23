@@ -5,8 +5,9 @@
 ## Current Status
 
 - **Active milestone**: Milestone 1 — Pipeline Autônomo + Qualidade + Fontes
-- **Active phase**: None (ready to start Phase 1)
-- **Last completed**: Project initialization + reorganization
+- **Active phase**: Phase 1 — Pipeline 100% Automático
+- **Current Plan**: 2 of N (Plan 01 complete)
+- **Last completed**: Phase 1, Plan 01 — pipeline_config table and admin endpoints
 
 ## Completed Work
 
@@ -15,6 +16,7 @@
 | 2026-03-22 | Project reorganized: app/, scripts/, docs/, data/, .planning/ |
 | 2026-03-22 | PROJECT.md, REQUIREMENTS.md, ROADMAP.md created |
 | 2026-03-22 | 4 research reports created in .planning/research/ |
+| 2026-03-22 | Phase 1 Plan 01: pipeline_config table, get_pipeline_config(), GET/PUT /api/admin/pipeline-config endpoints |
 
 ## Research Available
 
@@ -36,7 +38,17 @@
 | APScheduler 3.x (keep, don't upgrade) | 4.x is pre-release/not production-ready |
 | pipeline_config table (not hardcoded) | Enables admin UI config without code changes |
 | Reveal gate before export in roadmap | You reveal before you bulk-export |
+| Config values stored as JSON strings | Lists serialize cleanly, parsed with json.loads() |
+| get_pipeline_config() never raises | Falls back to module constants on any DB error — pipeline never blocked |
+| reschedule_job only on hour/minute change | Region/niches take effect on next trigger without APScheduler restart |
 
-## Next Action
+## Performance Metrics
 
-Run `/gsd:plan-phase 1` to create the execution plan for Phase 1 (Pipeline Automático).
+| Phase | Plan | Duration | Tasks | Files |
+|-------|------|----------|-------|-------|
+| 01 | 01 | ~15 min | 2/2 | 2 |
+
+## Last Session
+
+- **Stopped at**: Completed fase1-01-PLAN.md
+- **Timestamp**: 2026-03-22

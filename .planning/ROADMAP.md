@@ -34,12 +34,12 @@
 
 **Out of scope**: WhatsApp notifications (Fase posterior), Redis
 
-**Plans:** 3 plans
+**Plans:** 1/3 plans executed
 
 Plans:
-- [ ] 01-PLAN.md — DB migration + pipeline_config table + GET/PUT config endpoints + trigger_daily_pipeline() wired to DB
-- [ ] 02-PLAN.md — GET /api/admin/pipeline/health + Brevo email report + healthchecks.io ping
-- [ ] 03-PLAN.md — Frontend /admin/pipeline-config editor + admin index health card + 30-day history
+- [x] 01-PLAN.md — DB migration + pipeline_config table + GET/PUT config endpoints + trigger_daily_pipeline() wired to DB
+- [x] 02-PLAN.md — GET /api/admin/pipeline/health + Brevo email report + healthchecks.io ping
+- [x] 03-PLAN.md — Frontend /admin/pipeline-config editor + admin index health card + 30-day history
 
 ---
 
