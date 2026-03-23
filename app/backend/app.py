@@ -11199,7 +11199,7 @@ def start_massive_search():
     if methods is not None and not isinstance(methods, list):
         return jsonify({'error': '"methods" deve ser uma lista'}), 400
     if methods is None:
-        methods = ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data']
+        methods = ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data', 'outscraper_maps']
 
     # Parameters
     region_id = (data.get('region') or '').strip()
@@ -11506,6 +11506,17 @@ def start_massive_search():
                          city_data.get('region', 'manual'), 1, 'pending', 'whatsapp_dorks', datetime.now()))
                     whatsapp_dorks_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
 
+        outscraper_jobs = []
+        if 'outscraper_maps' in methods:
+            for niche in niches[:3]:
+                for city_data in cities_to_search[:2]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'outscraper_maps', datetime.now()))
+                    outscraper_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
         # Bug 2 fix: mark batch as 'processing' now that all jobs are queued
         c.execute("UPDATE batches SET status='processing' WHERE id=%s", (batch_id,))
 
@@ -11616,6 +11627,14 @@ def start_massive_search():
         threading.Thread(target=process_whatsapp_dorks_massive,
                          args=(batch_id, whatsapp_dorks_jobs, user_id), daemon=True).start()
 
+    # Thread 16: Outscraper Google Maps API (500 records/month free)
+    if outscraper_jobs:
+        threading.Thread(
+            target=process_outscraper_massive,
+            args=(batch_id, outscraper_jobs, user_id),
+            daemon=True
+        ).start()
+
     # Bug 4 fix: monitor thread marks batch 'completed' when all jobs finish
     monitor_thread = threading.Thread(target=_monitor_batch_completion, args=(batch_id,), daemon=True)
     monitor_thread.start()
@@ -11643,6 +11662,7 @@ def start_massive_search():
             'receita_ws': len(receita_ws_jobs),
             'olx_ads': len(olx_ads_jobs),
             'whatsapp_dorks': len(whatsapp_dorks_jobs),
+            'outscraper_maps': len(outscraper_jobs),
         },
         'status': 'processing',
         'message': f'Busca massiva iniciada com {total_jobs} jobs em {len(methods)} métodos'
