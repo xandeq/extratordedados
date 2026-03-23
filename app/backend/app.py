@@ -850,6 +850,34 @@ DAILY_JOB_HOUR    = 3                    # 3h da manhã, horário de Brasília
 DAILY_JOB_USER_ID = 1                   # user_id do admin que "roda" o job
 DAILY_CRM_SYNC_HOUR = 9                 # 09:00 da manhã para sync CRM automático
 
+
+def get_pipeline_config():
+    """Read current pipeline config from DB. Falls back to module constants on any error."""
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT key, value FROM pipeline_config")
+            rows = {k: json.loads(v) for k, v in cur.fetchall()}
+        return {
+            'niches':          rows.get('daily_niches',    DAILY_JOB_NICHES),
+            'region':          rows.get('daily_region',    DAILY_JOB_REGION),
+            'hour':            int(rows.get('daily_hour',  DAILY_JOB_HOUR)),
+            'minute':          int(rows.get('daily_minute', 0)),
+            'notify_email':    rows.get('notify_email'),
+            'healthcheck_url': rows.get('healthcheck_url'),
+        }
+    except Exception as e:
+        print(f"[CONFIG] Erro ao ler pipeline_config: {e} — usando defaults")
+        return {
+            'niches':          DAILY_JOB_NICHES,
+            'region':          DAILY_JOB_REGION,
+            'hour':            DAILY_JOB_HOUR,
+            'minute':          0,
+            'notify_email':    None,
+            'healthcheck_url': None,
+        }
+
+
 SKIP_DOMAINS = {
     # Redes sociais
     'facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'linkedin.com',
@@ -1400,6 +1428,27 @@ def init_db():
             leads_skipped INTEGER DEFAULT 0,
             error_message TEXT
         )''')
+
+        # Pipeline config table — configurable niches, region, schedule
+        c.execute('''CREATE TABLE IF NOT EXISTS pipeline_config (
+            key        VARCHAR(100) PRIMARY KEY,
+            value      TEXT         NOT NULL,
+            updated_at TIMESTAMP    DEFAULT NOW()
+        )''')
+        c.execute('''
+            INSERT INTO pipeline_config (key, value) VALUES
+              ('daily_niches',    %s),
+              ('daily_region',    %s),
+              ('daily_hour',      %s),
+              ('daily_minute',    '0'),
+              ('notify_email',    'null'),
+              ('healthcheck_url', 'null')
+            ON CONFLICT (key) DO NOTHING
+        ''', (
+            json.dumps(DAILY_JOB_NICHES),
+            json.dumps(DAILY_JOB_REGION),
+            json.dumps(DAILY_JOB_HOUR),
+        ))
 
         # CRM Sync Log — for daily automatic 09:00 sync and manual syncs
         c.execute('''CREATE TABLE IF NOT EXISTS crm_sync_logs (
