@@ -7676,6 +7676,73 @@ def verify_lead_email(lead_id: int):
         conn.close()
 
 
+@app.route('/api/leads/<int:lead_id>/enrich-linkedin', methods=['POST'])
+@limiter.limit("30 per hour")
+def enrich_lead_linkedin(lead_id: int):
+    """Enrich a lead's email via Prospeo Social URL API using their LinkedIn URL."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT email, linkedin FROM leads WHERE id = %s", (lead_id,))
+        row = c.fetchone()
+        if not row:
+            return jsonify({'error': 'Lead not found'}), 404
+
+        current_email, linkedin_url = row[0], row[1]
+
+        if not linkedin_url:
+            return jsonify({'error': 'Lead sem LinkedIn URL'}), 400
+
+        # Ensure Prospeo key is available before calling
+        try:
+            api_key = _get_prospeo_key()
+            if not api_key:
+                return jsonify({'error': 'Prospeo não configurado — adicione chave em tools/prospeo no AWS SM'}), 503
+        except ConfigError:
+            return jsonify({'error': 'Prospeo não configurado'}), 503
+
+        try:
+            enriched = enrich_linkedin_prospeo(linkedin_url)
+        except ConfigError:
+            return jsonify({'error': 'Créditos Prospeo esgotados este mês'}), 429
+
+        if not enriched.get('email'):
+            return jsonify({'enriched': False, 'message': 'Email não encontrado'}), 200
+
+        email_value = enriched['email']
+        email_type = enriched.get('email_type', '')
+        email_status = enriched.get('email_status', '')
+
+        # Only update if email is currently empty
+        if not current_email:
+            try:
+                c.execute(
+                    "UPDATE leads SET email = %s, last_verified_at = NOW() WHERE id = %s",
+                    (email_value, lead_id)
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+        return jsonify({
+            'enriched': True,
+            'email': email_value,
+            'email_type': email_type,
+            'email_status': email_status,
+        }), 200
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        c.close()
+        conn.close()
+
+
 @app.route('/api/leads/sanitize', methods=['POST'])
 @limiter.limit("5/minute")
 def sanitize_leads():
@@ -12400,6 +12467,7 @@ def process_linkedin_massive(batch_id, jobs_data, user_id):
     try:
         c = conn.cursor()
         total_saved = 0
+        prospeo_credits_used = 0  # Per-run cap: max 75 to match Prospeo free tier
 
         for job_idx, job_data in enumerate(jobs_data):
             search_job_id = job_data['search_job_id']
@@ -12427,6 +12495,26 @@ def process_linkedin_massive(batch_id, jobs_data, user_id):
                     leads = result
                     leads_saved = _save_leads_to_batch(c, conn, batch_id, leads, 'linkedin', city, state, 'LINKEDIN')
                     total_saved += leads_saved
+
+                    # Prospeo enrichment — only for leads with linkedin URL but no email
+                    # Guard: max 75 credits per run (Prospeo free tier limit)
+                    for lead in leads:
+                        if not lead.get('email') and lead.get('linkedin') and prospeo_credits_used < 75:
+                            try:
+                                enriched = enrich_linkedin_prospeo(lead['linkedin'])
+                                if enriched.get('email'):
+                                    try:
+                                        c.execute(
+                                            "UPDATE leads SET email=%s, last_verified_at=NOW() WHERE batch_id=%s AND linkedin=%s AND email IS NULL",
+                                            (enriched['email'], batch_id, lead['linkedin'])
+                                        )
+                                        prospeo_credits_used += 1
+                                    except Exception:
+                                        pass
+                            except ConfigError:
+                                print("[prospeo] Quota esgotada — parando enrichment para este job")
+                                prospeo_credits_used = 75  # stop further calls
+
                     status = 'completed'
                     err_msg = None
                     print(f"[LINKEDIN] Job {job_idx+1} OK: {leads_saved} leads salvos")
