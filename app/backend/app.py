@@ -6904,6 +6904,51 @@ def sanitize_single_lead(lead_dict):
     return lead, issues, has_contact
 
 
+# ── Phase 2 Lead Quality Endpoints (Wave 2 stubs — auth gates active) ────────
+
+@app.route('/api/leads/validate-email-free', methods=['POST'])
+def validate_email_free_endpoint():
+    """Validate email using free methods (format + MX + disposable check). Wave 2 implementation."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    # Wave 2: call validate_email_free() and return result
+    return jsonify({'error': 'Not implemented yet — available in Wave 2'}), 501
+
+
+@app.route('/api/leads/normalize-phone', methods=['POST'])
+def normalize_phone_endpoint():
+    """Normalize Brazilian phone number to E.164 format. Wave 2 implementation."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    # Wave 2: call normalize_phone_br() and return result
+    return jsonify({'error': 'Not implemented yet — available in Wave 2'}), 501
+
+
+@app.route('/api/leads/validate-batch', methods=['POST'])
+def validate_batch_endpoint():
+    """Run email validation + phone normalization over all leads in a batch. Wave 2 implementation."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json() or {}
+    if not data.get('batch_id'):
+        return jsonify({'error': 'batch_id is required'}), 400
+    # Wave 2: process batch and return summary
+    return jsonify({'error': 'Not implemented yet — available in Wave 2'}), 501
+
+
+@app.route('/api/leads/<int:lead_id>/verify-email', methods=['POST'])
+def verify_email_endpoint(lead_id):
+    """Verify a single lead email (ZeroBounce or free fallback). Wave 2 implementation."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    # Wave 2: call ZeroBounce / free verify and return result
+    return jsonify({'error': 'Not implemented yet — available in Wave 2'}), 501
+
+
 @app.route('/api/leads/sanitize', methods=['POST'])
 @limiter.limit("5/minute")
 def sanitize_leads():
