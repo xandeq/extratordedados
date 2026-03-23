@@ -11852,6 +11852,156 @@ def process_local_business_data_massive(batch_id, jobs_data, user_id):
             pass
 
 
+@_persist_thread_errors('outscraper')
+def process_outscraper_massive(batch_id, jobs_data, user_id):
+    """
+    Processa jobs via Outscraper Google Maps API.
+    Princípios de resiliência:
+      - Retry 3x com backoff via _massive_retry por job
+      - NUNCA lança exceção para fora — itera todos os jobs até o fim
+      - Se quota excedida, marca restantes como skipped e encerra graciosamente
+      - Loga cada falha no scraper_errors.log
+    Free tier: 500 records/month.
+    """
+    from outscraper import ApiClient as OutscraperClient
+
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[OUTSCRAPER] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'outscraper', f'batch={batch_id}',
+                f'Iniciando Outscraper Maps. {len(jobs_data)} jobs.')
+
+    try:
+        c = conn.cursor()
+        total_saved    = 0
+        quota_exceeded = False
+
+        # Fetch API key once before the loop
+        key = _get_outscraper_key()
+        if not key:
+            scraper_log('WARNING', 'outscraper', f'batch={batch_id}',
+                        'API key não disponível — pulando todos os jobs')
+            print('[OUTSCRAPER] API key ausente — marcando todos os jobs como quota_exceeded')
+            for job_data in jobs_data:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', 'quota_exceeded', datetime.now(), job_data['search_job_id']))
+                except Exception:
+                    pass
+            return
+
+        client = OutscraperClient(api_key=key)
+
+        for job_idx, job_data in enumerate(jobs_data):
+
+            search_job_id = job_data['search_job_id']
+            niche  = job_data['niche']
+            city   = job_data['city']
+            state  = job_data['state']
+            query  = f"{niche} {city} {state}"
+
+            # Parar graciosamente se quota esgotada
+            if quota_exceeded:
+                print(f"[OUTSCRAPER] Quota excedida — marcando job {search_job_id} como skipped")
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', 'quota_exceeded', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+                continue
+
+            print(f"[OUTSCRAPER] Job {job_idx+1}/{len(jobs_data)}: {query}")
+
+            try:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('running', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+                result, err = _massive_retry(
+                    lambda q=query: client.google_maps_search(
+                        [q], limit=20, language="pt", region="BR",
+                        fields=["name", "phone", "email", "full_address", "site", "category"]
+                    ),
+                    provider='outscraper',
+                    query=query
+                )
+
+                if result is not None:
+                    # Outscraper returns list-of-lists: result[0] is the businesses for query[0]
+                    raw_businesses = result[0] if (isinstance(result, list) and result) else []
+                    leads = []
+                    for biz in raw_businesses:
+                        if not isinstance(biz, dict):
+                            continue
+                        leads.append({
+                            'company_name': biz.get('name', ''),
+                            'email':        biz.get('email', ''),
+                            'phone':        biz.get('phone', ''),
+                            'website':      biz.get('site', ''),
+                            'address':      biz.get('full_address', ''),
+                            'category':     niche,
+                            'city':         city,
+                            'state':        state,
+                            'source':       'outscraper_maps',
+                        })
+                    leads_saved = _save_leads_to_batch(
+                        c, conn, batch_id, leads, 'outscraper_maps', city, state, 'OUTSCRAPER'
+                    )
+                    total_saved += leads_saved
+                    status  = 'completed'
+                    err_msg = None
+                    print(f"[OUTSCRAPER] Job {job_idx+1} OK: {leads_saved} leads salvos")
+                    scraper_log('INFO', 'outscraper', query, f'Job concluído: {leads_saved} leads')
+                else:
+                    leads_saved = 0
+                    status  = 'failed'
+                    err_str = str(err)[:500] if err else 'Sem resultados após 3 tentativas'
+                    err_msg = err_str
+                    # Detectar quota excedida para não desperdiçar chamadas restantes
+                    if err and ('429' in str(err).lower() or 'quota' in str(err).lower() or 'limit' in str(err).lower() or isinstance(err, ConfigError)):
+                        quota_exceeded = True
+                        reason = 'Config ausente (API key)' if isinstance(err, ConfigError) else 'Quota Outscraper excedida'
+                        scraper_log('WARNING', 'outscraper', query,
+                                    f'{reason} — parando thread graciosamente')
+                    print(f"[OUTSCRAPER] Job {job_idx+1} FALHOU: {err_msg}")
+                    scraper_log('WARNING', 'outscraper', query, f'Job falhou: {err_msg}')
+
+                try:
+                    c.execute(
+                        'UPDATE search_jobs SET status=%s, finished_at=%s, total_leads=%s, error_message=%s WHERE id=%s',
+                        (status, datetime.now(), leads_saved, err_msg, search_job_id)
+                    )
+                except Exception:
+                    pass
+
+            except Exception as e:
+                scraper_log('ERROR', 'outscraper', query, f'Erro inesperado no job: {e}', e)
+                print(f"[OUTSCRAPER] Erro inesperado job {search_job_id}: {e}")
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(e)[:500], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(5, 10))
+
+        scraper_log('INFO', 'outscraper', f'batch={batch_id}',
+                    f'Thread finalizada. Total salvo: {total_saved} leads.')
+        print(f"[OUTSCRAPER] Thread finalizada. batch={batch_id}, total={total_saved} leads")
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'outscraper', f'batch={batch_id}',
+                    f'Erro crítico na thread: {e}', e)
+        print(f"[OUTSCRAPER] ERRO CRÍTICO: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 # ============================================================
 # MASSIVE SEARCH PROCESSORS — Diretórios / Instagram / LinkedIn
 # ============================================================
