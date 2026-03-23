@@ -26,10 +26,10 @@ Sistema web de extração e agregação automatizada de leads empresariais brasi
 ### Active
 
 #### Pipeline & Automação
-- [ ] Pipeline diário executa nichos configuráveis (não hardcoded)
-- [ ] Relatório automático pós-pipeline enviado por notificação (WhatsApp ou email)
-- [ ] Painel de health do pipeline: última execução, leads capturados, erros, próxima execução
-- [ ] Configuração de nichos e regiões por interface (sem editar código)
+- [x] Pipeline diário executa nichos configuráveis (não hardcoded) — Validated in Phase 1: pipeline-100-automatico
+- [x] Relatório automático pós-pipeline enviado por email (Brevo) — Validated in Phase 1: pipeline-100-automatico
+- [x] Painel de health do pipeline: última execução, leads capturados, erros, próxima execução — Validated in Phase 1: pipeline-100-automatico
+- [x] Configuração de nichos e regiões por interface (sem editar código) — Validated in Phase 1: pipeline-100-automatico
 
 #### Qualidade de Leads
 - [ ] Validação de email em tempo real antes de salvar (verificar formato + MX record)
@@ -97,4 +97,4 @@ Este documento evolui a cada fase completada.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-03-22 after initialization*
+*Last updated: 2026-03-23 after Phase 1 completion*
