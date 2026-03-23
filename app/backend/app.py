@@ -13471,6 +13471,78 @@ def admin_update_pipeline_config():
     return jsonify({'success': True}), 200
 
 
+@app.route('/api/admin/pipeline/health', methods=['GET'])
+@limiter.limit("60/minute")
+def admin_pipeline_health():
+    """Return pipeline health summary: last run, 30d stats, next scheduled time. Admin only."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+        # Last run
+        cur.execute('''
+            SELECT id, status, started_at, finished_at, leads_found,
+                   leads_sanitized, leads_synced, error_message, region_used,
+                   CASE WHEN finished_at IS NOT NULL AND started_at IS NOT NULL
+                        THEN ROUND(EXTRACT(EPOCH FROM (finished_at - started_at))/60, 1)
+                        ELSE NULL END AS duration_min
+            FROM daily_jobs
+            ORDER BY started_at DESC LIMIT 1
+        ''')
+        row = cur.fetchone()
+
+        last_run = None
+        if row:
+            cols = ['id', 'status', 'started_at', 'finished_at', 'leads_found',
+                    'leads_sanitized', 'leads_synced', 'error_message', 'region_used', 'duration_min']
+            last_run = dict(zip(cols, row))
+            if last_run['started_at']:
+                last_run['started_at'] = last_run['started_at'].isoformat()
+            if last_run['finished_at']:
+                last_run['finished_at'] = last_run['finished_at'].isoformat()
+            if last_run['duration_min'] is not None:
+                last_run['duration_min'] = float(last_run['duration_min'])
+
+        # 30-day stats
+        cur.execute('''
+            SELECT
+                COUNT(*)                                               AS total,
+                COUNT(*) FILTER (WHERE status = 'completed')          AS successful,
+                COALESCE(ROUND(AVG(leads_found)::numeric, 1), 0)      AS avg_leads,
+                COALESCE(MAX(leads_found), 0)                         AS max_leads
+            FROM daily_jobs
+            WHERE started_at > NOW() - INTERVAL '30 days'
+        ''')
+        stats = cur.fetchone()
+
+    cfg = get_pipeline_config()
+    next_scheduled = f"{cfg['hour']:02d}:{cfg['minute']:02d} America/Sao_Paulo"
+
+    return jsonify({
+        'last_run':        last_run,
+        'next_scheduled':  next_scheduled,
+        'stats_30d': {
+            'total':      int(stats[0]) if stats else 0,
+            'successful': int(stats[1]) if stats else 0,
+            'avg_leads':  float(stats[2]) if stats else 0.0,
+            'max_leads':  int(stats[3]) if stats else 0,
+        },
+        'scheduler_running': bool(_APSCHEDULER_AVAILABLE and _scheduler and _scheduler.running),
+        'config': {
+            'niches': cfg['niches'],
+            'region': cfg['region'],
+            'hour':   cfg['hour'],
+        }
+    }), 200
+
+
 @app.route('/api/niches/custom', methods=['GET'])
 @limiter.limit("60/minute")
 def get_custom_niches():
