@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-23T11:20:05.846Z"
+last_updated: "2026-03-23T11:30:26.227Z"
 progress:
   total_phases: 6
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 9
-  completed_plans: 8
+  completed_plans: 9
 ---
 
 # STATE.md — Project Memory
@@ -18,9 +18,9 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone 1 — Pipeline Autônomo + Qualidade + Fontes
-- **Active phase**: Phase 3 — Novas Fontes (IN PROGRESS)
-- **Current Plan**: 2 of 3 complete
-- **Last completed**: Phase 3 Plan 02 — Outscraper Google Maps as Thread 16 in massive search: _get_outscraper_key(), process_outscraper_massive(), outscraper_maps wired into POST /api/search/massive, deployed to VPS
+- **Active phase**: Phase 3 — Novas Fontes (COMPLETE)
+- **Current Plan**: 3 of 3 complete
+- **Last completed**: Phase 3 Plan 03 — Prospeo LinkedIn-to-email enrichment: tools/prospeo AWS SM secret, _get_prospeo_key(), enrich_linkedin_prospeo(), POST /api/leads/<id>/enrich-linkedin, 75-credit cap in process_linkedin_massive(), Minha Receita deploy guide, 3/3 tests passing. Deployed to VPS.
 
 ## Completed Work
 
@@ -37,6 +37,7 @@ progress:
 | 2026-03-23 | Phase 2 Plan 03: validate_zerobounce() + POST /api/leads/<id>/verify-email; GradeBadge + FreshnessIndicator; A-F quality filter; Verificar Email button; tools/zerobounce in AWS SM |
 | 2026-03-23 | Phase 3 Plan 01: cnpj_rf table (20 cols, 2 partial indexes), enrich_from_rf_local() (3s SQL timeout), enrich_cnpj_with_fallback() (5-level chain), import_receita_federal.py (nohup-safe, --dry-run), RECEITA_FEDERAL_IMPORT.md runbook. 10 test stubs (10 skipped). Deployed to VPS. |
 | 2026-03-23 | Phase 3 Plan 02: Outscraper Google Maps — tools/outscraper AWS SM secret, _get_outscraper_key(), outscraper in requirements.txt, process_outscraper_massive() Thread 16, outscraper_maps wired into POST /api/search/massive (default methods + jobs + thread + response dict). 2/3 tests pass (3rd skips until real API key set). Deployed to VPS. |
+| 2026-03-23 | Phase 3 Plan 03: Prospeo LinkedIn enrichment — tools/prospeo AWS SM secret, _get_prospeo_key(), enrich_linkedin_prospeo(), POST /api/leads/<id>/enrich-linkedin (rate limit 30/hour), 75-credit cap in process_linkedin_massive(), Minha Receita docker-compose deploy guide in RECEITA_FEDERAL_IMPORT.md. 3/3 tests passing. Deployed to VPS. |
 
 ## Research Available
 
@@ -81,6 +82,9 @@ progress:
 | municipio_cod stored as integer (RF code), not city name | Would require separate municipios lookup table — city lookup deferred to future plan |
 | Outscraper ApiClient lazy-imported inside thread function | Avoids import-time cost for optional SDK at startup |
 | tools/outscraper placeholder in AWS SM | Missing key treated as quota_exceeded (graceful degradation) — same pattern as serper/apify |
+| Prospeo key stored as empty placeholder in AWS SM | Endpoint returns 503 until real key set — same pattern as ZeroBounce/Outscraper |
+| with get_db() as conn in enrich_lead_linkedin | Consistent with all other Flask endpoints; get_db_connection() does not exist |
+| prospeo_credits_used per-run counter (not persisted) | Simple and sufficient for Prospeo free tier 75-credit cap per run |
 
 ## Performance Metrics
 
@@ -94,8 +98,9 @@ progress:
 | 02-qualidade-de-leads | 03 | ~7 min | 2/2 | 3 |
 | 03-novas-fontes | 01 | ~6 min | 4/4 | 6 |
 | 03-novas-fontes | 02 | ~5 min | 3/3 | 3 |
+| 03-novas-fontes | 03 | ~6 min | 3/3 | 3 |
 
 ## Last Session
 
-- **Stopped at**: Completed Phase 3 Plan 02 — Outscraper integration (Thread 16, outscraper_maps method, deployed). Next: Phase 3 Plan 03.
+- **Stopped at**: Completed Phase 3 Plan 03 — Prospeo LinkedIn enrichment + Minha Receita deploy guide. Phase 3 (Novas Fontes) COMPLETE. Next: Phase 4.
 - **Timestamp**: 2026-03-23
