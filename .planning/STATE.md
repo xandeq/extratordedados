@@ -6,8 +6,8 @@
 
 - **Active milestone**: Milestone 1 — Pipeline Autônomo + Qualidade + Fontes
 - **Active phase**: Phase 1 — Pipeline 100% Automático
-- **Current Plan**: 3 of N (Plan 02 complete)
-- **Last completed**: Phase 1, Plan 02 — pipeline health endpoint, Brevo email report, healthcheck ping
+- **Current Plan**: 4 of N (Plan 03 complete)
+- **Last completed**: Phase 1, Plan 03 — admin/pipeline-config editor page + pipeline health card on admin index
 
 ## Completed Work
 
@@ -18,6 +18,7 @@
 | 2026-03-22 | 4 research reports created in .planning/research/ |
 | 2026-03-22 | Phase 1 Plan 01: pipeline_config table, get_pipeline_config(), GET/PUT /api/admin/pipeline-config endpoints |
 | 2026-03-23 | Phase 1 Plan 02: GET /api/admin/pipeline/health endpoint, Brevo email report, healthchecks.io ping, hooked into run_daily_pipeline() |
+| 2026-03-23 | Phase 1 Plan 03: /admin/pipeline-config editor page (niche toggles, region, schedule, notifications) + pipeline health card + 30-day history on admin/index.tsx |
 
 ## Research Available
 
@@ -45,6 +46,9 @@
 | pipeline_start as absolute first line of run_daily_pipeline | Guarantees it is always bound, even on early-exception paths |
 | Notification helpers inserted before run_daily_pipeline in code | Logical grouping near pipeline code; helpers are pipeline-specific |
 | Failure report call uses locals().get() for optional counters | Defensive: counters may not be assigned if exception fires before step 4/5/6 |
+| PipelineHealth fetch uses .catch(() => null) — safe defaults | Admin index never fails to load if pipeline endpoint is down |
+| getStatusBadge() extracted as module-level function (not inline) | Called in two places: status row and history table rows |
+| History table sliced to 10 rows | daily-job/status returns all-time history; 10 rows is readable without pagination |
 
 ## Performance Metrics
 
@@ -52,8 +56,9 @@
 |-------|------|----------|-------|-------|
 | 01 | 01 | ~15 min | 2/2 | 2 |
 | 01 | 02 | ~15 min | 2/2 | 2 |
+| 01 | 03 | ~20 min | 2/2 | 2 |
 
 ## Last Session
 
-- **Stopped at**: Completed fase1-02-PLAN.md
+- **Stopped at**: Completed fase1-03-PLAN.md
 - **Timestamp**: 2026-03-23
