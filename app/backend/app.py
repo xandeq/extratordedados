@@ -13300,8 +13300,9 @@ def trigger_daily_crm_sync(trigger='scheduled'):
 
 def trigger_daily_pipeline(niches=None, region_id=None):
     """Cria registro daily_job e dispara run_daily_pipeline em background."""
-    niches    = niches    or DAILY_JOB_NICHES
-    region_id = region_id or DAILY_JOB_REGION
+    cfg       = get_pipeline_config()
+    niches    = niches    or cfg['niches']
+    region_id = region_id or cfg['region']
 
     if region_id not in SEARCH_REGIONS:
         print(f"[DAILY] Região desconhecida: {region_id}")
@@ -13394,6 +13395,80 @@ def daily_job_status():
         'default_region': DAILY_JOB_REGION,
         'default_niches': DAILY_JOB_NICHES,
     })
+
+
+@app.route('/api/admin/pipeline-config', methods=['GET'])
+@limiter.limit("60/minute")
+def admin_get_pipeline_config():
+    """Return current pipeline configuration. Admin only."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+    cfg = get_pipeline_config()
+    return jsonify(cfg), 200
+
+
+@app.route('/api/admin/pipeline-config', methods=['PUT'])
+@limiter.limit("30/minute")
+def admin_update_pipeline_config():
+    """Update pipeline configuration. Admin only. Reschedules job if hour/minute changes."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+    data = request.get_json() or {}
+    updates = {}
+    if 'niches' in data:
+        updates['daily_niches']    = json.dumps(data['niches'])
+    if 'region' in data:
+        updates['daily_region']    = json.dumps(data['region'])
+    if 'hour' in data:
+        updates['daily_hour']      = json.dumps(int(data['hour']))
+    if 'minute' in data:
+        updates['daily_minute']    = json.dumps(int(data.get('minute', 0)))
+    if 'notify_email' in data:
+        updates['notify_email']    = json.dumps(data['notify_email'])
+    if 'healthcheck_url' in data:
+        updates['healthcheck_url'] = json.dumps(data['healthcheck_url'])
+
+    if updates:
+        with get_db() as conn:
+            cur = conn.cursor()
+            for k, v in updates.items():
+                cur.execute(
+                    "INSERT INTO pipeline_config (key, value, updated_at) VALUES (%s, %s, NOW()) "
+                    "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+                    (k, v)
+                )
+
+    # Reschedule APScheduler job if time changed
+    if ('hour' in data or 'minute' in data) and _APSCHEDULER_AVAILABLE:
+        try:
+            cfg = get_pipeline_config()
+            _tz = pytz.timezone('America/Sao_Paulo')
+            _scheduler.reschedule_job(
+                'daily_pipeline',
+                trigger=CronTrigger(hour=cfg['hour'], minute=cfg['minute'], timezone=_tz)
+            )
+            print(f"[CONFIG] Pipeline reagendado: {cfg['hour']:02d}:{cfg['minute']:02d}")
+        except Exception as e:
+            print(f"[CONFIG] Erro ao reagendar: {e}")
+
+    return jsonify({'success': True}), 200
 
 
 @app.route('/api/niches/custom', methods=['GET'])
