@@ -32,9 +32,9 @@ Sistema web de extração e agregação automatizada de leads empresariais brasi
 - [x] Configuração de nichos e regiões por interface (sem editar código) — Validated in Phase 1: pipeline-100-automatico
 
 #### Qualidade de Leads
-- [ ] Validação de email em tempo real antes de salvar (verificar formato + MX record)
-- [ ] Score de qualidade aprimorado: penalizar leads sem telefone/email/website
-- [ ] Deduplicação cross-batch (detectar email duplicado entre batches diferentes)
+- [x] Validação de email em tempo real antes de salvar (verificar formato + MX record) — Validated in Phase 2: qualidade-de-leads
+- [x] Score de qualidade aprimorado: penalizar leads sem telefone/email/website — Validated in Phase 2: qualidade-de-leads
+- [x] Deduplicação cross-batch (detectar email duplicado entre batches diferentes) — Validated in Phase 2: qualidade-de-leads
 
 #### Portal de Clientes
 - [ ] Tier de acesso "cliente" — vê base agregada, não pode disparar extrações
@@ -97,4 +97,4 @@ Este documento evolui a cada fase completada.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-03-23 after Phase 1 completion*
+*Last updated: 2026-03-23 after Phase 2 completion*
