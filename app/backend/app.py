@@ -1112,6 +1112,321 @@ def has_valid_mx(domain):
     return result
 
 
+# ============= Phase 2: Lead Quality Functions =============
+
+def validate_email_free(email: str) -> dict:
+    """
+    3-layer free email validation.
+    Layer 1: RFC-compliant syntax (email-validator, check_deliverability=False — no DNS per-call).
+    Layer 2: Disposable domain blocklist (instant, no network).
+    Layer 3: MX record check — reuses existing _MX_CACHE + has_valid_mx().
+    Returns: {valid: bool, normalized: str|None, reason: str|None, is_disposable: bool, is_free_provider: bool}
+    """
+    result = {'valid': False, 'normalized': None, 'reason': None,
+              'is_disposable': False, 'is_free_provider': False}
+
+    if not email:
+        result['reason'] = 'empty_email'
+        return result
+
+    # Layer 1: RFC-compliant syntax (email-validator, no DNS)
+    if _ev_validate is not None:
+        try:
+            info = _ev_validate(email, check_deliverability=False)
+            result['normalized'] = info.normalized
+        except EmailNotValidError as e:
+            result['reason'] = f'invalid_syntax:{e}'
+            return result
+    else:
+        # Fallback: basic regex check if email-validator not installed
+        import re as _re_local
+        if not _re_local.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email.strip()):
+            result['reason'] = 'invalid_syntax:email-validator not installed'
+            return result
+        result['normalized'] = email.strip().lower()
+
+    domain = result['normalized'].split('@')[1].lower()
+
+    # Layer 2: Disposable blocklist (instant, no network)
+    if domain in _DISPOSABLE_BLOCKLIST:
+        result['is_disposable'] = True
+        result['reason'] = 'disposable_domain'
+        return result
+
+    # Free provider flag (informational — not a disqualifier for B2B)
+    _FREE_PROVIDERS = {'gmail.com', 'hotmail.com', 'yahoo.com', 'outlook.com', 'live.com',
+                       'icloud.com', 'uol.com.br', 'bol.com.br', 'ig.com.br', 'terra.com.br',
+                       'globo.com', 'r7.com', 'hotmail.com.br'}
+    if domain in _FREE_PROVIDERS:
+        result['is_free_provider'] = True
+
+    # Layer 3: MX record — reuse existing _MX_CACHE + has_valid_mx()
+    mx_ok = has_valid_mx(domain)
+    if mx_ok is False:
+        result['reason'] = f'no_mx_record:{domain}'
+        return result
+    # mx_ok is None means timeout/unknown — allow through
+
+    result['valid'] = True
+    return result
+
+
+def normalize_phone_br(raw: str) -> dict:
+    """
+    Normalizes a Brazilian phone number using Google libphonenumber.
+    Returns: {valid: bool, e164: str|None, national: str|None, type: str|None, whatsapp_id: str|None}
+    Per Pitfall 5: FIXED_LINE_OR_MOBILE with 8-digit national number treated as landline.
+    """
+    result = {'valid': False, 'e164': None, 'national': None,
+              'type': None, 'whatsapp_id': None}
+    if not raw:
+        return result
+
+    if not _PHONENUMBERS_AVAILABLE or phonenumbers is None:
+        # Fallback: use existing validate_phone_br
+        norm, is_valid = validate_phone_br(raw)
+        if is_valid:
+            result['valid'] = True
+            result['national'] = norm
+            result['type'] = 'unknown'
+        return result
+
+    digits = ''.join(c for c in raw if c.isdigit())
+    if digits.startswith('55') and len(digits) >= 12:
+        parse_str = '+' + digits
+    elif digits.startswith('0'):
+        parse_str = '+55' + digits[1:]
+    else:
+        parse_str = '+55' + digits
+
+    try:
+        parsed = phonenumbers.parse(parse_str, 'BR')
+    except NumberParseException:
+        return result
+
+    if not phonenumbers.is_valid_number(parsed):
+        return result
+
+    result['valid'] = True
+    result['e164'] = phonenumbers.format_number(parsed, PhoneNumberFormat.E164)
+    result['national'] = phonenumbers.format_number(parsed, PhoneNumberFormat.NATIONAL)
+
+    num_type = phonenumbers.number_type(parsed)
+    # Get national number string for Pitfall 5 check
+    national_digits = str(parsed.national_number)
+
+    if num_type == PhoneNumberType.MOBILE:
+        result['type'] = 'mobile'
+        digits_e164 = result['e164'].lstrip('+')
+        result['whatsapp_id'] = f"{digits_e164}@c.us"
+    elif num_type == PhoneNumberType.FIXED_LINE_OR_MOBILE:
+        # Pitfall 5: 8-digit national number = legacy format, treat as landline
+        if len(national_digits) == 8:
+            result['type'] = 'landline'
+        else:
+            result['type'] = 'mobile'
+            digits_e164 = result['e164'].lstrip('+')
+            result['whatsapp_id'] = f"{digits_e164}@c.us"
+    elif num_type == PhoneNumberType.FIXED_LINE:
+        result['type'] = 'landline'
+    elif num_type == PhoneNumberType.TOLL_FREE:
+        result['type'] = 'toll_free'
+    else:
+        result['type'] = 'unknown'
+
+    return result
+
+
+def compute_lead_quality_score(lead: dict) -> dict:
+    """
+    6-dimension quality score → A/B/C/D/F grade + numeric 0-100 + freshness.
+    Dimensions: email(30) + phone(20) + completeness(20) + freshness(15) + cnpj(10) + source(5)
+    Returns: {score: int, grade: str, tier: str, freshness: int, breakdown: dict}
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    # --- EMAIL (30 pts) ---
+    email = lead.get('email') or ''
+    if not email:
+        email_pts = 0
+    else:
+        ev = validate_email_free(email)
+        if not ev['valid']:
+            email_pts = 0
+        elif ev['is_free_provider']:
+            email_pts = 15
+        else:
+            email_pts = 30  # corporate + valid
+
+    # --- PHONE (20 pts) ---
+    phone = lead.get('phone') or ''
+    if not phone:
+        phone_pts = 0
+    else:
+        pn = normalize_phone_br(phone)
+        if not pn['valid']:
+            phone_pts = 0
+        elif pn['type'] == 'mobile':
+            phone_pts = 20
+        elif pn['type'] == 'landline':
+            phone_pts = 12
+        else:
+            phone_pts = 5
+
+    # --- COMPLETENESS (20 pts) ---
+    fields = {'company_name': 4, 'email': 3, 'phone': 3, 'website': 2,
+              'city': 2, 'state': 2, 'cnpj': 2, 'category': 1, 'address': 1}
+    completeness_pts = min(20, sum(pts for f, pts in fields.items() if lead.get(f)))
+
+    # --- FRESHNESS (15 pts) ---
+    ref = lead.get('last_verified_at') or lead.get('captured_at') or lead.get('extracted_at')
+    if ref:
+        if isinstance(ref, str):
+            try:
+                ref = _dt.fromisoformat(ref.replace('Z', '+00:00'))
+            except Exception:
+                ref = None
+        if ref is not None:
+            if getattr(ref, 'tzinfo', None) is None:
+                ref = ref.replace(tzinfo=_tz.utc)
+            days = (_dt.now(_tz.utc) - ref).days
+            if days <= 60:     freshness = 100
+            elif days <= 180:  freshness = 70
+            elif days <= 365:  freshness = 40
+            else:               freshness = 10
+        else:
+            freshness = 50
+    else:
+        freshness = 50  # unknown age
+    freshness_pts = int(freshness * 0.15)
+
+    # --- CNPJ ENRICHMENT (10 pts) ---
+    cnpj_pts = 10 if lead.get('cnpj_enriched') else (5 if lead.get('cnpj') else 0)
+
+    # --- SOURCE QUALITY (5 pts) ---
+    source_map = {'google_maps': 5, 'directories': 4, 'search_engines': 3,
+                  'api_enrichment': 4, 'imported': 2, 'website_crawl': 3}
+    source_pts = source_map.get(lead.get('source', ''), 2)
+
+    total = email_pts + phone_pts + completeness_pts + freshness_pts + cnpj_pts + source_pts
+    total = max(0, min(100, total))
+
+    if total >= 80:   grade = 'A'
+    elif total >= 60: grade = 'B'
+    elif total >= 40: grade = 'C'
+    elif total >= 20: grade = 'D'
+    else:             grade = 'F'
+
+    # Map to legacy tier (backward compat)
+    tier = 'premium' if grade in ('A', 'B') else ('medio' if grade == 'C' else 'basico')
+
+    return {
+        'score': total, 'grade': grade, 'tier': tier, 'freshness': freshness,
+        'breakdown': {
+            'email': email_pts, 'phone': phone_pts, 'completeness': completeness_pts,
+            'freshness': freshness_pts, 'cnpj': cnpj_pts, 'source': source_pts,
+        }
+    }
+
+
+def save_lead_to_db(conn, lead_data: dict) -> bool:
+    """
+    Single canonical function for inserting a lead into the leads table.
+    Computes quality_grade + freshness_score before INSERT.
+    Handles UniqueViolation (global email index) silently — returns False on duplicate.
+    All extraction pipelines (batch scrape, search engines, google maps, directories,
+    apify, instagram, linkedin, local_business_data) MUST call this function.
+    Returns True if the lead was inserted, False if skipped (duplicate or error).
+    """
+    qs = compute_lead_quality_score(lead_data)
+
+    # Merge scoring into lead_data for INSERT
+    lead_data['quality_grade'] = qs['grade']
+    lead_data['quality_score'] = qs['tier']
+    lead_data['lead_score'] = qs['score']
+    lead_data['freshness_score'] = qs['freshness']
+
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO leads (
+                batch_id, company_name, email, phone, website, source_url,
+                city, state, category, source, instagram, facebook, linkedin,
+                twitter, youtube, whatsapp, cnpj, address, crm_status, tags,
+                notes, contact_name, quality_score, extra_data, cnpj_trade_name,
+                cnpj_status, cnpj_cnae, cnpj_abertura, cnpj_porte, cnpj_qsa,
+                cnpj_enriched, mx_valid, email_type, lead_score,
+                quality_grade, freshness_score,
+                email_pattern, team_members, pdf_emails_found
+            ) VALUES (
+                %(batch_id)s, %(company_name)s, %(email)s, %(phone)s, %(website)s,
+                %(source_url)s, %(city)s, %(state)s, %(category)s, %(source)s,
+                %(instagram)s, %(facebook)s, %(linkedin)s, %(twitter)s, %(youtube)s,
+                %(whatsapp)s, %(cnpj)s, %(address)s, %(crm_status)s, %(tags)s,
+                %(notes)s, %(contact_name)s, %(quality_score)s, %(extra_data)s,
+                %(cnpj_trade_name)s, %(cnpj_status)s, %(cnpj_cnae)s, %(cnpj_abertura)s,
+                %(cnpj_porte)s, %(cnpj_qsa)s, %(cnpj_enriched)s, %(mx_valid)s,
+                %(email_type)s, %(lead_score)s,
+                %(quality_grade)s, %(freshness_score)s,
+                %(email_pattern)s, %(team_members)s, %(pdf_emails_found)s
+            )
+        """, {
+            'batch_id': lead_data.get('batch_id'),
+            'company_name': lead_data.get('company_name'),
+            'email': lead_data.get('email'),
+            'phone': lead_data.get('phone'),
+            'website': lead_data.get('website'),
+            'source_url': lead_data.get('source_url'),
+            'city': lead_data.get('city'),
+            'state': lead_data.get('state'),
+            'category': lead_data.get('category'),
+            'source': lead_data.get('source'),
+            'instagram': lead_data.get('instagram'),
+            'facebook': lead_data.get('facebook'),
+            'linkedin': lead_data.get('linkedin'),
+            'twitter': lead_data.get('twitter'),
+            'youtube': lead_data.get('youtube'),
+            'whatsapp': lead_data.get('whatsapp'),
+            'cnpj': lead_data.get('cnpj'),
+            'address': lead_data.get('address'),
+            'crm_status': lead_data.get('crm_status', 'novo'),
+            'tags': lead_data.get('tags', ''),
+            'notes': lead_data.get('notes'),
+            'contact_name': lead_data.get('contact_name'),
+            'quality_score': qs['tier'],
+            'extra_data': lead_data.get('extra_data'),
+            'cnpj_trade_name': lead_data.get('cnpj_trade_name'),
+            'cnpj_status': lead_data.get('cnpj_status'),
+            'cnpj_cnae': lead_data.get('cnpj_cnae'),
+            'cnpj_abertura': lead_data.get('cnpj_abertura'),
+            'cnpj_porte': lead_data.get('cnpj_porte'),
+            'cnpj_qsa': lead_data.get('cnpj_qsa'),
+            'cnpj_enriched': lead_data.get('cnpj_enriched', False),
+            'mx_valid': lead_data.get('mx_valid'),
+            'email_type': lead_data.get('email_type'),
+            'lead_score': qs['score'],
+            'quality_grade': qs['grade'],
+            'freshness_score': qs['freshness'],
+            'email_pattern': lead_data.get('email_pattern'),
+            'team_members': lead_data.get('team_members'),
+            'pdf_emails_found': lead_data.get('pdf_emails_found', False),
+        })
+        conn.commit()
+        return True
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        err_str = str(e).lower()
+        if 'unique' in err_str or 'duplicate' in err_str:
+            return False  # duplicate — silent skip
+        print(f"[save_lead_to_db] error: {e}")
+        return False
+    finally:
+        c.close()
+
+
 # ============= BrasilAPI CNPJ Enrichment (Phase 1) =============
 
 _CNPJ_CACHE = {}             # cnpj_digits -> (data: dict, timestamp: float)
@@ -4043,93 +4358,20 @@ def is_irrelevant_email_domain(email):
 def calculate_lead_score_numeric(lead_data):
     """
     Calcula score numérico 0-100 para o lead.
-    Leva em conta completude dos dados e qualidade do contato.
+    Delegated to compute_lead_quality_score() for consistent 6-dimension scoring.
+    Kept for backward compatibility — all callers continue to work unchanged.
     Retorna int 0-100.
     """
-    score = 0
-    email = (lead_data.get('email') or '').lower()
-    phone = lead_data.get('phone') or ''
-    whatsapp = lead_data.get('whatsapp') or ''
-    instagram = lead_data.get('instagram') or ''
-    facebook = lead_data.get('facebook') or ''
-    linkedin = lead_data.get('linkedin') or ''
-    website = lead_data.get('website') or ''
-    cnpj = lead_data.get('cnpj') or ''
-    company = lead_data.get('company_name') or ''
-
-    # Email
-    if email:
-        domain = email.split('@')[-1] if '@' in email else ''
-        free_providers = {'gmail.com','hotmail.com','yahoo.com','outlook.com',
-                          'bol.com.br','ig.com.br','uol.com.br','terra.com.br',
-                          'live.com','msn.com','icloud.com','me.com'}
-        generic_prefixes_local = {'contato','info','atendimento','suporte','vendas',
-                                   'comercial','financeiro','rh','marketing','sac',
-                                   'faleconosco','ouvidoria','diretoria','administrativo',
-                                   'recepcao','newsletter','noticias','secretaria'}
-        local = email.split('@')[0] if '@' in email else ''
-
-        if domain in free_providers:
-            score += 8   # Email existe, mas provedor gratuito
-        elif local in generic_prefixes_local:
-            score += 12  # Email corporativo genérico
-        else:
-            score += 20  # Email corporativo pessoal/nominal — mais valioso
-
-        # Bonus TLD brasileiro
-        if domain.endswith('.com.br') or domain.endswith('.med.br') or \
-           domain.endswith('.adv.br') or domain.endswith('.eng.br'):
-            score += 8
-
-    # Telefone com DDD válido
-    if phone:
-        _, valid = validate_phone_br(phone)
-        if valid:
-            score += 15
-        else:
-            score += 3  # Tem telefone mas inválido — pequeno bônus
-
-    # WhatsApp
-    if whatsapp:
-        score += 15
-
-    # Redes sociais
-    if instagram:
-        score += 7
-    if facebook:
-        score += 5
-    if linkedin:
-        score += 8
-
-    # Website próprio
-    if website:
-        if '.com.br' in website or '.med.br' in website or '.adv.br' in website:
-            score += 8
-        else:
-            score += 4
-
-    # CNPJ enriquecido
-    if cnpj:
-        score += 10
-
-    # Nome de empresa limpo (não genérico)
-    if company and len(company) > 3:
-        score += 2
-
-    return min(score, 100)
+    return compute_lead_quality_score(lead_data).get('score', 0)
 
 
 def calculate_quality_score(lead_data):
     """
     Calcula tier de qualidade do lead: basico, medio, premium.
-    Usa calculate_lead_score_numeric internamente.
+    Delegated to compute_lead_quality_score() for consistent scoring.
+    Kept for backward compatibility.
     """
-    numeric = calculate_lead_score_numeric(lead_data)
-    if numeric >= 65:
-        return 'premium'
-    elif numeric >= 35:
-        return 'medio'
-    return 'basico'
+    return compute_lead_quality_score(lead_data).get('tier', 'basico')
 
 
 def log_search(conn_cursor, search_job_id, log_type, url=None, status_code=None, message='', duration_ms=0):
@@ -4231,42 +4473,32 @@ def process_search_job(batch_id, search_jobs_data, user_id):
 
                         if crawl_data['emails']:
                             for email in crawl_data['emails']:
-                                try:
-                                    # Calcular quality score baseado no email
-                                    email_score, _, _ = calculate_email_quality_score(email)
-                                    # Usar categorias antigas para compatibilidade
-                                    if email_score >= 70:
-                                        quality = 'premium'
-                                    elif email_score >= 50:
-                                        quality = 'medio'
-                                    else:
-                                        quality = 'basico'
-
-                                    c.execute(
-                                        '''INSERT INTO leads
-                                           (batch_id, company_name, email, phone, website, source_url, source,
-                                            instagram, facebook, linkedin, twitter, youtube,
-                                            whatsapp, cnpj, address, city, state, category,
-                                            quality_score, extracted_at)
-                                           VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                                   %s, %s, %s, %s, %s,
-                                                   %s, %s, %s, %s, %s, %s,
-                                                   %s, %s)''',
-                                        (batch_id, crawl_data['company_name'], email, first_phone,
-                                         crawl_data['website'], result_url, 'search_engine',
-                                         crawl_data.get('instagram'), crawl_data.get('facebook'),
-                                         crawl_data.get('linkedin'), crawl_data.get('twitter'), crawl_data.get('youtube'),
-                                         crawl_data.get('whatsapp'), crawl_data.get('cnpj'),
-                                         crawl_data.get('address'), crawl_data.get('city'), crawl_data.get('state'),
-                                         niche, quality, now)
-                                    )
+                                inserted = save_lead_to_db(conn, {
+                                    'batch_id': batch_id,
+                                    'company_name': crawl_data['company_name'],
+                                    'email': email,
+                                    'phone': first_phone,
+                                    'website': crawl_data['website'],
+                                    'source_url': result_url,
+                                    'source': 'search_engine',
+                                    'instagram': crawl_data.get('instagram'),
+                                    'facebook': crawl_data.get('facebook'),
+                                    'linkedin': crawl_data.get('linkedin'),
+                                    'twitter': crawl_data.get('twitter'),
+                                    'youtube': crawl_data.get('youtube'),
+                                    'whatsapp': crawl_data.get('whatsapp'),
+                                    'cnpj': crawl_data.get('cnpj'),
+                                    'address': crawl_data.get('address'),
+                                    'city': crawl_data.get('city'),
+                                    'state': crawl_data.get('state'),
+                                    'category': niche,
+                                })
+                                if inserted:
                                     job_leads += 1
-                                    print(f"[search] Lead inserido: {email} (quality: {quality}, score: {email_score})")
-                                except Exception as e:
-                                    print(f"[search] Lead insert error: {e}")
+                                    print(f"[search] Lead inserido: {email}")
 
                         log_search(c, search_job_id, 'crawl_complete', url=result_url,
-                                  message=f'{len(crawl_data["emails"])} emails, {len(crawl_data["phones"])} phones, quality={quality}',
+                                  message=f'{len(crawl_data["emails"])} emails, {len(crawl_data["phones"])} phones',
                                   duration_ms=crawl_duration)
 
                         safety.record_success()
@@ -4420,24 +4652,22 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
 
                         # For leads without email, create a placeholder using phone as dedup
                         dedup_email = email or f"phone_{re.sub(r'[^0-9]', '', phone or '')}@directory.local"
-                        lead_data = {'email': email or '', 'phone': phone or '', 'company_name': company,
-                                    'whatsapp': phone}
-                        quality = calculate_quality_score(lead_data)
-                        try:
-                            c.execute(
-                                '''INSERT INTO leads
-                                   (batch_id, company_name, email, phone, website, source_url, source,
-                                    address, city, state, category, quality_score, extracted_at)
-                                   VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                           %s, %s, %s, %s, %s, %s)''',
-                                (batch_id, company, dedup_email, phone, website,
-                                 website or '', f'diretorio_{dl.get("source", "br")}',
-                                 dl.get('address'), city, state, niche, quality, now)
-                            )
+                        inserted = save_lead_to_db(conn, {
+                            'batch_id': batch_id,
+                            'company_name': company,
+                            'email': dedup_email,
+                            'phone': phone,
+                            'website': website,
+                            'source_url': website or '',
+                            'source': f'diretorio_{dl.get("source", "br")}',
+                            'address': dl.get('address'),
+                            'city': city,
+                            'state': state,
+                            'category': niche,
+                        })
+                        if inserted:
                             dir_saved += 1
                             job_leads += 1
-                        except Exception as e:
-                            print(f"[SAVE] Erro salvando lead de diretorio: {e}")
 
                 log_search(c, search_job_id, 'dir_done',
                           message=f'Diretorios BR: {len(dir_leads)} empresas encontradas, {dir_saved} salvas, {len(dir_domains)} dominios descobertos ({dir_duration}ms)',
@@ -4529,28 +4759,25 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
                             if not contact_name:
                                 contact_name = derive_contact_name(email)
 
-                            lead_data = {'email': email, 'phone': phone, 'company_name': company}
-                            quality = calculate_quality_score(lead_data)
-                            try:
-                                c.execute(
-                                    '''INSERT INTO leads
-                                       (batch_id, company_name, email, phone, website, source_url, source,
-                                        city, state, category, contact_name, quality_score,
-                                        extra_data, extracted_at)
-                                       VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                               %s, %s, %s, %s, %s, %s, %s)''',
-                                    (batch_id, company, email, phone or None,
-                                     f'https://{domain}', result_url, job_source,
-                                     city, state, niche, contact_name or None, quality,
-                                     json.dumps({'position': api_lead.get('position', ''),
-                                                 'confidence': api_lead.get('confidence', 0),
-                                                 'source_api': source}),
-                                     now)
-                                )
+                            inserted = save_lead_to_db(conn, {
+                                'batch_id': batch_id,
+                                'company_name': company,
+                                'email': email,
+                                'phone': phone or None,
+                                'website': f'https://{domain}',
+                                'source_url': result_url,
+                                'source': job_source,
+                                'city': city,
+                                'state': state,
+                                'category': niche,
+                                'contact_name': contact_name or None,
+                                'extra_data': json.dumps({'position': api_lead.get('position', ''),
+                                                          'confidence': api_lead.get('confidence', 0),
+                                                          'source_api': source}),
+                            })
+                            if inserted:
                                 saved_count += 1
                                 job_leads += 1
-                            except Exception as e:
-                                print(f"[SAVE] Erro ao salvar lead: {e}")
 
                         log_search(c, search_job_id, 'leads_saved', url=result_url,
                                   message=f'Salvos {saved_count} leads de {domain} via {source}! (org: {org_name or "N/A"})')
@@ -4582,41 +4809,31 @@ def process_api_search_job(batch_id, search_jobs_data, user_id):
 
                                 if emails_found:
                                     for email in emails_found:
-                                        try:
-                                            # Calcular quality score baseado no email
-                                            email_score, _, _ = calculate_email_quality_score(email)
-                                            if email_score >= 70:
-                                                quality = 'premium'
-                                            elif email_score >= 50:
-                                                quality = 'medio'
-                                            else:
-                                                quality = 'basico'
-
-                                            c.execute(
-                                                '''INSERT INTO leads
-                                                   (batch_id, company_name, email, phone, website, source_url, source,
-                                                    instagram, facebook, linkedin, twitter, youtube,
-                                                    whatsapp, cnpj, address, city, state, category,
-                                                    quality_score, extracted_at)
-                                                   VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                                           %s, %s, %s, %s, %s,
-                                                           %s, %s, %s, %s, %s, %s,
-                                                           %s, %s)''',
-                                                (batch_id, crawl_data['company_name'], email, first_phone,
-                                                 crawl_data['website'], result_url, 'search_engine',
-                                                 crawl_data.get('instagram'), crawl_data.get('facebook'),
-                                                 crawl_data.get('linkedin'), crawl_data.get('twitter'),
-                                                 crawl_data.get('youtube'), crawl_data.get('whatsapp'),
-                                                 crawl_data.get('cnpj'), crawl_data.get('address'),
-                                                 crawl_data.get('city'), crawl_data.get('state'),
-                                                 niche, quality, now)
-                                            )
+                                        inserted = save_lead_to_db(conn, {
+                                            'batch_id': batch_id,
+                                            'company_name': crawl_data['company_name'],
+                                            'email': email,
+                                            'phone': first_phone,
+                                            'website': crawl_data['website'],
+                                            'source_url': result_url,
+                                            'source': 'search_engine',
+                                            'instagram': crawl_data.get('instagram'),
+                                            'facebook': crawl_data.get('facebook'),
+                                            'linkedin': crawl_data.get('linkedin'),
+                                            'twitter': crawl_data.get('twitter'),
+                                            'youtube': crawl_data.get('youtube'),
+                                            'whatsapp': crawl_data.get('whatsapp'),
+                                            'cnpj': crawl_data.get('cnpj'),
+                                            'address': crawl_data.get('address'),
+                                            'city': crawl_data.get('city'),
+                                            'state': crawl_data.get('state'),
+                                            'category': niche,
+                                        })
+                                        if inserted:
                                             job_leads += 1
-                                        except Exception as e:
-                                            print(f"[SAVE] Erro scrape lead: {e}")
 
                                 log_search(c, search_job_id, 'scrape_done', url=result_url,
-                                          message=f'Scraping de {domain}: {len(emails_found)} emails, empresa="{crawl_data.get("company_name", "?")}", quality={quality} ({crawl_duration}ms)',
+                                          message=f'Scraping de {domain}: {len(emails_found)} emails, empresa="{crawl_data.get("company_name", "?")}" ({crawl_duration}ms)',
                                           duration_ms=crawl_duration)
                                 safety.record_success()
 
@@ -4766,27 +4983,28 @@ def process_batch(batch_id, urls):
                 pdf_emails_found = bool(result.get('pdf_emails_found'))
 
                 for email in result['emails']:
-                    try:
-                        c.execute(
-                            '''INSERT INTO leads
-                               (batch_id, company_name, email, phone, website, source_url, source,
-                                instagram, facebook, linkedin, twitter, youtube,
-                                whatsapp, cnpj, address, city, state, extracted_at,
-                                email_pattern, team_members, pdf_emails_found)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                       %s, %s, %s, %s, %s,
-                                       %s, %s, %s, %s, %s, %s,
-                                       %s, %s, %s)''',
-                            (batch_id, result['company_name'], email, first_phone,
-                             result['website'], url, 'website_crawl',
-                             result.get('instagram'), result.get('facebook'),
-                             result.get('linkedin'), result.get('twitter'), result.get('youtube'),
-                             result.get('whatsapp'), result.get('cnpj'),
-                             result.get('address'), result.get('city'), result.get('state'), now,
-                             email_pattern_val, team_members_val, pdf_emails_found)
-                        )
-                    except Exception:
-                        pass  # UniqueViolation from global index — skip duplicate email
+                    save_lead_to_db(conn, {
+                        'batch_id': batch_id,
+                        'company_name': result['company_name'],
+                        'email': email,
+                        'phone': first_phone,
+                        'website': result['website'],
+                        'source_url': url,
+                        'source': 'website_crawl',
+                        'instagram': result.get('instagram'),
+                        'facebook': result.get('facebook'),
+                        'linkedin': result.get('linkedin'),
+                        'twitter': result.get('twitter'),
+                        'youtube': result.get('youtube'),
+                        'whatsapp': result.get('whatsapp'),
+                        'cnpj': result.get('cnpj'),
+                        'address': result.get('address'),
+                        'city': result.get('city'),
+                        'state': result.get('state'),
+                        'email_pattern': email_pattern_val,
+                        'team_members': team_members_val,
+                        'pdf_emails_found': pdf_emails_found,
+                    })
 
                 # If no emails but phones found, still record the company
                 if not result['emails'] and (result['phones'] or result['company_name']):
@@ -5581,24 +5799,18 @@ def scrape_google_maps_endpoint():
 
                 # Salvar leads
                 for lead in leads:
-                    try:
-                        email = lead.get('email')
-                        if email:
-                            email_score, is_valid, _ = calculate_email_quality_score(email)
-                            if not is_valid or email_score < 40:
-                                continue
-
-                        c.execute(
-                            '''INSERT INTO leads (batch_id, company_name, email, phone, website, address,
-                                                  city, state, source, source_url, quality_score, extracted_at)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                            (batch_id, lead.get('company_name'), lead.get('email'), lead.get('phone'),
-                             lead.get('website'), lead.get('address'), city, state,
-                             'google_maps', lead.get('website') or f"maps:{lead.get('company_name')}",
-                             lead.get('rating') or 'medio', datetime.now())
-                        )
-                    except Exception as e:
-                        print(f"[GoogleMaps] Erro ao inserir lead: {e}")
+                    save_lead_to_db(conn, {
+                        'batch_id': batch_id,
+                        'company_name': lead.get('company_name'),
+                        'email': lead.get('email'),
+                        'phone': lead.get('phone'),
+                        'website': lead.get('website'),
+                        'address': lead.get('address'),
+                        'city': city,
+                        'state': state,
+                        'source': 'google_maps',
+                        'source_url': lead.get('website') or f"maps:{lead.get('company_name')}",
+                    })
 
                 # Atualizar batch
                 c.execute(
@@ -5654,23 +5866,18 @@ def scrape_instagram_endpoint():
 
                 # Salvar leads
                 for lead in leads:
-                    try:
-                        email = lead.get('email')
-                        if email:
-                            email_score, is_valid, _ = calculate_email_quality_score(email)
-                            if not is_valid or email_score < 40:
-                                email = None  # Não bloquear lead, apenas limpar email inválido
-
-                        c.execute(
-                            '''INSERT INTO leads (batch_id, company_name, email, phone, website, instagram,
-                                                  city, state, source, source_url, quality_score, extracted_at)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                            (batch_id, lead.get('company_name'), email, lead.get('phone'),
-                             lead.get('website'), lead.get('instagram'), city, state,
-                             'instagram', lead.get('instagram'), 'medio', datetime.now())
-                        )
-                    except Exception as e:
-                        print(f"[Instagram] Erro ao inserir lead: {e}")
+                    save_lead_to_db(conn, {
+                        'batch_id': batch_id,
+                        'company_name': lead.get('company_name'),
+                        'email': lead.get('email'),
+                        'phone': lead.get('phone'),
+                        'website': lead.get('website'),
+                        'instagram': lead.get('instagram'),
+                        'city': city,
+                        'state': state,
+                        'source': 'instagram',
+                        'source_url': lead.get('instagram'),
+                    })
 
                 # Atualizar batch
                 c.execute(
@@ -5726,16 +5933,16 @@ def scrape_linkedin_endpoint():
 
                 # Salvar leads
                 for lead in leads:
-                    try:
-                        c.execute(
-                            '''INSERT INTO leads (batch_id, company_name, linkedin, address,
-                                                  city, state, source, source_url, quality_score, extracted_at)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                            (batch_id, lead.get('company_name'), lead.get('linkedin'), lead.get('address'),
-                             city, state, 'linkedin', lead.get('linkedin'), 'premium', datetime.now())
-                        )
-                    except Exception as e:
-                        print(f"[LinkedIn] Erro ao inserir lead: {e}")
+                    save_lead_to_db(conn, {
+                        'batch_id': batch_id,
+                        'company_name': lead.get('company_name'),
+                        'linkedin': lead.get('linkedin'),
+                        'address': lead.get('address'),
+                        'city': city,
+                        'state': state,
+                        'source': 'linkedin',
+                        'source_url': lead.get('linkedin'),
+                    })
 
                 # Atualizar batch
                 c.execute(
@@ -6105,7 +6312,7 @@ def list_leads():
     batch_id = request.args.get('batch_id', '').strip()
     city = request.args.get('city', '').strip()
     state = request.args.get('state', '').strip()
-    quality = request.args.get('quality', '').strip()  # premium | medio | basico
+    quality = request.args.get('quality', '').strip()  # A | B | C | D | F (or legacy: premium | medio | basico)
     source_filter = request.args.get('source', '').strip()
     min_score = request.args.get('min_score', '').strip()
     sort = request.args.get('sort', 'newest')
@@ -6144,8 +6351,11 @@ def list_leads():
         query += ' AND l.state ILIKE %s'
         params.append(f'%{state}%')
 
-    # Filtro por tier de qualidade
-    if quality in ('premium', 'medio', 'basico'):
+    # Filtro por grade de qualidade (A/B/C/D/F) ou tier legado (premium/medio/basico)
+    if quality in ('A', 'B', 'C', 'D', 'F'):
+        query += ' AND l.quality_grade = %s'
+        params.append(quality)
+    elif quality in ('premium', 'medio', 'basico'):
         query += ' AND l.quality_score = %s'
         params.append(quality)
 
@@ -7013,35 +7223,111 @@ def sanitize_single_lead(lead_dict):
 
 @app.route('/api/leads/validate-email-free', methods=['POST'])
 def validate_email_free_endpoint():
-    """Validate email using free methods (format + MX + disposable check). Wave 2 implementation."""
-    user_id = verify_token(get_auth_header())
-    if not user_id:
-        return jsonify({'error': 'Unauthorized'}), 401
-    # Wave 2: call validate_email_free() and return result
-    return jsonify({'error': 'Not implemented yet — available in Wave 2'}), 501
-
-
-@app.route('/api/leads/normalize-phone', methods=['POST'])
-def normalize_phone_endpoint():
-    """Normalize Brazilian phone number to E.164 format. Wave 2 implementation."""
-    user_id = verify_token(get_auth_header())
-    if not user_id:
-        return jsonify({'error': 'Unauthorized'}), 401
-    # Wave 2: call normalize_phone_br() and return result
-    return jsonify({'error': 'Not implemented yet — available in Wave 2'}), 501
-
-
-@app.route('/api/leads/validate-batch', methods=['POST'])
-def validate_batch_endpoint():
-    """Run email validation + phone normalization over all leads in a batch. Wave 2 implementation."""
+    """Validate email using free methods (format + MX + disposable check)."""
     user_id = verify_token(get_auth_header())
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json() or {}
-    if not data.get('batch_id'):
-        return jsonify({'error': 'batch_id is required'}), 400
-    # Wave 2: process batch and return summary
-    return jsonify({'error': 'Not implemented yet — available in Wave 2'}), 501
+    email = (data.get('email') or '').strip()
+    if not email:
+        return jsonify({'error': 'email is required'}), 400
+    result = validate_email_free(email)
+    return jsonify(result), 200
+
+
+@app.route('/api/leads/normalize-phone', methods=['POST'])
+def normalize_phone_endpoint():
+    """Normalize Brazilian phone number to E.164 format."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json() or {}
+    phone = (data.get('phone') or '').strip()
+    if not phone:
+        return jsonify({'error': 'phone is required'}), 400
+    result = normalize_phone_br(phone)
+    return jsonify(result), 200
+
+
+@app.route('/api/leads/validate-batch', methods=['POST'])
+@limiter.limit("5 per hour")
+def validate_batch_endpoint():
+    """
+    Run quality scoring over all leads in a batch (or all leads for admin).
+    Recomputes quality_grade, quality_score, lead_score, freshness_score for each lead.
+    Returns: {updated: int, errors: int, batch_id: int|null}
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    batch_id = data.get('batch_id')
+
+    try:
+        # First check admin status if no batch_id
+        if not batch_id:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("SELECT is_admin FROM users WHERE id = %s", (user_id,))
+                row = c.fetchone()
+                if not row or not row[0]:
+                    return jsonify({'error': 'batch_id required for non-admin users'}), 400
+
+        with get_db() as conn:
+            c = conn.cursor()
+            if batch_id:
+                c.execute("SELECT id FROM leads WHERE batch_id = %s", (batch_id,))
+            else:
+                c.execute("SELECT id FROM leads")
+            lead_ids = [r[0] for r in c.fetchall()]
+
+        updated = 0
+        errors = 0
+
+        for lead_id in lead_ids:
+            try:
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute("""
+                        SELECT company_name, email, phone, website, city, state,
+                               cnpj, category, address, source, cnpj_enriched,
+                               captured_at, extracted_at, last_verified_at
+                        FROM leads WHERE id = %s
+                    """, (lead_id,))
+                    row = c.fetchone()
+                    if not row:
+                        continue
+                    lead_data = {
+                        'company_name': row[0], 'email': row[1], 'phone': row[2],
+                        'website': row[3], 'city': row[4], 'state': row[5],
+                        'cnpj': row[6], 'category': row[7], 'address': row[8],
+                        'source': row[9], 'cnpj_enriched': row[10],
+                        'captured_at': row[11], 'extracted_at': row[12],
+                        'last_verified_at': row[13],
+                    }
+                    qs = compute_lead_quality_score(lead_data)
+                    c.execute("""
+                        UPDATE leads
+                        SET quality_grade = %s,
+                            quality_score = %s,
+                            lead_score = %s,
+                            freshness_score = %s,
+                            last_verified_at = NOW()
+                        WHERE id = %s
+                    """, (qs['grade'], qs['tier'], qs['score'], qs['freshness'], lead_id))
+                updated += 1
+            except Exception as e:
+                errors += 1
+                print(f"[validate-batch] lead {lead_id} error: {e}")
+
+        return jsonify({
+            'updated': updated,
+            'errors': errors,
+            'batch_id': batch_id,
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/leads/<int:lead_id>/verify-email', methods=['POST'])
@@ -7174,6 +7460,24 @@ def sanitize_leads():
                 # Build tags addition for email_type
                 existing_tags = (lead.get('notes') or '')
 
+                # Phase 2: compute quality_grade using 6-dimension scorer
+                qs = compute_lead_quality_score(lead)
+
+                # Phase 2: normalize phone via normalize_phone_br for whatsapp field
+                phone_val = lead.get('phone') or ''
+                if phone_val:
+                    pn_result = normalize_phone_br(phone_val)
+                    if pn_result['valid']:
+                        if pn_result['whatsapp_id'] and not lead.get('whatsapp'):
+                            c.execute("UPDATE leads SET whatsapp = %s WHERE id = %s",
+                                      (pn_result['whatsapp_id'], lead['id']))
+
+                # Phase 2: validate email MX and mark mx_valid
+                if new_email:
+                    ev_result = validate_email_free(new_email)
+                    if not ev_result['valid'] and (ev_result.get('reason') or '').startswith('no_mx_record'):
+                        c.execute("UPDATE leads SET mx_valid = FALSE WHERE id = %s", (lead['id'],))
+
                 c.execute(
                     '''UPDATE leads SET
                          email = %s,
@@ -7181,11 +7485,16 @@ def sanitize_leads():
                          address = %s,
                          city = %s,
                          quality_score = %s,
+                         quality_grade = %s,
+                         lead_score = %s,
+                         freshness_score = %s,
+                         last_verified_at = NOW(),
                          notes = %s,
                          updated_at = %s
                        WHERE id = %s''',
                     (new_email, new_company, new_address, new_city,
-                     new_quality, new_notes, datetime.now(), lead['id'])
+                     qs['tier'], qs['grade'], qs['score'], qs['freshness'],
+                     new_notes, datetime.now(), lead['id'])
                 )
                 quality_updated += 1
             except Exception as e:
@@ -9539,13 +9848,22 @@ def import_leads():
                         skipped += 1
                         continue
 
-                cur.execute(
-                    """INSERT INTO leads (batch_id, email, phone, company_name, website, whatsapp, contact_name, source_url, crm_status)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'novo')""",
-                    (batch_id, email or None, phone or None, company or None, website or None,
-                     whatsapp or None, contact_name or None, website or None)
-                )
-                imported += 1
+                inserted = save_lead_to_db(conn, {
+                    'batch_id': batch_id,
+                    'email': email or None,
+                    'phone': phone or None,
+                    'company_name': company or None,
+                    'website': website or None,
+                    'whatsapp': whatsapp or None,
+                    'contact_name': contact_name or None,
+                    'source_url': website or None,
+                    'crm_status': 'novo',
+                    'source': 'imported',
+                })
+                if inserted:
+                    imported += 1
+                else:
+                    skipped += 1
 
             # Update batch count
             cur.execute("UPDATE batches SET total_urls = %s WHERE id = %s", (imported, batch_id))
@@ -11248,20 +11566,24 @@ def _save_leads_to_batch(c, conn, batch_id, leads, source, city, state, provider
             else:
                 dedup_email = f"{source}_{re.sub(r'[^a-z0-9]', '', company.lower()[:30])}_{saved}@{source}.local"
 
-            c.execute(
-                '''INSERT INTO leads (batch_id, company_name, email, phone, website, address,
-                                      instagram, linkedin, whatsapp, city, state, source, extracted_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                (batch_id, company, dedup_email, phone, website, address,
-                 instagram_url, linkedin_url, whatsapp, city, state, source, now)
-            )
-            saved += 1
+            inserted = save_lead_to_db(conn, {
+                'batch_id': batch_id,
+                'company_name': company,
+                'email': dedup_email,
+                'phone': phone,
+                'website': website,
+                'address': address,
+                'instagram': instagram_url,
+                'linkedin': linkedin_url,
+                'whatsapp': whatsapp,
+                'city': city,
+                'state': state,
+                'source': source,
+            })
+            if inserted:
+                saved += 1
         except Exception as e:
             print(f"[{provider.upper()}] Erro ao salvar lead: {e}")
-            try:
-                conn.rollback()
-            except Exception:
-                pass
     return saved
 
 

@@ -1,7 +1,7 @@
 """
 Smoke tests + unit stubs — Phase 2 Lead Quality endpoints.
 Live smoke tests run against: https://api.extratordedados.com.br
-Unit stubs (marked skip) require Wave 2 implementation before unskipping.
+Unit tests (Wave 2): test the quality functions directly via module import.
 """
 import pytest
 import requests
@@ -48,8 +48,8 @@ def test_validate_batch_authenticated(api_base, auth_headers):
     """POST /api/leads/validate-batch with auth returns 200 or 400 (not 401/404 after Wave 2)."""
     resp = requests.post(f"{api_base}/api/leads/validate-batch",
                          json={}, headers=auth_headers, timeout=10)
-    # Before Wave 2: 404 expected. After Wave 2: 200 or 400 (bad request without batch_id).
-    assert resp.status_code in (200, 400, 404)
+    # After Wave 2: 200 or 400 (bad request without batch_id for non-admin).
+    assert resp.status_code in (200, 400)
 
 
 def test_verify_email_requires_auth(api_base):
@@ -70,53 +70,74 @@ def test_quality_grade_field_present_in_lead(api_base, auth_headers):
         assert "quality_grade" in leads[0], "quality_grade field missing from lead response"
 
 
-# ── Unit stubs (skipped until Wave 2 implements the functions) ─────────────
-# Function names MUST match VALIDATION.md exactly — do not rename.
-# In Wave 2 (Plan 02 Task 1): remove the @pytest.mark.skip decorators and
-# add `from app.backend.app import validate_email_free, normalize_phone_br, compute_lead_quality_score`
-# at the top of this section.
+# ── Unit tests (Wave 2 — test quality functions directly) ─────────────────
+# These tests import functions directly from app.py.
+# If app.py cannot be imported (requires DB/Gunicorn), tests are skipped with ImportError guard.
 
-@pytest.mark.skip(reason="Wave 0 stub — validate_email_free() not yet implemented (Wave 2)")
+def _import_quality_fns():
+    """Lazy import of quality functions to avoid module-level import failure."""
+    import sys
+    import os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'app', 'backend'))
+    import importlib
+    try:
+        m = importlib.import_module('app')
+        return m.validate_email_free, m.normalize_phone_br, m.compute_lead_quality_score
+    except Exception as e:
+        raise ImportError(f"Cannot import app.py: {e}")
+
+
 def test_validate_email_free_invalid_mx():
     """validate_email_free() rejects email with no MX record."""
-    # from app.backend.app import validate_email_free  # uncomment in Wave 2
-    result = validate_email_free('bad@nodomain12345invalid.com')  # noqa: F821
+    try:
+        validate_email_free, _, _ = _import_quality_fns()
+    except ImportError as e:
+        pytest.skip(f"app.py not importable in test environment: {e}")
+    result = validate_email_free('bad@nodomain12345invalid.com')
     assert result['valid'] is False
     assert 'no_mx_record' in (result.get('reason') or '')
 
 
-@pytest.mark.skip(reason="Wave 0 stub — validate_email_free() not yet implemented (Wave 2)")
 def test_validate_email_free_disposable():
     """validate_email_free() rejects disposable domain (mailinator.com)."""
-    # from app.backend.app import validate_email_free  # uncomment in Wave 2
-    result = validate_email_free('test@mailinator.com')  # noqa: F821
+    try:
+        validate_email_free, _, _ = _import_quality_fns()
+    except ImportError as e:
+        pytest.skip(f"app.py not importable in test environment: {e}")
+    result = validate_email_free('test@mailinator.com')
     assert result['valid'] is False
     assert result.get('is_disposable') is True
 
 
-@pytest.mark.skip(reason="Wave 0 stub — normalize_phone_br() not yet implemented (Wave 2)")
 def test_normalize_phone_br_mobile():
     """normalize_phone_br() correctly normalizes a Brazilian mobile number."""
-    # from app.backend.app import normalize_phone_br  # uncomment in Wave 2
-    result = normalize_phone_br('27999998888')  # noqa: F821
+    try:
+        _, normalize_phone_br, _ = _import_quality_fns()
+    except ImportError as e:
+        pytest.skip(f"app.py not importable in test environment: {e}")
+    result = normalize_phone_br('27999998888')
     assert result['valid'] is True
     assert result['e164'] == '+5527999998888'
     assert result['type'] == 'mobile'
     assert result['whatsapp_id'] == '5527999998888@c.us'
 
 
-@pytest.mark.skip(reason="Wave 0 stub — normalize_phone_br() not yet implemented (Wave 2)")
 def test_normalize_phone_br_invalid():
     """normalize_phone_br() returns valid=False for invalid input."""
-    # from app.backend.app import normalize_phone_br  # uncomment in Wave 2
-    result = normalize_phone_br('27XXXX')  # noqa: F821
+    try:
+        _, normalize_phone_br, _ = _import_quality_fns()
+    except ImportError as e:
+        pytest.skip(f"app.py not importable in test environment: {e}")
+    result = normalize_phone_br('27XXXX')
     assert result['valid'] is False
 
 
-@pytest.mark.skip(reason="Wave 0 stub — compute_lead_quality_score() not yet implemented (Wave 2)")
 def test_quality_score_complete_lead():
     """compute_lead_quality_score() scores a complete lead as grade B or A (score >= 60)."""
-    # from app.backend.app import compute_lead_quality_score  # uncomment in Wave 2
+    try:
+        _, _, compute_lead_quality_score = _import_quality_fns()
+    except ImportError as e:
+        pytest.skip(f"app.py not importable in test environment: {e}")
     lead = {
         'email': 'contato@empresa.com.br',
         'phone': '27999998888',
@@ -125,15 +146,17 @@ def test_quality_score_complete_lead():
         'state': 'ES',
         'source': 'google_maps',
     }
-    result = compute_lead_quality_score(lead)  # noqa: F821
+    result = compute_lead_quality_score(lead)
     assert result['score'] >= 60
     assert result['grade'] in ('A', 'B')
 
 
-@pytest.mark.skip(reason="Wave 0 stub — compute_lead_quality_score() not yet implemented (Wave 2)")
 def test_quality_score_no_email():
     """compute_lead_quality_score() scores a lead with no email/phone as grade D or F (score <= 20)."""
-    # from app.backend.app import compute_lead_quality_score  # uncomment in Wave 2
-    result = compute_lead_quality_score({'email': None, 'phone': None})  # noqa: F821
+    try:
+        _, _, compute_lead_quality_score = _import_quality_fns()
+    except ImportError as e:
+        pytest.skip(f"app.py not importable in test environment: {e}")
+    result = compute_lead_quality_score({'email': None, 'phone': None})
     assert result['score'] <= 20
     assert result['grade'] in ('D', 'F')
