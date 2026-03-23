@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-23T09:21:02.192Z"
+last_updated: "2026-03-23T09:33:53.727Z"
 progress:
   total_phases: 6
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 6
-  completed_plans: 5
+  completed_plans: 6
 ---
 
 # STATE.md — Project Memory
@@ -18,9 +18,9 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone 1 — Pipeline Autônomo + Qualidade + Fontes
-- **Active phase**: Phase 2 — Qualidade de Leads
-- **Current Plan**: 2 of 3 (Plan 02 complete)
-- **Last completed**: Phase 2, Plan 02 — Core quality functions (validate_email_free, normalize_phone_br, compute_lead_quality_score, save_lead_to_db), all 10 INSERT paths refactored, validate-batch endpoint, quality_grade filter
+- **Active phase**: Phase 2 — Qualidade de Leads (COMPLETE — awaiting checkpoint:human-verify)
+- **Current Plan**: 3 of 3 (Plan 03 complete — all plans done, checkpoint pending deploy verification)
+- **Last completed**: Phase 2, Plan 03 — validate_zerobounce() + POST /api/leads/\<id\>/verify-email, GradeBadge, FreshnessIndicator, A-F quality filter, Verificar Email button
 
 ## Completed Work
 
@@ -34,6 +34,7 @@ progress:
 | 2026-03-23 | Phase 1 Plan 03: /admin/pipeline-config editor page (niche toggles, region, schedule, notifications) + pipeline health card + 30-day history on admin/index.tsx |
 | 2026-03-23 | Phase 2 Plan 01: DB foundation — 4 quality columns (captured_at, quality_grade, etc.), global unique index, 157 dedup rows removed, Wave 0 test scaffold (14 tests), Phase 2 stub endpoints |
 | 2026-03-23 | Phase 2 Plan 02: Core quality functions — validate_email_free, normalize_phone_br, compute_lead_quality_score, save_lead_to_db; all 10 extraction INSERT paths refactored; validate-batch endpoint; quality_grade filter; 14/14 tests passing |
+| 2026-03-23 | Phase 2 Plan 03: validate_zerobounce() + POST /api/leads/<id>/verify-email; GradeBadge + FreshnessIndicator; A-F quality filter; Verificar Email button; tools/zerobounce in AWS SM |
 
 ## Research Available
 
@@ -69,6 +70,9 @@ progress:
 | validate_email_free uses check_deliverability=False | Avoid per-call DNS in batch — MX check delegates to has_valid_mx() cache |
 | save_lead_to_db is canonical INSERT helper | quality_grade written on every lead INSERT regardless of extraction pipeline |
 | quality filter supports both A/B/C/D/F and legacy tiers | Backward compat with existing frontend quality dropdown |
+| ZeroBounce key stored as placeholder in AWS SM | Operator must update tools/zerobounce with real key — endpoint returns 503 until then |
+| Verificar Email logic in leads.tsx via onVerifyEmail callback prop | Keeps LeadDrawer stateless, centralized in page component |
+| quality filter param remains 'quality' (not 'quality_grade') | Backend handles both A-F grades and legacy basico/medio/premium tiers |
 
 ## Performance Metrics
 
@@ -79,8 +83,9 @@ progress:
 | 01 | 03 | ~20 min | 2/2 | 2 |
 | 02-qualidade-de-leads | 01 | ~16 min | 2/2 | 3 |
 | 02-qualidade-de-leads | 02 | ~11 min | 2/2 | 2 |
+| 02-qualidade-de-leads | 03 | ~7 min | 2/2 | 3 |
 
 ## Last Session
 
-- **Stopped at**: Completed 02-02-PLAN.md
+- **Stopped at**: Completed 02-03-PLAN.md — awaiting checkpoint:human-verify (deploy + visual check required)
 - **Timestamp**: 2026-03-23
