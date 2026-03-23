@@ -1501,6 +1501,230 @@ def enrich_cnpj_brasilapi(cnpj_raw):
     return {}
 
 
+_RF_SITUACAO_MAP = {2: 'ativa', 3: 'suspensa', 4: 'inapta', 8: 'baixada'}
+
+
+def enrich_from_rf_local(cnpj_raw):
+    """
+    Direct SQL lookup against cnpj_rf table (Receita Federal local data).
+    Returns normalized enrichment dict or {} on miss/error.
+    Target latency: <10ms. Never raises — all exceptions caught and logged.
+    """
+    cnpj = re.sub(r'\D', '', cnpj_raw or '')
+    if len(cnpj) != 14:
+        return {}
+    try:
+        import threading
+        result_holder = [{}]
+        exc_holder = [None]
+
+        def _query():
+            try:
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute(
+                        '''SELECT razao_social, nome_fantasia, situacao,
+                                  cnae_principal, logradouro, numero, complemento,
+                                  bairro, cep, municipio_cod, uf, ddd1, telefone1,
+                                  ddd2, telefone2, email, data_abertura, porte,
+                                  matriz_filial
+                           FROM cnpj_rf WHERE cnpj = %s''',
+                        (cnpj,)
+                    )
+                    row = c.fetchone()
+                    if row:
+                        (razao_social, nome_fantasia, situacao,
+                         cnae_principal, logradouro, numero, complemento,
+                         bairro, cep, municipio_cod, uf, ddd1, telefone1,
+                         ddd2, telefone2, email_rf, data_abertura, porte,
+                         matriz_filial) = row
+                        phone = None
+                        if ddd1 and telefone1:
+                            phone = str(ddd1) + str(telefone1)
+                        address_parts = filter(None, [logradouro, numero, complemento, bairro])
+                        result_holder[0] = {
+                            'razao_social': razao_social,
+                            'nome_fantasia': nome_fantasia,
+                            'phone': phone,
+                            'city': None,  # municipio_cod requires a lookup table
+                            'state': uf,
+                            'cep': cep,
+                            'address': ' '.join(address_parts).strip() or None,
+                            'cnae_code': cnae_principal,
+                            'situacao': _RF_SITUACAO_MAP.get(situacao, str(situacao) if situacao else None),
+                            'porte': str(porte) if porte else None,
+                            'email_rf': email_rf,
+                            'source': 'rf_local',
+                        }
+            except Exception as e:
+                exc_holder[0] = e
+
+        t = threading.Thread(target=_query, daemon=True)
+        t.start()
+        t.join(timeout=3)
+        if t.is_alive():
+            print(f"[rf_local] CNPJ {cnpj}: timeout after 3s")
+            return {}
+        if exc_holder[0]:
+            print(f"[rf_local] CNPJ {cnpj}: {type(exc_holder[0]).__name__}: {exc_holder[0]}")
+            return {}
+        if result_holder[0]:
+            print(f"[rf_local] CNPJ {cnpj}: {result_holder[0].get('razao_social')} | {result_holder[0].get('situacao')}")
+        return result_holder[0]
+    except Exception as e:
+        print(f"[rf_local] CNPJ {cnpj}: unexpected error: {type(e).__name__}: {e}")
+        return {}
+
+
+def enrich_cnpj_with_fallback(cnpj_raw):
+    """
+    5-level CNPJ enrichment fallback chain.
+    Returns on first success. Logs which level succeeded.
+    Level 1: rf_local (SQL, no network, 3s timeout)
+    Level 2: Minha Receita localhost:3000 (optional — skips silently if not running)
+    Level 3: BrasilAPI (existing function, 8s timeout)
+    Level 4: receitaws.com.br (3 req/min free, 8s timeout)
+    Level 5: publica.cnpj.ws (8s timeout)
+    """
+    cnpj = re.sub(r'\D', '', cnpj_raw or '')
+    if len(cnpj) != 14:
+        return {}
+
+    cnpj_fmt = f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+
+    # Level 1: rf_local
+    try:
+        result = enrich_from_rf_local(cnpj)
+        if result:
+            print(f"[cnpj_fallback] hit level 1: rf_local")
+            return result
+    except Exception as e:
+        print(f"[cnpj_fallback] level 1 error: {e}")
+
+    # Level 2: Minha Receita localhost (optional — silently skip if not running)
+    try:
+        r = http_requests.get(
+            f"http://localhost:3000/{cnpj_fmt}",
+            timeout=3,
+            headers={'Accept': 'application/json'}
+        )
+        if r.status_code == 200:
+            d = r.json()
+            if d.get('cnpj'):
+                phone1 = re.sub(r'[^0-9]', '', d.get('telefone') or '')
+                address_parts = filter(None, [
+                    d.get('logradouro'), d.get('numero'),
+                    d.get('complemento'), d.get('bairro')
+                ])
+                result = {
+                    'razao_social': d.get('razao_social'),
+                    'nome_fantasia': d.get('nome_fantasia'),
+                    'phone': phone1 or None,
+                    'city': d.get('municipio'),
+                    'state': d.get('uf'),
+                    'cep': d.get('cep'),
+                    'address': ' '.join(address_parts).strip() or None,
+                    'cnae_code': d.get('cnae_fiscal'),
+                    'situacao': d.get('descricao_situacao_cadastral'),
+                    'porte': d.get('porte'),
+                    'email_rf': (d.get('email') or '').lower().strip() or None,
+                    'source': 'minha_receita',
+                }
+                print(f"[cnpj_fallback] hit level 2: minha_receita")
+                return result
+    except Exception:
+        pass  # Minha Receita not running is expected — silent skip
+
+    # Level 3: BrasilAPI (existing function)
+    try:
+        result = enrich_cnpj_brasilapi(cnpj)
+        if result:
+            result['source'] = 'brasilapi'
+            print(f"[cnpj_fallback] hit level 3: brasilapi")
+            return result
+    except Exception as e:
+        print(f"[cnpj_fallback] level 3 error: {e}")
+
+    # Level 4: receitaws.com.br (3 req/min free)
+    try:
+        r = http_requests.get(
+            f"https://receitaws.com.br/v1/cnpj/{cnpj}",
+            timeout=8,
+            headers={'User-Agent': random.choice(USER_AGENTS), 'Accept': 'application/json'}
+        )
+        if r.status_code == 200:
+            d = r.json()
+            if d.get('status') != 'ERROR':
+                phone1 = re.sub(r'[^0-9]', '', d.get('telefone') or '')
+                address_parts = filter(None, [
+                    d.get('logradouro'), d.get('numero'),
+                    d.get('complemento'), d.get('bairro')
+                ])
+                result = {
+                    'razao_social': d.get('nome'),
+                    'nome_fantasia': d.get('fantasia'),
+                    'phone': phone1 or None,
+                    'city': d.get('municipio'),
+                    'state': d.get('uf'),
+                    'cep': re.sub(r'[^0-9]', '', d.get('cep') or ''),
+                    'address': ' '.join(address_parts).strip() or None,
+                    'cnae_code': d.get('cnae_fiscal'),
+                    'situacao': d.get('situacao'),
+                    'porte': d.get('porte'),
+                    'email_rf': (d.get('email') or '').lower().strip() or None,
+                    'source': 'receitaws',
+                }
+                print(f"[cnpj_fallback] hit level 4: receitaws")
+                return result
+    except Exception as e:
+        print(f"[cnpj_fallback] level 4 error: {e}")
+
+    # Level 5: publica.cnpj.ws
+    try:
+        r = http_requests.get(
+            f"https://publica.cnpj.ws/cnpj/{cnpj}",
+            timeout=8,
+            headers={'User-Agent': random.choice(USER_AGENTS), 'Accept': 'application/json'}
+        )
+        if r.status_code == 200:
+            d = r.json()
+            estabelecimento = d.get('estabelecimento') or {}
+            telefones = estabelecimento.get('telefones') or []
+            phone1 = None
+            if telefones:
+                t0 = telefones[0]
+                ddd = re.sub(r'[^0-9]', '', t0.get('ddd') or '')
+                num = re.sub(r'[^0-9]', '', t0.get('numero') or '')
+                phone1 = ddd + num if ddd and num else None
+            endereco = estabelecimento.get('logradouro') or ''
+            numero = estabelecimento.get('numero') or ''
+            complemento = estabelecimento.get('complemento') or ''
+            bairro = estabelecimento.get('bairro') or ''
+            address_parts = filter(None, [endereco, numero, complemento, bairro])
+            atividade = estabelecimento.get('atividade_principal') or {}
+            result = {
+                'razao_social': d.get('razao_social'),
+                'nome_fantasia': estabelecimento.get('nome_fantasia'),
+                'phone': phone1,
+                'city': (estabelecimento.get('cidade') or {}).get('nome'),
+                'state': (estabelecimento.get('estado') or {}).get('sigla'),
+                'cep': re.sub(r'[^0-9]', '', estabelecimento.get('cep') or ''),
+                'address': ' '.join(address_parts).strip() or None,
+                'cnae_code': atividade.get('subclasse'),
+                'situacao': (estabelecimento.get('situacao_cadastral') or '').lower() or None,
+                'porte': d.get('porte'),
+                'email_rf': (estabelecimento.get('email') or '').lower().strip() or None,
+                'source': 'cnpj_ws',
+            }
+            print(f"[cnpj_fallback] hit level 5: cnpj_ws")
+            return result
+    except Exception as e:
+        print(f"[cnpj_fallback] level 5 error: {e}")
+
+    print(f"[cnpj_fallback] all 5 levels exhausted for CNPJ {cnpj}")
+    return {}
+
+
 def build_lead_from_cnpj_enrichment(cnpj_raw, enrichment):
     """
     Converts BrasilAPI enrichment dict into lead field updates.
@@ -8040,7 +8264,7 @@ def _run_cnpj_enrichment(user_id, lead_ids=None):
 
         for row in rows:
             lead_id, cnpj, company_name, phone, address, city, state, category, email, extra_data = row
-            enrichment = enrich_cnpj_brasilapi(cnpj)
+            enrichment = enrich_cnpj_with_fallback(cnpj)
             if not enrichment:
                 # Mark as attempted even if empty
                 c.execute('UPDATE leads SET cnpj_enriched = TRUE WHERE id = %s', (lead_id,))
