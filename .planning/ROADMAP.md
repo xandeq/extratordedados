@@ -93,11 +93,11 @@ Plans:
 
 **Out of scope**: Minha Receita como API pública, MillionVerifier
 
-**Plans:** 1/3 plans complete
+**Plans:** 2/3 plans executed
 
 Plans:
 - [x] 03-01-PLAN.md — Wave 0 test stubs + cnpj_rf table migration + enrich_from_rf_local() + enrich_cnpj_with_fallback() 5-level chain + import script + RF runbook
-- [ ] 03-02-PLAN.md — Outscraper AWS SM key + _get_outscraper_key() + process_outscraper_massive() + wire into POST /api/search/massive as outscraper_maps
+- [x] 03-02-PLAN.md — Outscraper AWS SM key + _get_outscraper_key() + process_outscraper_massive() + wire into POST /api/search/massive as outscraper_maps
 - [ ] 03-03-PLAN.md — Prospeo AWS SM key + enrich_linkedin_prospeo() + POST /api/leads/<id>/enrich-linkedin + LinkedIn thread hook + Minha Receita deploy guide
 
 ---
