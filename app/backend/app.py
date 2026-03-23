@@ -7684,9 +7684,9 @@ def enrich_lead_linkedin(lead_id: int):
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
 
-    conn = get_db_connection()
-    c = conn.cursor()
-    try:
+    with get_db() as conn:
+        c = conn.cursor()
+
         c.execute("SELECT email, linkedin FROM leads WHERE id = %s", (lead_id,))
         row = c.fetchone()
         if not row:
@@ -7698,12 +7698,9 @@ def enrich_lead_linkedin(lead_id: int):
             return jsonify({'error': 'Lead sem LinkedIn URL'}), 400
 
         # Ensure Prospeo key is available before calling
-        try:
-            api_key = _get_prospeo_key()
-            if not api_key:
-                return jsonify({'error': 'Prospeo não configurado — adicione chave em tools/prospeo no AWS SM'}), 503
-        except ConfigError:
-            return jsonify({'error': 'Prospeo não configurado'}), 503
+        api_key = _get_prospeo_key()
+        if not api_key:
+            return jsonify({'error': 'Prospeo não configurado — adicione chave em tools/prospeo no AWS SM'}), 503
 
         try:
             enriched = enrich_linkedin_prospeo(linkedin_url)
@@ -7719,14 +7716,10 @@ def enrich_lead_linkedin(lead_id: int):
 
         # Only update if email is currently empty
         if not current_email:
-            try:
-                c.execute(
-                    "UPDATE leads SET email = %s, last_verified_at = NOW() WHERE id = %s",
-                    (email_value, lead_id)
-                )
-                conn.commit()
-            except Exception:
-                conn.rollback()
+            c.execute(
+                "UPDATE leads SET email = %s, last_verified_at = NOW() WHERE id = %s",
+                (email_value, lead_id)
+            )
 
         return jsonify({
             'enriched': True,
@@ -7734,13 +7727,6 @@ def enrich_lead_linkedin(lead_id: int):
             'email_type': email_type,
             'email_status': email_status,
         }), 200
-
-    except Exception as e:
-        conn.rollback()
-        return jsonify({'error': str(e)}), 500
-    finally:
-        c.close()
-        conn.close()
 
 
 @app.route('/api/leads/sanitize', methods=['POST'])
