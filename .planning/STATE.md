@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-23T09:45:06.515Z"
+last_updated: "2026-03-23T11:10:00.000Z"
 progress:
   total_phases: 6
   completed_phases: 2
-  total_plans: 6
-  completed_plans: 6
+  total_plans: 9
+  completed_plans: 7
 ---
 
 # STATE.md — Project Memory
@@ -18,9 +18,9 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone 1 — Pipeline Autônomo + Qualidade + Fontes
-- **Active phase**: Phase 2 — Qualidade de Leads (COMPLETE — awaiting checkpoint:human-verify)
-- **Current Plan**: 3 of 3 (Plan 03 complete — all plans done, checkpoint pending deploy verification)
-- **Last completed**: Phase 2, Plan 03 — validate_zerobounce() + POST /api/leads/\<id\>/verify-email, GradeBadge, FreshnessIndicator, A-F quality filter, Verificar Email button
+- **Active phase**: Phase 3 — Novas Fontes (IN PROGRESS)
+- **Current Plan**: 1 of 3 complete
+- **Last completed**: Phase 3 Plan 01 — cnpj_rf table, enrich_from_rf_local(), enrich_cnpj_with_fallback(), import_receita_federal.py, RECEITA_FEDERAL_IMPORT.md
 
 ## Completed Work
 
@@ -35,6 +35,7 @@ progress:
 | 2026-03-23 | Phase 2 Plan 01: DB foundation — 4 quality columns (captured_at, quality_grade, etc.), global unique index, 157 dedup rows removed, Wave 0 test scaffold (14 tests), Phase 2 stub endpoints |
 | 2026-03-23 | Phase 2 Plan 02: Core quality functions — validate_email_free, normalize_phone_br, compute_lead_quality_score, save_lead_to_db; all 10 extraction INSERT paths refactored; validate-batch endpoint; quality_grade filter; 14/14 tests passing |
 | 2026-03-23 | Phase 2 Plan 03: validate_zerobounce() + POST /api/leads/<id>/verify-email; GradeBadge + FreshnessIndicator; A-F quality filter; Verificar Email button; tools/zerobounce in AWS SM |
+| 2026-03-23 | Phase 3 Plan 01: cnpj_rf table (20 cols, 2 partial indexes), enrich_from_rf_local() (3s SQL timeout), enrich_cnpj_with_fallback() (5-level chain), import_receita_federal.py (nohup-safe, --dry-run), RECEITA_FEDERAL_IMPORT.md runbook. 10 test stubs (10 skipped). Deployed to VPS. |
 
 ## Research Available
 
@@ -73,6 +74,10 @@ progress:
 | ZeroBounce key stored as placeholder in AWS SM | Operator must update tools/zerobounce with real key — endpoint returns 503 until then |
 | Verificar Email logic in leads.tsx via onVerifyEmail callback prop | Keeps LeadDrawer stateless, centralized in page component |
 | quality filter param remains 'quality' (not 'quality_grade') | Backend handles both A-F grades and legacy basico/medio/premium tiers |
+| enrich_from_rf_local uses threading timeout (not signal-based) | Windows/Linux compat; signal.alarm not available on Windows |
+| Level 2 (Minha Receita) silently passes on any exception | Connection refused is expected until Plan 03 deploys it on VPS |
+| ONLY_ACTIVE=True default in import script | 60M total vs ~22M active — saves ~3x disk space; inactive CNPJs rarely needed |
+| municipio_cod stored as integer (RF code), not city name | Would require separate municipios lookup table — city lookup deferred to future plan |
 
 ## Performance Metrics
 
@@ -84,8 +89,9 @@ progress:
 | 02-qualidade-de-leads | 01 | ~16 min | 2/2 | 3 |
 | 02-qualidade-de-leads | 02 | ~11 min | 2/2 | 2 |
 | 02-qualidade-de-leads | 03 | ~7 min | 2/2 | 3 |
+| 03-novas-fontes | 01 | ~6 min | 4/4 | 6 |
 
 ## Last Session
 
-- **Stopped at**: Completed 02-03-PLAN.md — awaiting checkpoint:human-verify (deploy + visual check required)
+- **Stopped at**: Completed Phase 3 Plan 01 — DB Foundation (cnpj_rf table, fallback chain, import script). Next: Phase 3 Plan 02.
 - **Timestamp**: 2026-03-23
