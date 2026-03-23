@@ -8,6 +8,40 @@ import api from '../lib/api'
 import { useToast } from './Toast'
 import StatusBadge from './StatusBadge'
 
+function GradeBadge({ grade }: { grade: string | null }) {
+  const colorMap: Record<string, string> = {
+    A: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+    B: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
+    C: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400',
+    D: 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400',
+    F: 'bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400',
+  }
+  const g = grade || '?'
+  const color = colorMap[g] ?? 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400'
+  return (
+    <span className={`inline-flex items-center justify-center w-7 h-6 rounded-full text-xs font-bold ${color}`}>
+      {g}
+    </span>
+  )
+}
+
+function FreshnessIndicator({ capturedAt }: { capturedAt: string | null }) {
+  if (!capturedAt) return null
+  const days = Math.floor((Date.now() - new Date(capturedAt).getTime()) / 86400000)
+  const color = days <= 60
+    ? 'bg-emerald-400 dark:bg-emerald-500'
+    : days <= 180
+      ? 'bg-yellow-400 dark:bg-yellow-500'
+      : 'bg-red-400 dark:bg-red-500'
+  const label = days <= 60 ? 'Recente' : days <= 180 ? 'Envelhecendo' : 'Antigo'
+  return (
+    <span
+      title={`${label} (${days} dias)`}
+      className={`inline-block w-2 h-2 rounded-full ${color}`}
+    />
+  )
+}
+
 const CRM_STATUSES = [
   { value: 'novo', label: 'Novo' },
   { value: 'contatado', label: 'Contatado' },
@@ -42,15 +76,19 @@ interface Lead {
   contact_name: string
   batch_name: string
   batch_id: number
+  lead_score?: number
+  quality_grade?: string | null
+  captured_at?: string | null
 }
 
 interface LeadDrawerProps {
   lead: Lead | null
   onClose: () => void
   onUpdate: (lead: Lead) => void
+  onVerifyEmail?: (leadId: number) => Promise<void>
 }
 
-export default function LeadDrawer({ lead, onClose, onUpdate }: LeadDrawerProps) {
+export default function LeadDrawer({ lead, onClose, onUpdate, onVerifyEmail }: LeadDrawerProps) {
   const { addToast } = useToast()
   const [status, setStatus] = useState('')
   const [tags, setTags] = useState('')
@@ -111,6 +149,13 @@ export default function LeadDrawer({ lead, onClose, onUpdate }: LeadDrawerProps)
             <div className="min-w-0">
               <h2 className="text-base font-bold text-gray-900 truncate">{lead.company_name || 'Sem nome'}</h2>
               <p className="text-xs text-gray-400 truncate">{lead.email}</p>
+              <div className="flex items-center gap-2 mt-1">
+                <GradeBadge grade={lead.quality_grade ?? null} />
+                <FreshnessIndicator capturedAt={lead.captured_at ?? null} />
+                {lead.lead_score != null && (
+                  <span className="text-xs text-gray-400">Score: {lead.lead_score}</span>
+                )}
+              </div>
             </div>
           </div>
           <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-lg transition-colors">
@@ -277,7 +322,15 @@ export default function LeadDrawer({ lead, onClose, onUpdate }: LeadDrawerProps)
         </div>
 
         {/* Footer */}
-        <div className="px-6 py-4 border-t border-gray-200">
+        <div className="px-6 py-4 border-t border-gray-200 space-y-2">
+          {onVerifyEmail && (
+            <button
+              onClick={() => onVerifyEmail(lead.id)}
+              className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-md w-full"
+            >
+              Verificar Email
+            </button>
+          )}
           <button
             onClick={handleSave}
             disabled={saving}

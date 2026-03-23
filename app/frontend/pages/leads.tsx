@@ -48,6 +48,9 @@ interface Lead {
   batch_id: number
   lead_score: number
   quality_score: string | null
+  quality_grade: string | null
+  freshness_score: number | null
+  captured_at: string | null
   source: string | null
 }
 
@@ -94,6 +97,40 @@ function ScoreBadge({ score }: { score: number }) {
     <span className={`inline-flex items-center justify-center w-10 h-6 rounded-full text-xs font-semibold tabular-nums ${color}`}>
       {pct}
     </span>
+  )
+}
+
+function GradeBadge({ grade }: { grade: string | null }) {
+  const colorMap: Record<string, string> = {
+    A: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+    B: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
+    C: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400',
+    D: 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400',
+    F: 'bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400',
+  }
+  const g = grade || '?'
+  const color = colorMap[g] ?? 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400'
+  return (
+    <span className={`inline-flex items-center justify-center w-7 h-6 rounded-full text-xs font-bold ${color}`}>
+      {g}
+    </span>
+  )
+}
+
+function FreshnessIndicator({ capturedAt }: { capturedAt: string | null }) {
+  if (!capturedAt) return null
+  const days = Math.floor((Date.now() - new Date(capturedAt).getTime()) / 86400000)
+  const color = days <= 60
+    ? 'bg-emerald-400 dark:bg-emerald-500'
+    : days <= 180
+      ? 'bg-yellow-400 dark:bg-yellow-500'
+      : 'bg-red-400 dark:bg-red-500'
+  const label = days <= 60 ? 'Recente' : days <= 180 ? 'Envelhecendo' : 'Antigo'
+  return (
+    <span
+      title={`${label} (${days} dias)`}
+      className={`inline-block w-2 h-2 rounded-full ${color}`}
+    />
   )
 }
 
@@ -552,6 +589,16 @@ export default function Leads() {
     setDrawerLead(updatedLead)
   }
 
+  const handleVerifyEmail = async (leadId: number) => {
+    try {
+      const resp = await api.post(`/api/leads/${leadId}/verify-email`)
+      addToast(`ZeroBounce: ${resp.data.status || 'verificado'}`, 'success')
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Erro ao verificar'
+      addToast(msg, 'error')
+    }
+  }
+
   const confirmSyncAndDelete = async () => {
     setSyncingAndDeleting(true)
     try {
@@ -871,10 +918,12 @@ export default function Leads() {
             onChange={(e) => { setQualityFilter(e.target.value); setPage(1) }}
             className="px-3 py-2.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500/30 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200"
           >
-            <option value="">Todos os níveis</option>
-            <option value="premium">Premium (65+)</option>
-            <option value="medio">Médio (35-64)</option>
-            <option value="basico">Básico (&lt;35)</option>
+            <option value="">Todos os grades</option>
+            <option value="A">A — Alta (80+)</option>
+            <option value="B">B — Boa (60-79)</option>
+            <option value="C">C — Regular (40-59)</option>
+            <option value="D">D — Fraca (20-39)</option>
+            <option value="F">F — Invalida (0-19)</option>
           </select>
           <Tooltip text="Filtra leads por qualidade calculada: pontuação 0-100 baseada em email corporativo, telefone válido, WhatsApp, CNPJ, redes sociais." />
         </div>
@@ -1051,6 +1100,7 @@ export default function Leads() {
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Contato</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Score</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Qualidade</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Redes</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Tags</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Lote</th>
@@ -1086,6 +1136,10 @@ export default function Leads() {
                           {lead.city && (
                             <p className="text-[10px] text-gray-400">{lead.city}{lead.state ? `/${lead.state}` : ''}</p>
                           )}
+                          <div className="flex items-center gap-1 mt-0.5">
+                            <GradeBadge grade={lead.quality_grade} />
+                            <FreshnessIndicator capturedAt={lead.captured_at} />
+                          </div>
                         </div>
                       </div>
                     </td>
@@ -1109,6 +1163,12 @@ export default function Leads() {
                     </td>
                     <td className="px-4 py-3">
                       <ScoreBadge score={lead.lead_score ?? 0} />
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-1">
+                        <GradeBadge grade={lead.quality_grade} />
+                        <FreshnessIndicator capturedAt={lead.captured_at} />
+                      </div>
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-0.5">
@@ -1209,6 +1269,7 @@ export default function Leads() {
           lead={drawerLead}
           onClose={() => setDrawerLead(null)}
           onUpdate={handleDrawerUpdate}
+          onVerifyEmail={handleVerifyEmail}
         />
       )}
 
