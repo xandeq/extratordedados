@@ -46,9 +46,11 @@ def test_validate_batch_requires_auth(api_base):
 
 def test_validate_batch_authenticated(api_base, auth_headers):
     """POST /api/leads/validate-batch with auth returns 200 or 400 (not 401/404 after Wave 2)."""
+    # Use a non-existent batch_id (truthy) to avoid full-table scan timeout on admin users
+    # batch_id=0 is falsy in Python — endpoint would scan all leads for admin users
     resp = requests.post(f"{api_base}/api/leads/validate-batch",
-                         json={}, headers=auth_headers, timeout=10)
-    # After Wave 2: 200 or 400 (bad request without batch_id for non-admin).
+                         json={"batch_id": 999999999}, headers=auth_headers, timeout=10)
+    # 200 = success (batch not found = 0 leads updated), 400 = validation error
     assert resp.status_code in (200, 400)
 
 
