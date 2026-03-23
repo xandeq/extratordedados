@@ -64,7 +64,7 @@ Plans:
 
 **Out of scope**: MillionVerifier bulk (pago), Paid email validation tier
 
-**Plans:** 1/3 plans executed
+**Plans:** 2/3 plans executed
 
 Plans:
 - [x] 02-01-PLAN.md — Wave 0 test scaffold + packages in requirements.txt + DB migrations (4 cols) + dedup cross-batch + global partial UNIQUE index on email

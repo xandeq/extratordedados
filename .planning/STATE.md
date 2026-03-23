@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-23T09:03:55.835Z"
+last_updated: "2026-03-23T09:21:02.192Z"
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 6
-  completed_plans: 4
+  completed_plans: 5
 ---
 
 # STATE.md — Project Memory
@@ -19,8 +19,8 @@ progress:
 
 - **Active milestone**: Milestone 1 — Pipeline Autônomo + Qualidade + Fontes
 - **Active phase**: Phase 2 — Qualidade de Leads
-- **Current Plan**: 1 of 3 (Plan 01 complete)
-- **Last completed**: Phase 2, Plan 01 — DB foundation (4 columns, global index, dedup, Wave 0 test scaffold)
+- **Current Plan**: 2 of 3 (Plan 02 complete)
+- **Last completed**: Phase 2, Plan 02 — Core quality functions (validate_email_free, normalize_phone_br, compute_lead_quality_score, save_lead_to_db), all 10 INSERT paths refactored, validate-batch endpoint, quality_grade filter
 
 ## Completed Work
 
@@ -33,6 +33,7 @@ progress:
 | 2026-03-23 | Phase 1 Plan 02: GET /api/admin/pipeline/health endpoint, Brevo email report, healthchecks.io ping, hooked into run_daily_pipeline() |
 | 2026-03-23 | Phase 1 Plan 03: /admin/pipeline-config editor page (niche toggles, region, schedule, notifications) + pipeline health card + 30-day history on admin/index.tsx |
 | 2026-03-23 | Phase 2 Plan 01: DB foundation — 4 quality columns (captured_at, quality_grade, etc.), global unique index, 157 dedup rows removed, Wave 0 test scaffold (14 tests), Phase 2 stub endpoints |
+| 2026-03-23 | Phase 2 Plan 02: Core quality functions — validate_email_free, normalize_phone_br, compute_lead_quality_score, save_lead_to_db; all 10 extraction INSERT paths refactored; validate-batch endpoint; quality_grade filter; 14/14 tests passing |
 
 ## Research Available
 
@@ -65,6 +66,9 @@ progress:
 | History table sliced to 10 rows | daily-job/status returns all-time history; 10 rows is readable without pagination |
 | ADD COLUMN IF NOT EXISTS in init_db ALTER TABLE loop | Avoids silent rollback when DuplicateColumn is thrown inside multi-column transaction |
 | Phase 2 stub endpoints in Wave 0 | auth-gate tests must pass immediately; stubs return 401 unauth / 501 auth until Wave 2 |
+| validate_email_free uses check_deliverability=False | Avoid per-call DNS in batch — MX check delegates to has_valid_mx() cache |
+| save_lead_to_db is canonical INSERT helper | quality_grade written on every lead INSERT regardless of extraction pipeline |
+| quality filter supports both A/B/C/D/F and legacy tiers | Backward compat with existing frontend quality dropdown |
 
 ## Performance Metrics
 
@@ -74,8 +78,9 @@ progress:
 | 01 | 02 | ~15 min | 2/2 | 2 |
 | 01 | 03 | ~20 min | 2/2 | 2 |
 | 02-qualidade-de-leads | 01 | ~16 min | 2/2 | 3 |
+| 02-qualidade-de-leads | 02 | ~11 min | 2/2 | 2 |
 
 ## Last Session
 
-- **Stopped at**: Completed 02-01-PLAN.md
+- **Stopped at**: Completed 02-02-PLAN.md
 - **Timestamp**: 2026-03-23
