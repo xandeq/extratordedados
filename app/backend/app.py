@@ -9055,6 +9055,29 @@ def _get_serper_key():
     return None
 
 
+# ---- METHOD 5: Outscraper Google Maps API ----
+_outscraper_key_cache = None
+_outscraper_key_failed = False
+
+def _get_outscraper_key():
+    """Fetch Outscraper API key — resolve_secret_value with module-level cache (same as _get_serper_key)."""
+    global _outscraper_key_cache, _outscraper_key_failed
+    if _outscraper_key_cache:
+        return _outscraper_key_cache
+    if _outscraper_key_failed:
+        return None
+    _outscraper_key_cache = resolve_secret_value(
+        'OUTSCRAPER_API_KEY',
+        secret_ids=['tools/outscraper', 'extratordedados/prod'],
+        env_keys=['OUTSCRAPER_API_KEY'],
+        db_provider='outscraper',
+    )
+    if _outscraper_key_cache:
+        return _outscraper_key_cache
+    _outscraper_key_failed = True
+    return None
+
+
 def serper_email_search(niche, city, state, max_results=20):
     """
     Serper.dev: 2500 buscas grátis/mês. Retorna resultados estruturados do Google.
