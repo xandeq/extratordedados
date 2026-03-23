@@ -34,7 +34,7 @@
 
 **Out of scope**: WhatsApp notifications (Fase posterior), Redis
 
-**Plans:** 1/3 plans executed
+**Plans:** 2/3 plans executed
 
 Plans:
 - [x] 01-PLAN.md — DB migration + pipeline_config table + GET/PUT config endpoints + trigger_daily_pipeline() wired to DB

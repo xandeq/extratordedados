@@ -6,8 +6,8 @@
 
 - **Active milestone**: Milestone 1 — Pipeline Autônomo + Qualidade + Fontes
 - **Active phase**: Phase 1 — Pipeline 100% Automático
-- **Current Plan**: 2 of N (Plan 01 complete)
-- **Last completed**: Phase 1, Plan 01 — pipeline_config table and admin endpoints
+- **Current Plan**: 3 of N (Plan 02 complete)
+- **Last completed**: Phase 1, Plan 02 — pipeline health endpoint, Brevo email report, healthcheck ping
 
 ## Completed Work
 
@@ -17,6 +17,7 @@
 | 2026-03-22 | PROJECT.md, REQUIREMENTS.md, ROADMAP.md created |
 | 2026-03-22 | 4 research reports created in .planning/research/ |
 | 2026-03-22 | Phase 1 Plan 01: pipeline_config table, get_pipeline_config(), GET/PUT /api/admin/pipeline-config endpoints |
+| 2026-03-23 | Phase 1 Plan 02: GET /api/admin/pipeline/health endpoint, Brevo email report, healthchecks.io ping, hooked into run_daily_pipeline() |
 
 ## Research Available
 
@@ -41,14 +42,18 @@
 | Config values stored as JSON strings | Lists serialize cleanly, parsed with json.loads() |
 | get_pipeline_config() never raises | Falls back to module constants on any DB error — pipeline never blocked |
 | reschedule_job only on hour/minute change | Region/niches take effect on next trigger without APScheduler restart |
+| pipeline_start as absolute first line of run_daily_pipeline | Guarantees it is always bound, even on early-exception paths |
+| Notification helpers inserted before run_daily_pipeline in code | Logical grouping near pipeline code; helpers are pipeline-specific |
+| Failure report call uses locals().get() for optional counters | Defensive: counters may not be assigned if exception fires before step 4/5/6 |
 
 ## Performance Metrics
 
 | Phase | Plan | Duration | Tasks | Files |
 |-------|------|----------|-------|-------|
 | 01 | 01 | ~15 min | 2/2 | 2 |
+| 01 | 02 | ~15 min | 2/2 | 2 |
 
 ## Last Session
 
-- **Stopped at**: Completed fase1-01-PLAN.md
-- **Timestamp**: 2026-03-22
+- **Stopped at**: Completed fase1-02-PLAN.md
+- **Timestamp**: 2026-03-23
