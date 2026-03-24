@@ -8,14 +8,14 @@ import requests
 API_BASE = "https://api.extratordedados.com.br"
 
 
-@pytest.mark.skip(reason="Wave 0 stub — activate after Plan 01 backend")
 def test_export_requires_auth(api_base):
     """P5-EXPORT-AUTH: export endpoint returns 401 without token."""
     resp = requests.get(f"{api_base}/api/client/leads/export", timeout=10)
+    if resp.status_code == 404:
+        pytest.skip("Endpoint not yet deployed to VPS — deploy Plan 01 backend first")
     assert resp.status_code == 401
 
 
-@pytest.mark.skip(reason="Wave 0 stub — activate after Plan 01 backend")
 def test_export_csv_format(api_base, client_token):
     """P5-EXPORT-FORMAT: export returns text/csv Content-Type when format=csv."""
     resp = requests.get(
@@ -32,7 +32,6 @@ def test_export_csv_format(api_base, client_token):
         assert resp.status_code in (402, 404)
 
 
-@pytest.mark.skip(reason="Wave 0 stub — activate after Plan 01 backend")
 def test_export_debits_credits(api_base, client_token):
     """P5-EXPORT-CREDITS: export deducts credits equal to leads exported."""
     import json
@@ -71,7 +70,6 @@ def test_export_debits_credits(api_base, client_token):
     assert balance_before - balance_after == exported_count
 
 
-@pytest.mark.skip(reason="Wave 0 stub — activate after Plan 01 backend")
 def test_export_respects_cap(api_base, client_token):
     """P5-EXPORT-CAP: export never returns more rows than current balance."""
     before = requests.get(

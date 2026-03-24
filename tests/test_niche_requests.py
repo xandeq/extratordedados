@@ -8,7 +8,6 @@ import requests
 API_BASE = "https://api.extratordedados.com.br"
 
 
-@pytest.mark.skip(reason="Wave 0 stub — activate after Plan 02 backend")
 def test_niche_request_created(api_base, client_token):
     """P5-NICHE-CREATE: POST creates a niche request or votes on existing."""
     import time
@@ -25,7 +24,6 @@ def test_niche_request_created(api_base, client_token):
     assert data.get("action") in ("created", "voted")
 
 
-@pytest.mark.skip(reason="Wave 0 stub — activate after Plan 02 backend")
 def test_niche_vote_dedup(api_base, client_token, auth_token):
     """P5-NICHE-VOTE: second request for same niche increments votes, no duplicate row."""
     import time
@@ -58,7 +56,6 @@ def test_niche_vote_dedup(api_base, client_token, auth_token):
     assert r2.json()["niche_request_id"] == req_id
 
 
-@pytest.mark.skip(reason="Wave 0 stub — activate after Plan 02 backend")
 def test_admin_niche_list(api_base, auth_headers):
     """P5-NICHE-ADMIN-LIST: admin can list all niche requests sorted by votes."""
     resp = requests.get(
@@ -75,7 +72,6 @@ def test_admin_niche_list(api_base, auth_headers):
         assert votes_list == sorted(votes_list, reverse=True)
 
 
-@pytest.mark.skip(reason="Wave 0 stub — activate after Plan 02 backend")
 def test_admin_approve_niche(api_base, client_token, auth_headers):
     """P5-NICHE-APPROVE: admin approve sets status to processing."""
     import time
