@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-24T15:06:06.273Z"
+last_updated: "2026-03-24T15:25:34.723Z"
 progress:
   total_phases: 6
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 20
-  completed_plans: 19
+  completed_plans: 20
 ---
 
 # STATE.md — Project Memory
@@ -18,10 +18,10 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone 2 — Portal de Clientes
-- **Active phase**: Phase 6 — Plan 02 COMPLETE (Wave 1: 4 CRUD endpoints + APScheduler notification job)
-- **Milestone 2**: Phase 5 COMPLETE — export com cotas + niche request queue fully operational. Phase 6 Plan 02 COMPLETE — full CRUD + scheduler deployed.
+- **Active phase**: Phase 6 — Plan 03 COMPLETE (Wave 3: Frontend — /saved-searches page, Salvar Busca modal, Sidebar nav link, deployed)
+- **Milestone 2**: Phase 5 COMPLETE — export com cotas + niche request queue fully operational. Phase 6 Plans 01/02/03 COMPLETE — full CRUD + scheduler + frontend deployed.
 - **Milestone 1**: COMPLETE (Phases 1-3 all done, 48/48 regression tests passing)
-- **Last completed**: Phase 6 Plan 02 — 4 REST endpoints (POST/GET/DELETE/PATCH /api/client/saved-searches), trigger_saved_search_notifications APScheduler job at 08:00 BRT, all 6 tests activated (1 pass 5 skip), deployed to VPS.
+- **Last completed**: Phase 6 Plan 03 — saved-searches.tsx (147 lines, GET/PATCH/DELETE wired), Salvar Busca button + modal on portal.tsx (POST /api/client/saved-searches), Sidebar Buscas Salvas nav link, frontend deployed 54 files via FTP.
 
 ## Completed Work
 
@@ -44,6 +44,7 @@ progress:
 | 2026-03-24 | Phase 4 Plan 03: Client portal frontend — /portal page (filter panel + masked results + RevealButton), useClientCredits hook, RevealButton (4 states), Sidebar Portal nav + CreditBalance widget, plans.tsx credits row. TypeScript clean, Next.js build OK, 56 passed, 9 skipped. Frontend deployed. Human verification APPROVED. |
 | 2026-03-24 | Phase 6 Plan 01: Wave 0 — saved_searches table (DDL + 2 indexes), test scaffold (1 pass 5 skip), stub endpoints /api/client/saved-searches (auth gate), _build_portal_filter_query() helper, send_notification_email() via Brevo. Deployed to VPS. |
 | 2026-03-24 | Phase 6 Plan 02: Wave 1 — 4 REST CRUD endpoints (POST upsert, GET list, DELETE owner-guarded, PATCH toggle), trigger_saved_search_notifications APScheduler job (08:00 BRT, double-fire guard, 23h re-send prevention), all 6 tests activated. Deployed to VPS. |
+| 2026-03-24 | Phase 6 Plan 03: Wave 3 Frontend — /saved-searches page (list, toggle notify, delete), Salvar Busca button + modal on /portal, Sidebar Buscas Salvas nav link. TypeScript clean, frontend deployed via FTP (54 files, 0 errors). |
 
 ## Research Available
 
@@ -139,8 +140,9 @@ progress:
 | Phase 05-export-com-cotas-niche-request-queue P05 | 6 | 1 tasks | 1 files |
 | Phase 06 P01 | 11 | 2 tasks | 2 files |
 | Phase 06-saved-searches-notifica-es-de-novos-leads P02 | 15 | 2 tasks | 2 files |
+| Phase 06-saved-searches-notifica-es-de-novos-leads P03 | 16 | 2 tasks | 3 files |
 
 ## Last Session
 
-- **Stopped at**: Completed Phase 06 Plan 02 — 4 CRUD endpoints + APScheduler notification job deployed. Next: Phase 06 Plan 03 (if exists) or Phase 6 complete.
+- **Stopped at**: Completed Phase 06 Plan 03 — saved-searches.tsx + Salvar Busca modal + Sidebar nav link, frontend deployed. Checkpoint reached for human verification of /portal and /saved-searches.
 - **Timestamp**: 2026-03-24
