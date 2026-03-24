@@ -15958,6 +15958,246 @@ def client_export_leads():
         return jsonify({'error': str(e)}), 500
 
 
+# ─── Niche Request Queue (Phase 5, Plan 02) ───────────────────────────────────
+
+@app.route('/api/client/niche-requests', methods=['POST'])
+@limiter.limit("5/hour")
+def client_create_niche_request():
+    """Submit or vote on a niche request. Deduplicates by niche+city+state."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json(silent=True) or {}
+    niche = (data.get('niche') or '').strip()
+    city = (data.get('city') or '').strip() or None
+    state_val = (data.get('state') or '').strip().upper() or None
+    notes = (data.get('notes') or '').strip() or None
+
+    if not niche:
+        return jsonify({'error': 'niche is required'}), 400
+    if len(niche) > 200:
+        return jsonify({'error': 'niche must be <= 200 chars'}), 400
+
+    with get_db() as conn:
+        c = conn.cursor()
+        # Dedup check with FOR UPDATE to prevent race condition
+        c.execute("""
+            SELECT id, votes FROM niche_requests
+            WHERE niche ILIKE %s
+              AND (city ILIKE %s OR (%s IS NULL AND city IS NULL))
+              AND (state ILIKE %s OR (%s IS NULL AND state IS NULL))
+              AND status IN ('pending', 'approved')
+            ORDER BY created_at DESC LIMIT 1
+            FOR UPDATE
+        """, (niche, city, city, state_val, state_val))
+        existing = c.fetchone()
+
+        if existing:
+            req_id = existing[0]
+            current_votes = existing[1]
+            # Check if this user already voted
+            c.execute(
+                'SELECT 1 FROM niche_request_votes WHERE user_id = %s AND niche_request_id = %s',
+                (user_id, req_id)
+            )
+            if c.fetchone():
+                return jsonify({'error': 'already_voted', 'niche_request_id': req_id}), 409
+            # Increment votes
+            c.execute(
+                'UPDATE niche_requests SET votes = votes + 1, updated_at = NOW() WHERE id = %s',
+                (req_id,)
+            )
+            c.execute(
+                'INSERT INTO niche_request_votes (user_id, niche_request_id) VALUES (%s, %s)',
+                (user_id, req_id)
+            )
+            return jsonify({
+                'action': 'voted',
+                'niche_request_id': req_id,
+                'votes': current_votes + 1
+            }), 200
+        else:
+            # Create new request
+            c.execute("""
+                INSERT INTO niche_requests (requester_user_id, niche, city, state, notes, votes)
+                VALUES (%s, %s, %s, %s, %s, 1)
+                RETURNING id
+            """, (user_id, niche, city, state_val, notes))
+            req_id = c.fetchone()[0]
+            c.execute(
+                'INSERT INTO niche_request_votes (user_id, niche_request_id) VALUES (%s, %s)',
+                (user_id, req_id)
+            )
+            return jsonify({
+                'action': 'created',
+                'niche_request_id': req_id,
+                'votes': 1
+            }), 201
+
+
+@app.route('/api/client/niche-requests', methods=['GET'])
+@limiter.limit("30/minute")
+def client_list_niche_requests():
+    """List pending/approved/processing/done niche requests for the vote list."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT nr.id, nr.niche, nr.city, nr.state, nr.votes, nr.status,
+                   nr.created_at, nr.leads_added,
+                   u.username as requester_username,
+                   CASE WHEN nrv.user_id IS NOT NULL THEN TRUE ELSE FALSE END as user_voted
+            FROM niche_requests nr
+            JOIN users u ON u.id = nr.requester_user_id
+            LEFT JOIN niche_request_votes nrv
+                   ON nrv.niche_request_id = nr.id AND nrv.user_id = %s
+            WHERE nr.status IN ('pending', 'approved', 'processing', 'done')
+            ORDER BY
+                CASE WHEN nr.status = 'pending' THEN 0
+                     WHEN nr.status = 'approved' THEN 1
+                     WHEN nr.status = 'processing' THEN 2
+                     ELSE 3 END,
+                nr.votes DESC,
+                nr.created_at DESC
+        """, (user_id,))
+        rows = c.fetchall()
+
+    requests_list = []
+    for r in rows:
+        requests_list.append({
+            'id': r[0],
+            'niche': r[1],
+            'city': r[2],
+            'state': r[3],
+            'votes': r[4],
+            'status': r[5],
+            'created_at': r[6].isoformat() if r[6] else None,
+            'leads_added': r[7],
+            'requester_username': r[8],
+            'user_voted': r[9],
+        })
+
+    return jsonify({'requests': requests_list, 'total': len(requests_list)}), 200
+
+
+@app.route('/api/admin/niche-requests', methods=['GET'])
+@limiter.limit("30/minute")
+@require_role('admin')
+def admin_list_niche_requests():
+    """Admin: list all niche requests sorted by votes desc."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT nr.id, nr.niche, nr.city, nr.state, nr.votes, nr.status,
+                   nr.admin_notes, nr.leads_added,
+                   nr.created_at, nr.updated_at, nr.completed_at,
+                   u.username as requester_username
+            FROM niche_requests nr
+            JOIN users u ON u.id = nr.requester_user_id
+            ORDER BY nr.votes DESC, nr.created_at DESC
+        """)
+        rows = c.fetchall()
+
+    requests_list = []
+    for r in rows:
+        requests_list.append({
+            'id': r[0],
+            'niche': r[1],
+            'city': r[2],
+            'state': r[3],
+            'votes': r[4],
+            'status': r[5],
+            'admin_notes': r[6],
+            'leads_added': r[7],
+            'created_at': r[8].isoformat() if r[8] else None,
+            'updated_at': r[9].isoformat() if r[9] else None,
+            'completed_at': r[10].isoformat() if r[10] else None,
+            'requester_username': r[11],
+        })
+
+    pending_count = sum(1 for r in requests_list if r['status'] == 'pending')
+    return jsonify({'requests': requests_list, 'total': len(requests_list), 'pending_count': pending_count}), 200
+
+
+@app.route('/api/admin/niche-requests/<int:req_id>/approve', methods=['POST'])
+@limiter.limit("10/hour")
+@require_role('admin')
+def admin_approve_niche_request(req_id):
+    """Admin: approve a niche request and trigger background extraction."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT niche, city, state FROM niche_requests WHERE id = %s AND status = 'pending'",
+            (req_id,)
+        )
+        row = c.fetchone()
+        if not row:
+            return jsonify({'error': 'not_found_or_not_pending'}), 404
+        niche, city, state_val = row[0], row[1], row[2]
+        c.execute(
+            "UPDATE niche_requests SET status = 'processing', updated_at = NOW() WHERE id = %s",
+            (req_id,)
+        )
+
+    # Trigger extraction in background thread (daemon — same pattern as daily pipeline)
+    def _trigger_niche_extraction(req_id=req_id, niche=niche, city=city, state_val=state_val):
+        try:
+            print(f'[niche_request] Starting extraction for req_id={req_id} niche={niche} city={city}')
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute(
+                    "UPDATE niche_requests SET status = 'done', updated_at = NOW(), completed_at = NOW() WHERE id = %s",
+                    (req_id,)
+                )
+            print(f'[niche_request] Extraction completed for req_id={req_id}')
+        except Exception as e:
+            print(f'[niche_request] Error processing req_id={req_id}: {e}')
+            try:
+                with get_db() as conn:
+                    conn.cursor().execute(
+                        "UPDATE niche_requests SET status = 'pending', updated_at = NOW() WHERE id = %s AND status = 'processing'",
+                        (req_id,)
+                    )
+            except Exception:
+                pass
+
+    threading.Thread(target=_trigger_niche_extraction, daemon=True).start()
+
+    return jsonify({'status': 'processing', 'niche_request_id': req_id, 'niche': niche, 'city': city}), 200
+
+
+@app.route('/api/admin/niche-requests/<int:req_id>/reject', methods=['POST'])
+@limiter.limit("10/hour")
+@require_role('admin')
+def admin_reject_niche_request(req_id):
+    """Admin: reject a pending niche request."""
+    data = request.get_json(silent=True) or {}
+    admin_notes = (data.get('admin_notes') or '').strip() or None
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id FROM niche_requests WHERE id = %s AND status = 'pending'",
+            (req_id,)
+        )
+        if not c.fetchone():
+            return jsonify({'error': 'not_found_or_not_pending'}), 404
+        c.execute(
+            "UPDATE niche_requests SET status = 'rejected', admin_notes = %s, updated_at = NOW() WHERE id = %s",
+            (admin_notes, req_id)
+        )
+
+    return jsonify({'status': 'rejected', 'niche_request_id': req_id}), 200
+
+
+# ─── End Niche Request Queue ──────────────────────────────────────────────────
+
 @app.route('/api/leads/search', methods=['GET'])
 @limiter.limit("100/hour")
 def client_search_leads():
