@@ -162,6 +162,8 @@ Plans:
 - [x] 05-01-PLAN.md — Wave 0 test stubs + niche_requests/niche_request_votes DB tables + _generate_csv_bytes() + GET /api/client/leads/export
 - [x] 05-02-PLAN.md — POST/GET /api/client/niche-requests + GET/POST /api/admin/niche-requests (approve + reject) + activate Wave 0 test stubs
 - [x] 05-03-PLAN.md — ClientExportModal.tsx + portal.tsx export button + Sidebar nav item + /request-niche page + /admin/niche-requests page
+- [x] 05-04-PLAN.md — Gap closure: _trigger_niche_extraction wired to real search pipeline (process_search_job) + Fila de Nichos added to admin sidebar nav
+- [x] 05-05-PLAN.md — Gap closure: backend deployed to VPS, health check confirmed OK, Phase 5 endpoints live
 
 ---
 
@@ -212,7 +214,7 @@ Plans:
 
 [ ] Milestone 2 — Portal de Clientes
     [✓] Phase 4 — Reveal gate + créditos (3/3 plans complete)
-    [✓] Phase 5 — Export + niche requests (3/3 plans complete)
+    [✓] Phase 5 — Export + niche requests (5/5 plans complete, gaps closed, backend deployed)
     [ ] Phase 6 — Saved searches + notificações
 ```
 
@@ -227,4 +229,4 @@ Plans:
 
 ---
 
-*Last updated: 2026-03-24*
+*Last updated: 2026-03-24 — Phase 5 complete (5/5 plans, gaps closed, backend deployed)*
