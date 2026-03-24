@@ -2343,6 +2343,36 @@ def init_db():
     except Exception as e:
         print(f'[init_db] niche_requests tables warning: {e}')
 
+    # Phase 6: saved_searches table — client portal notification subscriptions
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS saved_searches (
+                    id               SERIAL PRIMARY KEY,
+                    user_id          INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    name             VARCHAR(100) NOT NULL,
+                    filters          JSONB NOT NULL DEFAULT '{}',
+                    notify_enabled   BOOLEAN DEFAULT TRUE,
+                    notify_email     VARCHAR(255),
+                    last_notified_at TIMESTAMPTZ,
+                    created_at       TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(user_id, name)
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_saved_searches_user
+                ON saved_searches(user_id)
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_saved_searches_notify
+                ON saved_searches(notify_enabled, last_notified_at)
+            """)
+            conn.commit()
+        print('[DB] saved_searches table ready')
+    except Exception as e:
+        print(f'[DB] saved_searches: {e}')
+
     with get_db() as conn:
         c = conn.cursor()
 
@@ -16124,6 +16154,31 @@ def admin_list_niche_requests():
 
     pending_count = sum(1 for r in requests_list if r['status'] == 'pending')
     return jsonify({'requests': requests_list, 'total': len(requests_list), 'pending_count': pending_count}), 200
+
+
+# Phase 6: Saved Searches — stub endpoints (Wave 0 auth gate only, full CRUD in Plan 02)
+@app.route('/api/client/saved-searches', methods=['GET', 'POST'])
+@limiter.limit("60/minute")
+def client_saved_searches():
+    """Saved searches: GET list, POST create. Auth required. Full impl in Plan 02."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    # Wave 0 stub: return 501 until Plan 02 implements full CRUD
+    return jsonify({'error': 'Not implemented yet — coming in Wave 1'}), 501
+
+
+@app.route('/api/client/saved-searches/<int:search_id>', methods=['DELETE', 'PATCH'])
+@limiter.limit("60/minute")
+def client_saved_search_detail(search_id):
+    """Saved search detail: DELETE, PATCH toggle. Auth required. Full impl in Plan 02."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    # Wave 0 stub: return 501 until Plan 02 implements full CRUD
+    return jsonify({'error': 'Not implemented yet — coming in Wave 1'}), 501
 
 
 @app.route('/api/admin/niche-requests/<int:req_id>/approve', methods=['POST'])
