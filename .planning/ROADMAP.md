@@ -156,6 +156,13 @@ Plans:
 
 **Dependencies**: Phase 4 (credit ledger já implementado)
 
+**Plans:** 3 plans
+
+Plans:
+- [ ] 05-01-PLAN.md — Wave 0 test stubs + niche_requests/niche_request_votes DB tables + _generate_csv_bytes() + GET /api/client/leads/export
+- [ ] 05-02-PLAN.md — POST/GET /api/client/niche-requests + GET/POST /api/admin/niche-requests (approve + reject) + activate Wave 0 test stubs
+- [ ] 05-03-PLAN.md — ClientExportModal.tsx + portal.tsx export button + Sidebar nav item + /request-niche page + /admin/niche-requests page
+
 ---
 
 ### Phase 6: Saved Searches + Notificações de Novos Leads
@@ -204,8 +211,8 @@ Plans:
     [✓] Phase 3 — Receita Federal + Outscraper + Prospeo (3/3 plans complete)
 
 [ ] Milestone 2 — Portal de Clientes
-    [ ] Phase 4 — Reveal gate + créditos (3 plans, ready to execute)
-    [ ] Phase 5 — Export + niche requests
+    [✓] Phase 4 — Reveal gate + créditos (3/3 plans complete)
+    [ ] Phase 5 — Export + niche requests (3 plans, ready to execute)
     [ ] Phase 6 — Saved searches + notificações
 ```
 
@@ -220,4 +227,4 @@ Plans:
 
 ---
 
-*Last updated: 2026-03-23*
+*Last updated: 2026-03-24*
