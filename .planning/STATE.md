@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-24T00:27:56.223Z"
+last_updated: "2026-03-24T00:35:01.359Z"
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 12
-  completed_plans: 10
+  completed_plans: 11
 ---
 
 # STATE.md — Project Memory
@@ -18,7 +18,7 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone 2 — Portal de Clientes
-- **Active phase**: Phase 4 — Tier Cliente + Reveal Gate + Busca Avançada (plan 01 complete — plan 02 next)
+- **Active phase**: Phase 4 — Tier Cliente + Reveal Gate + Busca Avançada (plans 01-02 complete — plan 03 next)
 - **Milestone 1**: COMPLETE (Phases 1-3 all done, 48/48 regression tests passing)
 - **Last completed**: Phase 3 COMPLETE — 48/48 regression tests passing. init_db transaction bug fixed (ADD COLUMN IF NOT EXISTS). Pipeline Autônomo + Qualidade + Fontes milestone delivered.
 
@@ -39,6 +39,7 @@ progress:
 | 2026-03-23 | Phase 3 Plan 02: Outscraper Google Maps — tools/outscraper AWS SM secret, _get_outscraper_key(), outscraper in requirements.txt, process_outscraper_massive() Thread 16, outscraper_maps wired into POST /api/search/massive (default methods + jobs + thread + response dict). 2/3 tests pass (3rd skips until real API key set). Deployed to VPS. |
 | 2026-03-23 | Phase 3 Plan 03: Prospeo LinkedIn enrichment — tools/prospeo AWS SM secret, _get_prospeo_key(), enrich_linkedin_prospeo(), POST /api/leads/<id>/enrich-linkedin (rate limit 30/hour), 75-credit cap in process_linkedin_massive(), Minha Receita docker-compose deploy guide in RECEITA_FEDERAL_IMPORT.md. 3/3 tests passing. Deployed to VPS. |
 | 2026-03-24 | Phase 4 Plan 01: DB foundation — role column on users, credits_per_month on plan_limits, credit_ledger table (BIGSERIAL, SELECT FOR UPDATE), user_lead_reveals table (PK user_id+lead_id), require_role() decorator, deduct_credit() atomic helper, grant_monthly_credits() APScheduler job (day=1 00:05 with double-fire guard), mask_email(), mask_phone(), portal_lead_to_dict(). /api/me returns role. 12 Wave 0 test stubs. 53 passed, 17 skipped. |
+| 2026-03-24 | Phase 4 Plan 02: Three client portal endpoints — POST /api/leads/reveal/<id> (atomic credit deduction, admin bypass, idempotent re-reveal, 402 on zero balance), GET /api/client/credits (balance + 20 event history), GET /api/leads/search (masked search over shared batches, 9 filter params, portal_lead_to_dict masking). 52 passed, 18 skipped. Deployed + VPS health check OK. |
 
 ## Research Available
 
@@ -90,6 +91,9 @@ progress:
 | ROLE_HIERARCHY uses integers (admin=3, operator=2, client=1) | Single >= comparison handles future role additions |
 | portal_lead_to_dict uses positional row indexing | Callers in plans 02/03 must SELECT columns in documented order |
 | grant_monthly_credits double-fire guard uses 5-min window | Same pattern as daily pipeline guard — consistent across schedulers |
+| reveal_lead() verifies lead exists before credit logic | Prevents credit deduction attempts for nonexistent leads — 404 check before any DB credit operations |
+| client_search_leads() delegates masking to portal_lead_to_dict() | Single source of truth for reveal state — no inline masking in endpoint |
+| quality_grade filter uses grade_order dict + = ANY(%s) | Cleaner than multiple OR conditions — allows A/B/C/D/F scale filtering at-or-better |
 
 ## Performance Metrics
 
@@ -106,8 +110,9 @@ progress:
 | 03-novas-fontes | 03 | ~6 min | 3/3 | 3 |
 | Phase 04-tier-cliente-reveal-gate-busca-avan-ada P01 | 12 | 2 tasks | 5 files |
 | 04-tier-cliente-reveal-gate-busca-avan-ada | 01 | ~12 min | 2/2 | 5 |
+| Phase 04-tier-cliente-reveal-gate-busca-avan-ada P02 | 4 | 2 tasks | 1 files |
 
 ## Last Session
 
-- **Stopped at**: Completed 04-tier-cliente-reveal-gate-busca-avan-ada/04-01-PLAN.md — DB foundation + RBAC + credit ledger helpers. 53 passed, 17 skipped, 0 failures.
+- **Stopped at**: Completed 04-tier-cliente-reveal-gate-busca-avan-ada/04-02-PLAN.md — three client portal endpoints (reveal_lead, client_credits, client_search_leads). 52 passed, 18 skipped, 0 failures. Deployed to VPS.
 - **Timestamp**: 2026-03-24
