@@ -16,6 +16,7 @@ import time
 import logging
 import logging.handlers
 import traceback
+import functools
 from urllib.parse import urlparse, urljoin, quote as requests_quote
 
 # ── Structured error logger for scraper ──────────────────────────────────────
@@ -2424,7 +2425,7 @@ def require_role(minimum_role):
     Usage: @require_role('admin') or @require_role('client')
     """
     def decorator(fn):
-        @wraps(fn)
+        @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             token = get_auth_header()
             user_id = verify_token(token)
