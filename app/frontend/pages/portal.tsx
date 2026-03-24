@@ -1,8 +1,10 @@
 import { useState, useCallback } from 'react'
-import { ChevronLeft, ChevronRight, Search as SearchIcon, Mail, Phone, Globe } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Search as SearchIcon, Mail, Phone, Globe, Download } from 'lucide-react'
 import api from '../lib/api'
 import { useClientCredits } from '../lib/useClientCredits'
 import { RevealButton } from '../components/RevealButton'
+import ClientExportModal from '../components/ClientExportModal'
+import UpgradeModal from '../components/UpgradeModal'
 
 interface PortalLead {
   id: number
@@ -65,6 +67,10 @@ export default function Portal() {
   const [searching, setSearching] = useState(false)
   const [searched, setSearched] = useState(false)
 
+  // Export/upgrade modal state
+  const [showExportModal, setShowExportModal] = useState(false)
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false)
+
   // Per-lead reveal loading state
   const [revealingId, setRevealingId] = useState<number | null>(null)
 
@@ -124,6 +130,18 @@ export default function Portal() {
   }, [refetchCredits])
 
   const GRADES = ['A', 'B', 'C', 'D', 'F']
+
+  // Computed filters object — same params as handleSearch uses
+  const currentFilters: Record<string, string | boolean | number> = {}
+  if (category) currentFilters.category = category
+  if (city) currentFilters.city = city
+  if (state) currentFilters.state = state
+  if (qualityGrade) currentFilters.quality_grade = qualityGrade
+  if (hasEmail) currentFilters.has_email = true
+  if (hasPhone) currentFilters.has_phone = true
+  if (hasWhatsapp) currentFilters.has_whatsapp = true
+  if (hasWebsite) currentFilters.has_website = true
+  if (hasCnpj) currentFilters.has_cnpj = true
 
   return (
     <div className="flex gap-6 h-full animate-fade-in">
@@ -225,11 +243,22 @@ export default function Portal() {
       <main className="flex-1 min-w-0">
         <div className="flex items-center justify-between mb-4">
           <h1 className="text-xl font-bold text-gray-900 dark:text-white">Portal de Leads</h1>
-          {!creditsLoading && balance !== null && (
-            <span className="text-sm text-gray-500 dark:text-gray-400">
-              <span className="font-bold text-blue-600 dark:text-blue-400 tabular-nums">{balance}</span> créditos disponíveis
-            </span>
-          )}
+          <div className="flex items-center gap-3">
+            {!creditsLoading && balance !== null && (
+              <span className="text-sm text-gray-500 dark:text-gray-400">
+                <span className="font-bold text-blue-600 dark:text-blue-400 tabular-nums">{balance}</span> créditos disponíveis
+              </span>
+            )}
+            {leads.length > 0 && (
+              <button
+                onClick={() => setShowExportModal(true)}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-lg transition-colors"
+              >
+                <Download className="w-4 h-4" />
+                Exportar
+              </button>
+            )}
+          </div>
         </div>
 
         {!searched && !searching && (
@@ -350,6 +379,25 @@ export default function Portal() {
           </>
         )}
       </main>
+
+      {showExportModal && (
+        <ClientExportModal
+          filters={currentFilters}
+          leadsCount={total}
+          creditBalance={balance}
+          onClose={() => setShowExportModal(false)}
+          onInsufficientCredits={() => {
+            setShowExportModal(false)
+            setShowUpgradeModal(true)
+          }}
+          onExportSuccess={(_count, _remaining) => {
+            refetchCredits()
+          }}
+        />
+      )}
+      {showUpgradeModal && (
+        <UpgradeModal onClose={() => setShowUpgradeModal(false)} reason="export" />
+      )}
     </div>
   )
 }
