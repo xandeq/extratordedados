@@ -54,3 +54,20 @@ def auth_token(api_base, credentials):
 @pytest.fixture(scope="session")
 def auth_headers(auth_token):
     return {"Authorization": f"Bearer {auth_token}"}
+
+
+@pytest.fixture(scope="session")
+def client_token(api_base, credentials):
+    """Get auth token for a test client user (role='client')."""
+    import requests
+    client_pass = credentials.get("CLIENT_TEST_PASSWORD", "")
+    if not client_pass:
+        pytest.skip("CLIENT_TEST_PASSWORD not available in AWS SM — client tests require a seeded test user")
+    resp = requests.post(
+        f"{api_base}/api/login",
+        json={"username": "test_client", "password": client_pass},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        pytest.skip(f"Client login failed (test_client user may not exist yet): {resp.text}")
+    return resp.json()["token"]
