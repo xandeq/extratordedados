@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: in_progress
-last_updated: "2026-03-24T12:00:00.000Z"
+status: unknown
+last_updated: "2026-03-24T14:47:07.658Z"
 progress:
   total_phases: 6
   completed_phases: 5
-  total_plans: 17
-  completed_plans: 17
+  total_plans: 20
+  completed_plans: 18
 ---
 
 # STATE.md — Project Memory
@@ -18,10 +18,10 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone 2 — Portal de Clientes
-- **Active phase**: Phase 6 — Phase 5 COMPLETE (all 5 plans done, gaps closed, backend deployed, human verification APPROVED)
-- **Milestone 2**: Phase 5 COMPLETE — export com cotas + niche request queue fully operational, _trigger_niche_extraction wired to real search pipeline, admin sidebar nav updated
+- **Active phase**: Phase 6 — Plan 01 COMPLETE (Wave 0: saved_searches table, test scaffold, helpers deployed)
+- **Milestone 2**: Phase 5 COMPLETE — export com cotas + niche request queue fully operational. Phase 6 Plan 01 COMPLETE — Wave 0 foundation done.
 - **Milestone 1**: COMPLETE (Phases 1-3 all done, 48/48 regression tests passing)
-- **Last completed**: Phase 5 COMPLETE — all 5 plans done including gap closure plans 04 (_trigger_niche_extraction wired) and 05 (backend deployed). Human verification APPROVED.
+- **Last completed**: Phase 6 Plan 01 — saved_searches DB migration, test scaffold (1 pass 5 skip), _build_portal_filter_query(), send_notification_email(), stub endpoints deployed to VPS.
 
 ## Completed Work
 
@@ -42,6 +42,7 @@ progress:
 | 2026-03-24 | Phase 4 Plan 01: DB foundation — role column on users, credits_per_month on plan_limits, credit_ledger table (BIGSERIAL, SELECT FOR UPDATE), user_lead_reveals table (PK user_id+lead_id), require_role() decorator, deduct_credit() atomic helper, grant_monthly_credits() APScheduler job (day=1 00:05 with double-fire guard), mask_email(), mask_phone(), portal_lead_to_dict(). /api/me returns role. 12 Wave 0 test stubs. 53 passed, 17 skipped. |
 | 2026-03-24 | Phase 4 Plan 02: Three client portal endpoints — POST /api/leads/reveal/<id> (atomic credit deduction, admin bypass, idempotent re-reveal, 402 on zero balance), GET /api/client/credits (balance + 20 event history), GET /api/leads/search (masked search over shared batches, 9 filter params, portal_lead_to_dict masking). 52 passed, 18 skipped. Deployed + VPS health check OK. |
 | 2026-03-24 | Phase 4 Plan 03: Client portal frontend — /portal page (filter panel + masked results + RevealButton), useClientCredits hook, RevealButton (4 states), Sidebar Portal nav + CreditBalance widget, plans.tsx credits row. TypeScript clean, Next.js build OK, 56 passed, 9 skipped. Frontend deployed. Human verification APPROVED. |
+| 2026-03-24 | Phase 6 Plan 01: Wave 0 — saved_searches table (DDL + 2 indexes), test scaffold (1 pass 5 skip), stub endpoints /api/client/saved-searches (auth gate), _build_portal_filter_query() helper, send_notification_email() via Brevo. Deployed to VPS. |
 
 ## Research Available
 
@@ -106,6 +107,8 @@ progress:
 | _trigger_niche_extraction uses simplified done-immediately pattern | Actual search integration deferred to future plan — keeps approve endpoint functional without wiring to massive search |
 | Use process_search_job (not process_search_engines_massive) for niche extraction | Correct function name in app.py for search engines thread — plan had wrong name in interfaces block |
 | _trigger_niche_extraction creates batch + 3 search_jobs then calls process_search_job blocking | leads_added persisted to niche_requests row after extraction completes |
+| Wave 0 stub endpoints return 401/501 | Enables auth guard test to pass immediately while deferring full CRUD to Plan 02 |
+| _build_portal_filter_query returns (conditions, params) tuple | Shared by client_search_leads and future notification scheduler — caller joins conditions |
 
 ## Performance Metrics
 
@@ -130,8 +133,9 @@ progress:
 | Phase 05-export-com-cotas-niche-request-queue P03 | 15 | 3 tasks | 5 files |
 | Phase 05-export-com-cotas-niche-request-queue P04 | 5 | 2 tasks | 2 files |
 | Phase 05-export-com-cotas-niche-request-queue P05 | 6 | 1 tasks | 1 files |
+| Phase 06 P01 | 11 | 2 tasks | 2 files |
 
 ## Last Session
 
-- **Stopped at**: Phase 05 fully closed — all 5 plans complete, gaps closed, backend deployed, human verification APPROVED. Next: Phase 06 — Saved Searches + Notificacoes.
+- **Stopped at**: Completed Phase 06 Plan 01 — Wave 0 foundation done. Next: Phase 06 Plan 02 — full CRUD endpoints for saved searches.
 - **Timestamp**: 2026-03-24
