@@ -59,7 +59,7 @@ completed: 2026-03-24
 - **Duration:** ~15 min
 - **Started:** 2026-03-24T10:38:25Z
 - **Completed:** 2026-03-24T10:53:00Z
-- **Tasks:** 2 auto + 1 checkpoint (human-verify pending)
+- **Tasks:** 2 auto + 1 checkpoint (human-verify APPROVED)
 - **Files modified:** 5
 
 ## Accomplishments
@@ -106,9 +106,9 @@ None — all components are wired to real API endpoints from Plans 01/02.
 
 ## Next Phase Readiness
 
-- Human verification checkpoint pending (Task 3): visit portal, verify export button + modal flow, check Solicitar Nicho link + page, verify admin/niche-requests table
-- Frontend deploy needed after checkpoint approval: `python deploy.py frontend`
-- All Phase 5 features (export + niche requests) are now in the frontend
+- Human verification APPROVED (Task 3): all 4 flows verified — portal export button + modal + file download, Solicitar Nicho nav item, /request-niche form + vote list, /admin/niche-requests table with Aprovar/Rejeitar
+- Phase 5 COMPLETE — all 3 plans done: export endpoints (Plan 01), niche request endpoints (Plan 02), frontend UI (Plan 03)
+- Ready for Phase 6: Saved Searches + Notificações de Novos Leads
 
 ---
 *Phase: 05-export-com-cotas-niche-request-queue*

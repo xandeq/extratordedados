@@ -212,7 +212,7 @@ Plans:
 
 [ ] Milestone 2 — Portal de Clientes
     [✓] Phase 4 — Reveal gate + créditos (3/3 plans complete)
-    [ ] Phase 5 — Export + niche requests (3 plans, ready to execute)
+    [✓] Phase 5 — Export + niche requests (3/3 plans complete)
     [ ] Phase 6 — Saved searches + notificações
 ```
 
