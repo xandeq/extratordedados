@@ -2258,6 +2258,49 @@ def init_db():
         c.execute("UPDATE batches SET is_shared = TRUE WHERE is_shared IS NULL")
         c.execute('CREATE INDEX IF NOT EXISTS idx_batches_is_shared ON batches(is_shared)')
 
+        # Phase 4: Role column on users
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'client'")
+        except Exception as _e:
+            print(f"[init_db] ADD COLUMN role: {_e}")
+            conn.rollback()
+
+        # Phase 4: credits_per_month on plan_limits
+        try:
+            c.execute("ALTER TABLE plan_limits ADD COLUMN IF NOT EXISTS credits_per_month INTEGER DEFAULT 0")
+        except Exception as _e:
+            print(f"[init_db] ADD COLUMN credits_per_month: {_e}")
+            conn.rollback()
+
+        # Phase 4: Backfill role='admin' for existing admin users
+        c.execute("UPDATE users SET role = 'admin' WHERE is_admin = TRUE AND role = 'client'")
+
+        # Phase 4: Seed credits_per_month per plan (idempotent)
+        c.execute("UPDATE plan_limits SET credits_per_month = 10 WHERE plan_name = 'free' AND credits_per_month = 0")
+        c.execute("UPDATE plan_limits SET credits_per_month = 200 WHERE plan_name = 'pro' AND credits_per_month = 0")
+        c.execute("UPDATE plan_limits SET credits_per_month = 999999 WHERE plan_name = 'enterprise' AND credits_per_month = 0")
+
+        # Phase 4: credit_ledger table
+        c.execute('''CREATE TABLE IF NOT EXISTS credit_ledger (
+            id BIGSERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            amount INTEGER NOT NULL,
+            operation VARCHAR(30) NOT NULL,
+            ref_id INTEGER,
+            balance_after INTEGER NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_credit_ledger_user ON credit_ledger(user_id, id DESC)')
+
+        # Phase 4: user_lead_reveals table
+        c.execute('''CREATE TABLE IF NOT EXISTS user_lead_reveals (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+            revealed_at TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (user_id, lead_id)
+        )''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_user_lead_reveals_user ON user_lead_reveals(user_id)')
+
         # Insert admin user if not exists
         c.execute('SELECT id FROM users WHERE username = %s', (ADMIN_USERNAME,))
         if not c.fetchone():
@@ -2326,6 +2369,188 @@ def get_auth_header():
     if auth.startswith('Bearer '):
         return auth[7:]
     return None
+
+# ============= Phase 4: RBAC + Credit Helpers =============
+
+ROLE_HIERARCHY = {'admin': 3, 'operator': 2, 'client': 1}
+
+def require_role(minimum_role):
+    """Decorator: ensures authenticated user has at minimum the given role.
+    Also accepts is_admin=True as equivalent to role='admin' for backward compat.
+    Usage: @require_role('admin') or @require_role('client')
+    """
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            token = get_auth_header()
+            user_id = verify_token(token)
+            if not user_id:
+                return jsonify({'error': 'Unauthorized'}), 401
+            with get_db() as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT role, is_admin FROM users WHERE id = %s', (user_id,))
+                row = cur.fetchone()
+                user_role = row[0] if row else 'client'
+                user_is_admin = row[1] if row else False
+            # Backward compat: is_admin=True always grants admin-level access
+            if user_is_admin:
+                user_role = 'admin'
+            if ROLE_HIERARCHY.get(user_role, 0) < ROLE_HIERARCHY.get(minimum_role, 999):
+                return jsonify({'error': 'forbidden', 'required_role': minimum_role}), 403
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def deduct_credit(conn, user_id, operation, ref_id=None):
+    """Atomically deduct 1 credit using SELECT FOR UPDATE.
+    Must be called inside an open transaction (with conn: block).
+    Returns (success: bool, new_balance: int).
+    On success: inserts deduction row in credit_ledger.
+    On failure (balance < 1): returns (False, current_balance) — caller returns 402.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, balance_after FROM credit_ledger
+        WHERE user_id = %s ORDER BY id DESC LIMIT 1
+        FOR UPDATE
+    """, (user_id,))
+    row = cur.fetchone()
+    balance = row[1] if row else 0
+
+    if balance < 1:
+        return False, balance
+
+    new_balance = balance - 1
+    cur.execute("""
+        INSERT INTO credit_ledger (user_id, amount, operation, ref_id, balance_after)
+        VALUES (%s, -1, %s, %s, %s)
+    """, (user_id, operation, ref_id, new_balance))
+    return True, new_balance
+
+
+def grant_monthly_credits():
+    """APScheduler job: runs at 00:05 on the 1st of every month (America/Sao_Paulo).
+    Grants each active user their plan's credits_per_month credit allocation.
+    Double-fire guard: checks credit_ledger for a monthly_grant event in last 5 minutes.
+    """
+    print('[SCHEDULER] grant_monthly_credits: iniciando concessão mensal de créditos...')
+    # Double-fire guard (2 Gunicorn workers may both fire)
+    try:
+        guard_conn = psycopg2.connect(**DB_CONFIG)
+        guard_cur = guard_conn.cursor()
+        guard_cur.execute("""
+            SELECT COUNT(*) FROM credit_ledger
+            WHERE operation = 'monthly_grant'
+              AND created_at > NOW() - INTERVAL '5 minutes'
+        """)
+        recent = guard_cur.fetchone()[0]
+        guard_conn.close()
+        if recent > 0:
+            print('[SCHEDULER] grant_monthly_credits: double-fire detectado, abortando.')
+            return
+    except Exception as _e:
+        print(f'[SCHEDULER] grant_monthly_credits: erro no guard: {_e}')
+        return
+
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        # Fetch all users with their plan's credit allocation
+        cur.execute("""
+            SELECT u.id, COALESCE(pl.credits_per_month, 0)
+            FROM users u
+            LEFT JOIN plan_limits pl ON u.plan = pl.plan_name
+            WHERE COALESCE(pl.credits_per_month, 0) > 0
+        """)
+        rows = cur.fetchall()
+        granted = 0
+        for uid, credits_to_grant in rows:
+            try:
+                # Get current balance
+                cur.execute(
+                    'SELECT balance_after FROM credit_ledger WHERE user_id = %s ORDER BY id DESC LIMIT 1',
+                    (uid,)
+                )
+                bal_row = cur.fetchone()
+                current_balance = bal_row[0] if bal_row else 0
+                new_balance = current_balance + credits_to_grant
+                cur.execute("""
+                    INSERT INTO credit_ledger (user_id, amount, operation, ref_id, balance_after)
+                    VALUES (%s, %s, 'monthly_grant', NULL, %s)
+                """, (uid, credits_to_grant, new_balance))
+                granted += 1
+            except Exception as _ue:
+                print(f'[SCHEDULER] grant_monthly_credits: erro para user {uid}: {_ue}')
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+        conn.commit()
+        conn.close()
+        print(f'[SCHEDULER] grant_monthly_credits: {granted} usuários receberam créditos.')
+    except Exception as e:
+        print(f'[SCHEDULER] grant_monthly_credits: erro geral: {e}')
+
+
+def mask_email(email):
+    """Mask email for client portal. Example: john@gmail.com -> jo***@gmail.com
+    Returns None if email is None or empty.
+    """
+    if not email:
+        return None
+    if '@' not in email:
+        return email[:2] + '***'
+    local, domain = email.split('@', 1)
+    shown = local[:2] if len(local) >= 2 else local[0]
+    return f"{shown}***@{domain}"
+
+
+def mask_phone(phone):
+    """Mask phone for client portal. Example: 27987655678 -> 279****5678
+    Returns None if phone is None or fewer than 6 chars.
+    Pattern: first 3 chars + '****' + last 4 chars.
+    """
+    if not phone or len(phone) < 6:
+        return None
+    return phone[:3] + '****' + phone[-4:]
+
+
+def portal_lead_to_dict(row, revealed=False):
+    """Serialize a lead row for the client portal response.
+    row columns (positional): id, company_name, city, state, category,
+                               email, phone, whatsapp, website, cnpj,
+                               lead_score, quality_grade, source, captured_at
+    NEVER exposes: crm_status, notes, batch_id, tags (internal operator fields).
+    Returns masked values by default; unmasked if revealed=True.
+    """
+    lead_id, company_name, city, state, category = row[0], row[1], row[2], row[3], row[4]
+    email, phone, whatsapp, website, cnpj = row[5], row[6], row[7], row[8], row[9]
+    lead_score, quality_grade, source, captured_at = row[10], row[11], row[12], row[13]
+
+    return {
+        'id': lead_id,
+        'company_name': company_name,
+        'city': city,
+        'state': state,
+        'category': category,
+        'email': email if revealed else mask_email(email),
+        'phone': phone if revealed else mask_phone(phone),
+        'whatsapp': whatsapp if revealed else mask_phone(whatsapp),
+        'website': website,  # not gated — not sensitive per spec
+        'cnpj': cnpj if revealed else (cnpj[:4] + '****' if cnpj else None),
+        'lead_score': lead_score,
+        'quality_grade': quality_grade,
+        'source': source,
+        'captured_at': captured_at.isoformat() if captured_at else None,
+        'has_email': email is not None and email != '',
+        'has_phone': phone is not None and phone != '',
+        'has_whatsapp': whatsapp is not None and whatsapp != '',
+        'has_website': website is not None and website != '',
+        'has_cnpj': cnpj is not None and cnpj != '',
+        'revealed': revealed,
+    }
+
 
 # ============= Email Normalization =============
 
@@ -5377,7 +5602,7 @@ def get_me():
             return jsonify({'error': 'Unauthorized'}), 401
         with get_db() as conn:
             c = conn.cursor()
-            c.execute('SELECT id, username, is_admin, plan FROM users WHERE id = %s', (user_id,))
+            c.execute('SELECT id, username, is_admin, plan, role FROM users WHERE id = %s', (user_id,))
             row = c.fetchone()
             if not row:
                 return jsonify({'error': 'User not found'}), 404
@@ -5385,7 +5610,8 @@ def get_me():
                 'id': row[0],
                 'username': row[1],
                 'is_admin': row[2],
-                'plan': row[3]
+                'plan': row[3],
+                'role': row[4] if row[4] else ('admin' if row[2] else 'client')
             }), 200
     except Exception as e:
         print(f'[ERROR] /api/me: {e}')
@@ -16138,10 +16364,18 @@ try:
             replace_existing=True
         )
 
+        _scheduler.add_job(
+            grant_monthly_credits,
+            CronTrigger(day=1, hour=0, minute=5, timezone=_tz),
+            id='monthly_credit_grant',
+            replace_existing=True
+        )
+
         _scheduler.start()
         print(f"[SCHEDULER] Pipeline diário agendado: {DAILY_JOB_HOUR:02d}:00 America/Sao_Paulo")
         print(f"[SCHEDULER] CRM sync diário agendado: {DAILY_CRM_SYNC_HOUR:02d}:00 America/Sao_Paulo")
         print(f"[SCHEDULER] Manutenção semanal agendada: Domingo 03:30 America/Sao_Paulo")
+        print("[SCHEDULER] Concessão mensal de créditos agendada: dia 1 às 00:05 America/Sao_Paulo")
     else:
         print("[SCHEDULER] APScheduler indisponível — instale: pip install APScheduler pytz")
 except Exception as _sched_err:
