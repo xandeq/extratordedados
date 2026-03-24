@@ -17,6 +17,7 @@ import {
   TrendingUp,
   Shield,
   BookMarked,
+  MessageSquarePlus,
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import api from '../lib/api'
@@ -27,6 +28,7 @@ const clientNavItems = [
   { href: '/portal', label: 'Portal de Leads', icon: BookMarked },
   { href: '/leads', label: 'Leads', icon: Database },
   { href: '/plans', label: 'Planos', icon: Zap },
+  { href: '/request-niche', label: 'Solicitar Nicho', icon: MessageSquarePlus },
 ]
 
 const adminNavItems = [
@@ -185,7 +187,7 @@ export default function Sidebar({ isOpen = true, onClose }: SidebarProps) {
 
   const isActive = (href: string) => {
     // exact match for root-like admin pages to avoid /admin matching /admin/users
-    if (href === '/admin' || href === '/dashboard' || href === '/leads' || href === '/plans' || href === '/portal') {
+    if (href === '/admin' || href === '/dashboard' || href === '/leads' || href === '/plans' || href === '/portal' || href === '/request-niche') {
       return router.pathname === href
     }
     return router.pathname.startsWith(href)
