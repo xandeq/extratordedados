@@ -97,4 +97,4 @@ Este documento evolui a cada fase completada.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-03-23 after Phase 2 completion*
+*Last updated: 2026-03-24 after Phase 6 completion — saved searches + email notifications live*
