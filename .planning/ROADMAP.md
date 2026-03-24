@@ -174,12 +174,19 @@ Plans:
 **Value delivered**: Clientes voltam toda semana sem precisar lembrar de entrar no sistema.
 
 **Scope**:
-- Tabela `saved_searches` (user_id, name, filters JSONB, last_notified_at)
-- `POST/GET/DELETE /api/client/saved-searches`
+- Tabela `saved_searches` (user_id, name, filters JSONB, last_notified_at, notify_email)
+- `POST/GET/DELETE/PATCH /api/client/saved-searches`
 - APScheduler job 08:00 — detecta novos leads por filtro, envia email via Brevo
 - Frontend: "Salvar Busca", página `/saved-searches` com toggle de notificação
 
 **Dependencies**: Phase 5 (busca avançada funcionando)
+
+**Plans:** 3 plans
+
+Plans:
+- [ ] 06-01-PLAN.md — Wave 0 test stubs + saved_searches DB migration + _build_portal_filter_query() extracted + send_notification_email()
+- [ ] 06-02-PLAN.md — POST/GET/DELETE/PATCH /api/client/saved-searches + trigger_saved_search_notifications APScheduler job + activate all 6 tests
+- [ ] 06-03-PLAN.md — saved-searches.tsx page + Sidebar nav link + portal.tsx "Salvar Busca" button + modal + frontend deploy
 
 ---
 
