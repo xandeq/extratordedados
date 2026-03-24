@@ -181,11 +181,11 @@ Plans:
 
 **Dependencies**: Phase 5 (busca avançada funcionando)
 
-**Plans:** 1/3 plans executed
+**Plans:** 2/3 plans executed
 
 Plans:
 - [x] 06-01-PLAN.md — Wave 0 test stubs + saved_searches DB migration + _build_portal_filter_query() extracted + send_notification_email()
-- [ ] 06-02-PLAN.md — POST/GET/DELETE/PATCH /api/client/saved-searches + trigger_saved_search_notifications APScheduler job + activate all 6 tests
+- [x] 06-02-PLAN.md — POST/GET/DELETE/PATCH /api/client/saved-searches + trigger_saved_search_notifications APScheduler job + activate all 6 tests
 - [ ] 06-03-PLAN.md — saved-searches.tsx page + Sidebar nav link + portal.tsx "Salvar Busca" button + modal + frontend deploy
 
 ---

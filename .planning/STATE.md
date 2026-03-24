@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-24T14:47:07.658Z"
+last_updated: "2026-03-24T15:06:06.273Z"
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 20
-  completed_plans: 18
+  completed_plans: 19
 ---
 
 # STATE.md — Project Memory
@@ -18,10 +18,10 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone 2 — Portal de Clientes
-- **Active phase**: Phase 6 — Plan 01 COMPLETE (Wave 0: saved_searches table, test scaffold, helpers deployed)
-- **Milestone 2**: Phase 5 COMPLETE — export com cotas + niche request queue fully operational. Phase 6 Plan 01 COMPLETE — Wave 0 foundation done.
+- **Active phase**: Phase 6 — Plan 02 COMPLETE (Wave 1: 4 CRUD endpoints + APScheduler notification job)
+- **Milestone 2**: Phase 5 COMPLETE — export com cotas + niche request queue fully operational. Phase 6 Plan 02 COMPLETE — full CRUD + scheduler deployed.
 - **Milestone 1**: COMPLETE (Phases 1-3 all done, 48/48 regression tests passing)
-- **Last completed**: Phase 6 Plan 01 — saved_searches DB migration, test scaffold (1 pass 5 skip), _build_portal_filter_query(), send_notification_email(), stub endpoints deployed to VPS.
+- **Last completed**: Phase 6 Plan 02 — 4 REST endpoints (POST/GET/DELETE/PATCH /api/client/saved-searches), trigger_saved_search_notifications APScheduler job at 08:00 BRT, all 6 tests activated (1 pass 5 skip), deployed to VPS.
 
 ## Completed Work
 
@@ -43,6 +43,7 @@ progress:
 | 2026-03-24 | Phase 4 Plan 02: Three client portal endpoints — POST /api/leads/reveal/<id> (atomic credit deduction, admin bypass, idempotent re-reveal, 402 on zero balance), GET /api/client/credits (balance + 20 event history), GET /api/leads/search (masked search over shared batches, 9 filter params, portal_lead_to_dict masking). 52 passed, 18 skipped. Deployed + VPS health check OK. |
 | 2026-03-24 | Phase 4 Plan 03: Client portal frontend — /portal page (filter panel + masked results + RevealButton), useClientCredits hook, RevealButton (4 states), Sidebar Portal nav + CreditBalance widget, plans.tsx credits row. TypeScript clean, Next.js build OK, 56 passed, 9 skipped. Frontend deployed. Human verification APPROVED. |
 | 2026-03-24 | Phase 6 Plan 01: Wave 0 — saved_searches table (DDL + 2 indexes), test scaffold (1 pass 5 skip), stub endpoints /api/client/saved-searches (auth gate), _build_portal_filter_query() helper, send_notification_email() via Brevo. Deployed to VPS. |
+| 2026-03-24 | Phase 6 Plan 02: Wave 1 — 4 REST CRUD endpoints (POST upsert, GET list, DELETE owner-guarded, PATCH toggle), trigger_saved_search_notifications APScheduler job (08:00 BRT, double-fire guard, 23h re-send prevention), all 6 tests activated. Deployed to VPS. |
 
 ## Research Available
 
@@ -109,6 +110,9 @@ progress:
 | _trigger_niche_extraction creates batch + 3 search_jobs then calls process_search_job blocking | leads_added persisted to niche_requests row after extraction completes |
 | Wave 0 stub endpoints return 401/501 | Enables auth guard test to pass immediately while deferring full CRUD to Plan 02 |
 | _build_portal_filter_query returns (conditions, params) tuple | Shared by client_search_leads and future notification scheduler — caller joins conditions |
+| 4 separate endpoint functions instead of 2 combined handlers | Clearer route dispatch, easier to test and read individually |
+| test_notification_email_format skips if DB_HOST not set | Flask monolith import hangs in local dev — skip guard prevents infinite hang without losing test value |
+| Double-fire guard in notification scheduler uses last_notified_at 10-min window | No separate lock table needed — consistent pattern with last_notified_at semantics |
 
 ## Performance Metrics
 
@@ -134,8 +138,9 @@ progress:
 | Phase 05-export-com-cotas-niche-request-queue P04 | 5 | 2 tasks | 2 files |
 | Phase 05-export-com-cotas-niche-request-queue P05 | 6 | 1 tasks | 1 files |
 | Phase 06 P01 | 11 | 2 tasks | 2 files |
+| Phase 06-saved-searches-notifica-es-de-novos-leads P02 | 15 | 2 tasks | 2 files |
 
 ## Last Session
 
-- **Stopped at**: Completed Phase 06 Plan 01 — Wave 0 foundation done. Next: Phase 06 Plan 02 — full CRUD endpoints for saved searches.
+- **Stopped at**: Completed Phase 06 Plan 02 — 4 CRUD endpoints + APScheduler notification job deployed. Next: Phase 06 Plan 03 (if exists) or Phase 6 complete.
 - **Timestamp**: 2026-03-24
