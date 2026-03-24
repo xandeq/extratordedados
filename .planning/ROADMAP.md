@@ -156,7 +156,7 @@ Plans:
 
 **Dependencies**: Phase 4 (credit ledger já implementado)
 
-**Plans:** 3/3 plans complete
+**Plans:** 4/5 plans executed
 
 Plans:
 - [x] 05-01-PLAN.md — Wave 0 test stubs + niche_requests/niche_request_votes DB tables + _generate_csv_bytes() + GET /api/client/leads/export

@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-24T11:00:30.069Z"
+last_updated: "2026-03-24T11:25:17.152Z"
 progress:
   total_phases: 6
-  completed_phases: 5
-  total_plans: 15
-  completed_plans: 15
+  completed_phases: 4
+  total_plans: 17
+  completed_plans: 16
 ---
 
 # STATE.md — Project Memory
@@ -104,6 +104,8 @@ progress:
 | Boolean filter conditions for has_email etc use inline SQL (no %s params) | Prevents psycopg2 parameter binding mismatch — inline NULL checks are equivalent |
 | GET /api/client/niche-requests returns all pending/approved/processing/done (not just own) | More useful for a vote list UI — clients see all active requests, not just theirs |
 | _trigger_niche_extraction uses simplified done-immediately pattern | Actual search integration deferred to future plan — keeps approve endpoint functional without wiring to massive search |
+| Use process_search_job (not process_search_engines_massive) for niche extraction | Correct function name in app.py for search engines thread — plan had wrong name in interfaces block |
+| _trigger_niche_extraction creates batch + 3 search_jobs then calls process_search_job blocking | leads_added persisted to niche_requests row after extraction completes |
 
 ## Performance Metrics
 
@@ -126,8 +128,9 @@ progress:
 | Phase 05-export-com-cotas-niche-request-queue P01 | 10 | 2 tasks | 3 files |
 | Phase 05-export-com-cotas-niche-request-queue P02 | 8 | 2 tasks | 3 files |
 | Phase 05-export-com-cotas-niche-request-queue P03 | 15 | 3 tasks | 5 files |
+| Phase 05-export-com-cotas-niche-request-queue P04 | 5 | 2 tasks | 2 files |
 
 ## Last Session
 
-- **Stopped at**: Completed 05-03-PLAN.md — Phase 5 Plan 03 COMPLETE. Human verification APPROVED (all 4 flows verified). Phase 5 fully done. Ready for Phase 6.
+- **Stopped at**: Completed 05-04-PLAN.md — gap closure: _trigger_niche_extraction wired to real search pipeline + Fila de Nichos added to admin sidebar nav.
 - **Timestamp**: 2026-03-24
