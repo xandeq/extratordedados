@@ -16209,29 +16209,168 @@ def admin_list_niche_requests():
     return jsonify({'requests': requests_list, 'total': len(requests_list), 'pending_count': pending_count}), 200
 
 
-# Phase 6: Saved Searches — stub endpoints (Wave 0 auth gate only, full CRUD in Plan 02)
-@app.route('/api/client/saved-searches', methods=['GET', 'POST'])
+# ── Saved Searches (Phase 6) ─────────────────────────────────────────────────
+
+@app.route('/api/client/saved-searches', methods=['POST'])
 @limiter.limit("60/minute")
-def client_saved_searches():
-    """Saved searches: GET list, POST create. Auth required. Full impl in Plan 02."""
+def create_saved_search():
+    """Create or upsert a saved search for the authenticated user."""
     token = get_auth_header()
-    user_id = verify_token(token)
-    if not user_id:
+    user = verify_token(token)
+    if not user:
         return jsonify({'error': 'Unauthorized'}), 401
-    # Wave 0 stub: return 501 until Plan 02 implements full CRUD
-    return jsonify({'error': 'Not implemented yet — coming in Wave 1'}), 501
+    user_id = user['id']
+
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    filters = data.get('filters') or {}
+    notify_enabled = bool(data.get('notify_enabled', True))
+    notify_email = (data.get('notify_email') or '').strip() or None
+
+    if not name:
+        return jsonify({'error': 'name is required'}), 400
+    if not isinstance(filters, dict):
+        return jsonify({'error': 'filters must be an object'}), 400
+
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO saved_searches (user_id, name, filters, notify_enabled, notify_email)
+                VALUES (%s, %s, %s::jsonb, %s, %s)
+                ON CONFLICT (user_id, name) DO UPDATE SET
+                    filters = EXCLUDED.filters,
+                    notify_enabled = EXCLUDED.notify_enabled,
+                    notify_email = COALESCE(EXCLUDED.notify_email, saved_searches.notify_email)
+                RETURNING id, name, filters, notify_enabled, notify_email, last_notified_at, created_at
+            """, (user_id, name, json.dumps(filters), notify_enabled, notify_email))
+            row = cur.fetchone()
+            conn.commit()
+            return jsonify({
+                'id': row[0], 'name': row[1], 'filters': row[2],
+                'notify_enabled': row[3], 'notify_email': row[4],
+                'last_notified_at': row[5].isoformat() if row[5] else None,
+                'created_at': row[6].isoformat() if row[6] else None,
+            }), 201
+    except Exception as e:
+        print(f'[API] create_saved_search erro: {e}')
+        return jsonify({'error': 'internal error'}), 500
 
 
-@app.route('/api/client/saved-searches/<int:search_id>', methods=['DELETE', 'PATCH'])
+@app.route('/api/client/saved-searches', methods=['GET'])
 @limiter.limit("60/minute")
-def client_saved_search_detail(search_id):
-    """Saved search detail: DELETE, PATCH toggle. Auth required. Full impl in Plan 02."""
+def list_saved_searches():
+    """List all saved searches for the authenticated user."""
     token = get_auth_header()
-    user_id = verify_token(token)
-    if not user_id:
+    user = verify_token(token)
+    if not user:
         return jsonify({'error': 'Unauthorized'}), 401
-    # Wave 0 stub: return 501 until Plan 02 implements full CRUD
-    return jsonify({'error': 'Not implemented yet — coming in Wave 1'}), 501
+    user_id = user['id']
+
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, name, filters, notify_enabled, notify_email,
+                       last_notified_at, created_at
+                FROM saved_searches
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+            """, (user_id,))
+            rows = cur.fetchall()
+            result = []
+            for row in rows:
+                result.append({
+                    'id': row[0], 'name': row[1], 'filters': row[2],
+                    'notify_enabled': row[3], 'notify_email': row[4],
+                    'last_notified_at': row[5].isoformat() if row[5] else None,
+                    'created_at': row[6].isoformat() if row[6] else None,
+                })
+            return jsonify({'saved_searches': result}), 200
+    except Exception as e:
+        print(f'[API] list_saved_searches erro: {e}')
+        return jsonify({'error': 'internal error'}), 500
+
+
+@app.route('/api/client/saved-searches/<int:ss_id>', methods=['DELETE'])
+@limiter.limit("60/minute")
+def delete_saved_search(ss_id):
+    """Delete a saved search (owner check enforced)."""
+    token = get_auth_header()
+    user = verify_token(token)
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    user_id = user['id']
+
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM saved_searches WHERE id = %s AND user_id = %s RETURNING id",
+                (ss_id, user_id)
+            )
+            deleted = cur.fetchone()
+            conn.commit()
+            if not deleted:
+                return jsonify({'error': 'Not found or not yours'}), 404
+            return jsonify({'deleted': ss_id}), 200
+    except Exception as e:
+        print(f'[API] delete_saved_search erro: {e}')
+        return jsonify({'error': 'internal error'}), 500
+
+
+@app.route('/api/client/saved-searches/<int:ss_id>', methods=['PATCH'])
+@limiter.limit("60/minute")
+def update_saved_search(ss_id):
+    """Update a saved search (toggle notify_enabled, update email or name). Owner check enforced."""
+    token = get_auth_header()
+    user = verify_token(token)
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    user_id = user['id']
+
+    data = request.get_json() or {}
+    updates = []
+    params = []
+
+    if 'notify_enabled' in data:
+        updates.append("notify_enabled = %s")
+        params.append(bool(data['notify_enabled']))
+    if 'notify_email' in data:
+        updates.append("notify_email = %s")
+        params.append((data['notify_email'] or '').strip() or None)
+    if 'name' in data:
+        new_name = (data['name'] or '').strip()
+        if new_name:
+            updates.append("name = %s")
+            params.append(new_name)
+
+    if not updates:
+        return jsonify({'error': 'nothing to update'}), 400
+
+    params.extend([ss_id, user_id])
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE saved_searches SET {', '.join(updates)} "
+                f"WHERE id = %s AND user_id = %s "
+                f"RETURNING id, name, filters, notify_enabled, notify_email, last_notified_at, created_at",
+                params
+            )
+            row = cur.fetchone()
+            conn.commit()
+            if not row:
+                return jsonify({'error': 'Not found or not yours'}), 404
+            return jsonify({
+                'id': row[0], 'name': row[1], 'filters': row[2],
+                'notify_enabled': row[3], 'notify_email': row[4],
+                'last_notified_at': row[5].isoformat() if row[5] else None,
+                'created_at': row[6].isoformat() if row[6] else None,
+            }), 200
+    except Exception as e:
+        print(f'[API] update_saved_search erro: {e}')
+        return jsonify({'error': 'internal error'}), 500
 
 
 @app.route('/api/admin/niche-requests/<int:req_id>/approve', methods=['POST'])
