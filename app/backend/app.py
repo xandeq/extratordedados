@@ -17314,6 +17314,102 @@ def admin_auto_categorize_all():
     })
 
 
+def trigger_saved_search_notifications():
+    """
+    APScheduler job: runs daily at 08:00 America/Sao_Paulo.
+    For each saved search with notify_enabled=TRUE and a notify_email:
+      1. Count new leads (since last_notified_at) matching the saved filters.
+      2. If count > 0 and last_notified_at is older than 23 hours (or NULL):
+         send email and update last_notified_at.
+    Uses raw psycopg2.connect — NOT get_db() — consistent with all other scheduler jobs.
+    """
+    print('[SCHEDULER] trigger_saved_search_notifications: iniciando...')
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cur = conn.cursor()
+
+        # Double-fire guard: if any row was notified in the last 10 minutes, another worker ran.
+        cur.execute("""
+            SELECT COUNT(*) FROM saved_searches
+            WHERE last_notified_at > NOW() - INTERVAL '10 minutes'
+        """)
+        if cur.fetchone()[0] > 0:
+            print('[SCHEDULER] saved_search_notifications: double-fire detectado, abortando.')
+            cur.close()
+            conn.close()
+            return
+
+        # Fetch all active notification subscriptions
+        cur.execute("""
+            SELECT id, user_id, name, filters, notify_enabled, notify_email, last_notified_at
+            FROM saved_searches
+            WHERE notify_enabled = TRUE
+              AND notify_email IS NOT NULL
+              AND notify_email != ''
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        print(f'[SCHEDULER] saved_search_notifications: {len(rows)} subscriptions ativas')
+        notified = 0
+
+        for ss_id, user_id, name, filters, notify_enabled, notify_email, last_notified_at in rows:
+            try:
+                # Skip if notified within the last 23 hours (1 email/day guard)
+                if last_notified_at:
+                    import pytz as _pytz
+                    if last_notified_at.tzinfo is None:
+                        last_notified_at = last_notified_at.replace(tzinfo=_pytz.UTC)
+                    from datetime import datetime as _dt
+                    now_utc = _dt.now(_pytz.UTC)
+                    elapsed_hours = (now_utc - last_notified_at).total_seconds() / 3600
+                    if elapsed_hours < 23:
+                        continue
+
+                # Count new leads matching this filter since last_notified_at
+                since = last_notified_at
+                filters_dict = filters if isinstance(filters, dict) else {}
+                conditions, params = _build_portal_filter_query(filters_dict)
+                if since:
+                    conditions.append("l.captured_at > %s")
+                    params.append(since)
+
+                where_sql = " AND ".join(conditions)
+                count_sql = f"""
+                    SELECT COUNT(*) FROM leads l
+                    JOIN batches b ON l.batch_id = b.id
+                    WHERE {where_sql}
+                """
+                count_conn = psycopg2.connect(**DB_CONFIG)
+                count_cur = count_conn.cursor()
+                count_cur.execute(count_sql, params)
+                new_count = count_cur.fetchone()[0]
+                count_cur.close()
+                count_conn.close()
+
+                if new_count > 0:
+                    sent = send_notification_email(notify_email, name, new_count)
+                    if sent:
+                        upd_conn = psycopg2.connect(**DB_CONFIG)
+                        upd_cur = upd_conn.cursor()
+                        upd_cur.execute(
+                            "UPDATE saved_searches SET last_notified_at = NOW() WHERE id = %s",
+                            (ss_id,)
+                        )
+                        upd_conn.commit()
+                        upd_cur.close()
+                        upd_conn.close()
+                        notified += 1
+                        print(f'[SCHEDULER] Notificado {notify_email}: {new_count} leads em "{name}"')
+            except Exception as row_err:
+                print(f'[SCHEDULER] saved_search_notifications: erro para id={ss_id}: {row_err}')
+
+        print(f'[SCHEDULER] saved_search_notifications: {notified} notificações enviadas.')
+    except Exception as e:
+        print(f'[SCHEDULER] saved_search_notifications: erro geral: {e}')
+
+
 # ============= Scheduler Setup =============
 try:
     if _APSCHEDULER_AVAILABLE:
@@ -17412,6 +17508,14 @@ try:
             id='monthly_credit_grant',
             replace_existing=True
         )
+
+        _scheduler.add_job(
+            trigger_saved_search_notifications,
+            CronTrigger(hour=8, minute=0, timezone=_tz),
+            id='saved_search_notifications',
+            replace_existing=True
+        )
+        print('[SCHEDULER] saved_search_notifications job registrado (08:00 BRT)')
 
         _scheduler.start()
         print(f"[SCHEDULER] Pipeline diário agendado: {DAILY_JOB_HOUR:02d}:00 America/Sao_Paulo")
