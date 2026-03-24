@@ -14428,6 +14428,59 @@ def send_pipeline_email_report(report: dict, to_email: str) -> bool:
         return False
 
 
+def send_notification_email(to_email: str, search_name: str, new_count: int) -> bool:
+    """
+    Send a Brevo transactional email notifying a client of new leads
+    matching their saved search. Returns True on success, False on any error.
+    Never raises.
+    """
+    try:
+        creds = _get_brevo_credentials()
+        if not creds:
+            print('[NOTIFY] send_notification_email: Brevo creds not available')
+            return False
+        api_key    = creds.get('BREVO_API_KEY', '')
+        from_email = creds.get('BREVO_FROM_EMAIL', 'noreply@extratordedados.com.br')
+        from_name  = creds.get('BREVO_FROM_NAME', 'Extrator DIAX')
+        subject    = f"[DIAX] {new_count} novos leads em '{search_name}'"
+        html = f"""
+        <div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px">
+          <h2 style="color:#2563eb">Novos leads disponíveis</h2>
+          <p>Sua busca salva <strong>'{search_name}'</strong> encontrou
+             <strong>{new_count} novos leads</strong> desde a última notificação.</p>
+          <p style="margin-top:24px">
+            <a href="https://extratordedados.com.br/portal"
+               style="background:#2563eb;color:#fff;padding:10px 20px;
+                      border-radius:6px;text-decoration:none;font-weight:bold">
+              Ver leads no portal
+            </a>
+          </p>
+          <hr style="margin-top:32px;border:none;border-top:1px solid #e5e7eb"/>
+          <p style="font-size:12px;color:#6b7280">
+            Extrator de Dados DIAX — para parar notificações acesse
+            <a href="https://extratordedados.com.br/saved-searches">/saved-searches</a>
+          </p>
+        </div>
+        """
+        resp = http_requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={"api-key": api_key, "Content-Type": "application/json"},
+            json={
+                "sender": {"name": from_name, "email": from_email},
+                "to": [{"email": to_email}],
+                "subject": subject,
+                "htmlContent": html,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        print(f'[NOTIFY] Email enviado para {to_email}: {new_count} leads em "{search_name}"')
+        return True
+    except Exception as e:
+        print(f'[NOTIFY] send_notification_email erro: {e}')
+        return False
+
+
 def _ping_healthcheck(check_url: str, success: bool = True) -> None:
     """
     Dead man's switch: ping healthchecks.io after pipeline completes.
@@ -16309,6 +16362,63 @@ def admin_reject_niche_request(req_id):
 
 # ─── End Niche Request Queue ──────────────────────────────────────────────────
 
+
+def _build_portal_filter_query(filters: dict):
+    """
+    Build the SQL WHERE clause for client portal lead searches.
+    Used by client_search_leads() and trigger_saved_search_notifications().
+
+    Returns: (conditions: list[str], params: list)
+    The caller is responsible for joining conditions with AND and prepending
+    the mandatory base condition 'b.is_shared = TRUE'.
+    """
+    conditions = ["b.is_shared = TRUE"]
+    params = []
+
+    category = filters.get('category', '').strip()
+    if category:
+        conditions.append("l.category ILIKE %s")
+        params.append(f"%{category}%")
+
+    city = filters.get('city', '').strip()
+    if city:
+        conditions.append("l.city ILIKE %s")
+        params.append(f"%{city}%")
+
+    state = filters.get('state', '').strip()
+    if state:
+        conditions.append("l.state ILIKE %s")
+        params.append(f"%{state}%")
+
+    q = filters.get('q', '').strip()
+    if q:
+        conditions.append("l.company_name ILIKE %s")
+        params.append(f"%{q}%")
+
+    quality_grade = filters.get('quality_grade', '').strip()
+    if quality_grade:
+        grade_order = {'A': 1, 'B': 2, 'C': 3, 'D': 4, 'F': 5}
+        if quality_grade.upper() in grade_order:
+            target_rank = grade_order[quality_grade.upper()]
+            eligible = [g for g, r in grade_order.items() if r <= target_rank]
+            if eligible:
+                conditions.append("l.quality_grade = ANY(%s)")
+                params.append(eligible)
+
+    if filters.get('has_email'):
+        conditions.append("l.email IS NOT NULL AND l.email != ''")
+    if filters.get('has_phone'):
+        conditions.append("l.phone IS NOT NULL AND l.phone != ''")
+    if filters.get('has_whatsapp'):
+        conditions.append("l.whatsapp IS NOT NULL AND l.whatsapp != ''")
+    if filters.get('has_website'):
+        conditions.append("l.website IS NOT NULL AND l.website != ''")
+    if filters.get('has_cnpj'):
+        conditions.append("l.cnpj IS NOT NULL AND l.cnpj != ''")
+
+    return conditions, params
+
+
 @app.route('/api/leads/search', methods=['GET'])
 @limiter.limit("100/hour")
 def client_search_leads():
@@ -16324,17 +16434,6 @@ def client_search_leads():
     if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
 
-    # Parse client-specific filters
-    category = request.args.get('category', '').strip()
-    city = request.args.get('city', '').strip()
-    state = request.args.get('state', '').strip()
-    quality_grade = request.args.get('quality_grade', '').strip().upper()
-    q = request.args.get('q', '').strip()  # free-text search on company_name
-    has_email = request.args.get('has_email', '').lower() == 'true'
-    has_phone = request.args.get('has_phone', '').lower() == 'true'
-    has_whatsapp = request.args.get('has_whatsapp', '').lower() == 'true'
-    has_website = request.args.get('has_website', '').lower() == 'true'
-    has_cnpj = request.args.get('has_cnpj', '').lower() == 'true'
     try:
         page = max(1, int(request.args.get('page', 1)))
     except (ValueError, TypeError):
@@ -16344,45 +16443,29 @@ def client_search_leads():
     except (ValueError, TypeError):
         per_page = 20
 
+    # Build WHERE clause using shared helper
+    conditions, params = _build_portal_filter_query({
+        'category': request.args.get('category', ''),
+        'city': request.args.get('city', ''),
+        'state': request.args.get('state', ''),
+        'q': request.args.get('q', ''),
+        'quality_grade': request.args.get('quality_grade', ''),
+        'has_email': request.args.get('has_email') in ('true', '1', 'yes'),
+        'has_phone': request.args.get('has_phone') in ('true', '1', 'yes'),
+        'has_whatsapp': request.args.get('has_whatsapp') in ('true', '1', 'yes'),
+        'has_website': request.args.get('has_website') in ('true', '1', 'yes'),
+        'has_cnpj': request.args.get('has_cnpj') in ('true', '1', 'yes'),
+    })
+    where_clause = " AND ".join(conditions)
+
     # Base query — only shared batches
-    base_query = """
+    base_query = f"""
         SELECT l.id, l.company_name, l.city, l.state, l.category,
                l.email, l.phone, l.whatsapp, l.website, l.cnpj,
                l.lead_score, l.quality_grade, l.source, l.captured_at
         FROM leads l JOIN batches b ON l.batch_id = b.id
-        WHERE b.is_shared = TRUE
+        WHERE {where_clause}
     """
-    params = []
-
-    if q:
-        base_query += ' AND l.company_name ILIKE %s'
-        params.append(f'%{q}%')
-    if category:
-        base_query += ' AND l.category ILIKE %s'
-        params.append(f'%{category}%')
-    if city:
-        base_query += ' AND l.city ILIKE %s'
-        params.append(f'%{city}%')
-    if state:
-        base_query += ' AND l.state ILIKE %s'
-        params.append(f'%{state}%')
-    if quality_grade in ('A', 'B', 'C', 'D', 'F'):
-        # Return leads at or better than requested grade (A=best, F=worst)
-        grade_order = {'A': 1, 'B': 2, 'C': 3, 'D': 4, 'F': 5}
-        min_order = grade_order[quality_grade]
-        allowed_grades = [g for g, o in grade_order.items() if o <= min_order]
-        base_query += ' AND l.quality_grade = ANY(%s)'
-        params.append(allowed_grades)
-    if has_email:
-        base_query += " AND l.email IS NOT NULL AND l.email != ''"
-    if has_phone:
-        base_query += " AND l.phone IS NOT NULL AND l.phone != ''"
-    if has_whatsapp:
-        base_query += " AND l.whatsapp IS NOT NULL AND l.whatsapp != ''"
-    if has_website:
-        base_query += " AND l.website IS NOT NULL AND l.website != ''"
-    if has_cnpj:
-        base_query += " AND l.cnpj IS NOT NULL AND l.cnpj != ''"
 
     try:
         with get_db() as conn:
