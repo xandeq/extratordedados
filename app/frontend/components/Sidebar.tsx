@@ -38,6 +38,7 @@ const adminNavItems = [
   { href: '/leads', label: 'Leads Database', icon: Database },
   { href: '/admin/users', label: 'Usuários', icon: Users },
   { href: '/admin/plans', label: 'Planos & Limites', icon: Settings },
+  { href: '/admin/niche-requests', label: 'Fila de Nichos', icon: MessageSquarePlus },
   { href: '/app-logs', label: 'System Logs', icon: ScrollText },
 ]
 
