@@ -15605,6 +15605,137 @@ def client_usage():
         print(f'[ERROR] /api/client/usage: {e}')
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/leads/reveal/<int:lead_id>', methods=['POST'])
+@limiter.limit("60/hour")
+def reveal_lead(lead_id):
+    """Reveal full contact details for a lead. Costs 1 credit.
+    Re-revealing the same lead is free (idempotent — checks user_lead_reveals).
+    Admin users bypass credit check entirely.
+    Returns: {lead_id, email, phone, whatsapp, credits_remaining, already_revealed}
+    HTTP 402 if insufficient credits.
+    HTTP 409 is NOT used — re-reveal returns 200 (already_revealed=True, no charge).
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    # Admin bypass: admins always get full data, no credit deducted
+    is_admin = _is_admin_user(user_id)
+
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+
+            # Verify lead exists
+            c.execute('SELECT email, phone, whatsapp FROM leads WHERE id = %s', (lead_id,))
+            lead_row = c.fetchone()
+            if not lead_row:
+                return jsonify({'error': 'lead_not_found'}), 404
+
+            if is_admin:
+                # Admins bypass credit system entirely
+                return jsonify({
+                    'lead_id': lead_id,
+                    'email': lead_row[0],
+                    'phone': lead_row[1],
+                    'whatsapp': lead_row[2],
+                    'credits_remaining': None,
+                    'already_revealed': True
+                }), 200
+
+            # Check if already revealed (no double-charge)
+            c.execute(
+                'SELECT 1 FROM user_lead_reveals WHERE user_id = %s AND lead_id = %s',
+                (user_id, lead_id)
+            )
+            already_revealed = c.fetchone() is not None
+
+            if not already_revealed:
+                # Atomically deduct 1 credit (SELECT FOR UPDATE inside transaction)
+                success, new_balance = deduct_credit(conn, user_id, 'reveal', lead_id)
+                if not success:
+                    return jsonify({
+                        'error': 'insufficient_credits',
+                        'balance': new_balance,
+                        'required': 1
+                    }), 402
+                # Record reveal — ON CONFLICT DO NOTHING prevents duplicate if race occurs
+                c.execute(
+                    'INSERT INTO user_lead_reveals (user_id, lead_id) VALUES (%s, %s) ON CONFLICT DO NOTHING',
+                    (user_id, lead_id)
+                )
+            else:
+                # Fetch current balance without deducting
+                c.execute(
+                    'SELECT balance_after FROM credit_ledger WHERE user_id = %s ORDER BY id DESC LIMIT 1',
+                    (user_id,)
+                )
+                bal_row = c.fetchone()
+                new_balance = bal_row[0] if bal_row else 0
+
+            return jsonify({
+                'lead_id': lead_id,
+                'email': lead_row[0],
+                'phone': lead_row[1],
+                'whatsapp': lead_row[2],
+                'credits_remaining': new_balance,
+                'already_revealed': already_revealed
+            }), 200
+
+    except Exception as e:
+        print(f'[ERROR] /api/leads/reveal/{lead_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/client/credits', methods=['GET'])
+@limiter.limit("30/minute")
+def client_credits():
+    """Get client's credit balance and last 20 credit events.
+    Returns: {balance: int, history: [{amount, operation, ref_id, balance_after, created_at}]}
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+
+            # Current balance from last ledger event
+            c.execute(
+                'SELECT balance_after FROM credit_ledger WHERE user_id = %s ORDER BY id DESC LIMIT 1',
+                (user_id,)
+            )
+            row = c.fetchone()
+            balance = row[0] if row else 0
+
+            # Last 20 events
+            c.execute("""
+                SELECT amount, operation, ref_id, balance_after, created_at
+                FROM credit_ledger
+                WHERE user_id = %s
+                ORDER BY id DESC LIMIT 20
+            """, (user_id,))
+            history = [
+                {
+                    'amount': r[0],
+                    'operation': r[1],
+                    'ref_id': r[2],
+                    'balance_after': r[3],
+                    'created_at': r[4].isoformat() if r[4] else None
+                }
+                for r in c.fetchall()
+            ]
+
+        return jsonify({'balance': balance, 'history': history}), 200
+
+    except Exception as e:
+        print(f'[ERROR] /api/client/credits: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/admin/users', methods=['GET'])
 @limiter.limit("30/minute")
 def admin_users():
