@@ -13,6 +13,7 @@ interface PlanTier {
   leads: string
   exports: string
   savedFilters: string
+  credits: string
   features: string[]
   cta: string
   ctaHref: string
@@ -33,10 +34,11 @@ const PLANS: PlanTier[] = [
     leads: '100',
     exports: '1',
     savedFilters: '0',
+    credits: '10',
     features: [
       'Acesso à base de leads',
       'Filtros básicos',
-      'Export CSV limitado',
+      '10 reveals/mês',
     ],
     cta: 'Plano atual',
     ctaHref: '',
@@ -55,10 +57,12 @@ const PLANS: PlanTier[] = [
     leads: '5.000',
     exports: '20',
     savedFilters: '5',
+    credits: '200',
     features: [
       'Tudo do plano Free',
       'Filtros salvos (5)',
       'Exportações ilimitadas por dia',
+      '200 reveals/mês',
       'Suporte prioritário',
     ],
     cta: 'Contratar Pro',
@@ -78,9 +82,11 @@ const PLANS: PlanTier[] = [
     leads: '∞',
     exports: '∞',
     savedFilters: '20',
+    credits: '∞',
     features: [
       'Tudo do plano Pro',
       'Filtros salvos ilimitados',
+      'Reveals ilimitados',
       'Acesso à API',
       'SLA dedicado',
       'Onboarding personalizado',
@@ -147,6 +153,7 @@ export default function Plans() {
 
             {/* Usage limits */}
             <div className="space-y-0">
+              <FeatureRow label="Créditos de reveal / mês" value={plan.credits} />
               <FeatureRow label="Leads / mês" value={plan.leads} />
               <FeatureRow label="Exportações / mês" value={plan.exports} />
               <FeatureRow label="Filtros salvos" value={plan.savedFilters} />

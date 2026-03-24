@@ -16,12 +16,15 @@ import {
   Settings,
   TrendingUp,
   Shield,
+  BookMarked,
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import api from '../lib/api'
+import { useClientCredits } from '../lib/useClientCredits'
 
 const clientNavItems = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { href: '/portal', label: 'Portal de Leads', icon: BookMarked },
   { href: '/leads', label: 'Leads', icon: Database },
   { href: '/plans', label: 'Planos', icon: Zap },
 ]
@@ -128,6 +131,7 @@ export default function Sidebar({ isOpen = true, onClose }: SidebarProps) {
   const [isAdmin, setIsAdmin] = useState(false)
   const [loading, setLoading] = useState(true)
   const [usageData, setUsageData] = useState<UsageData | null>(null)
+  const { balance: creditBalance, loading: creditsLoading } = useClientCredits()
 
   useEffect(() => {
     setSidebarOpen(isOpen)
@@ -181,7 +185,7 @@ export default function Sidebar({ isOpen = true, onClose }: SidebarProps) {
 
   const isActive = (href: string) => {
     // exact match for root-like admin pages to avoid /admin matching /admin/users
-    if (href === '/admin' || href === '/dashboard' || href === '/leads' || href === '/plans') {
+    if (href === '/admin' || href === '/dashboard' || href === '/leads' || href === '/plans' || href === '/portal') {
       return router.pathname === href
     }
     return router.pathname.startsWith(href)
@@ -269,6 +273,29 @@ export default function Sidebar({ isOpen = true, onClose }: SidebarProps) {
             usage={usageData.usage}
             limits={usageData.limits}
           />
+        )}
+
+        {/* Credit Balance (clients only) */}
+        {!isAdmin && !loading && creditBalance !== null && (
+          <div className="px-3 pb-3">
+            <div className="rounded-xl border border-gray-200 dark:border-gray-700 p-3 space-y-2 bg-gray-50 dark:bg-gray-700/30">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                  Créditos disponíveis
+                </span>
+                <Zap className="w-3 h-3 text-blue-500" />
+              </div>
+              <div>
+                <span
+                  className="text-xl font-bold text-blue-600 dark:text-blue-400 tabular-nums"
+                  aria-live="polite"
+                >
+                  {creditBalance}
+                </span>
+                <span className="text-xs text-gray-500 dark:text-gray-400 ml-1">créditos</span>
+              </div>
+            </div>
+          </div>
         )}
 
         {/* Footer */}
