@@ -132,10 +132,10 @@ Plans:
 
 **Out of scope**: Stripe (pagamento manual por agora), API keys para clientes
 
-**Plans:** 3 plans
+**Plans:** 1/3 plans executed
 
 Plans:
-- [ ] 04-01-PLAN.md — Wave 0 test stubs + DB migrations (credit_ledger, user_lead_reveals, role col, credits_per_month) + deduct_credit() + grant_monthly_credits() + require_role() + mask_email/phone + portal_lead_to_dict
+- [x] 04-01-PLAN.md — Wave 0 test stubs + DB migrations (credit_ledger, user_lead_reveals, role col, credits_per_month) + deduct_credit() + grant_monthly_credits() + require_role() + mask_email/phone + portal_lead_to_dict
 - [ ] 04-02-PLAN.md — POST /api/leads/reveal/<id> + GET /api/client/credits + GET /api/leads/search (masked, filtered)
 - [ ] 04-03-PLAN.md — Frontend portal.tsx (client search page) + RevealButton component + useClientCredits hook + Sidebar credit widget + plans.tsx credits row
 

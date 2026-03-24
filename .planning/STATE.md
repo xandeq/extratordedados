@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: milestone-1-complete
-last_updated: "2026-03-23T14:00:00.000Z"
+status: unknown
+last_updated: "2026-03-24T00:27:56.223Z"
 progress:
   total_phases: 6
   completed_phases: 3
-  total_plans: 9
-  completed_plans: 9
+  total_plans: 12
+  completed_plans: 10
 ---
 
 # STATE.md — Project Memory
@@ -18,7 +18,7 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone 2 — Portal de Clientes
-- **Active phase**: Phase 4 — Tier Cliente + Reveal Gate + Busca Avançada (next)
+- **Active phase**: Phase 4 — Tier Cliente + Reveal Gate + Busca Avançada (plan 01 complete — plan 02 next)
 - **Milestone 1**: COMPLETE (Phases 1-3 all done, 48/48 regression tests passing)
 - **Last completed**: Phase 3 COMPLETE — 48/48 regression tests passing. init_db transaction bug fixed (ADD COLUMN IF NOT EXISTS). Pipeline Autônomo + Qualidade + Fontes milestone delivered.
 
@@ -38,6 +38,7 @@ progress:
 | 2026-03-23 | Phase 3 Plan 01: cnpj_rf table (20 cols, 2 partial indexes), enrich_from_rf_local() (3s SQL timeout), enrich_cnpj_with_fallback() (5-level chain), import_receita_federal.py (nohup-safe, --dry-run), RECEITA_FEDERAL_IMPORT.md runbook. 10 test stubs (10 skipped). Deployed to VPS. |
 | 2026-03-23 | Phase 3 Plan 02: Outscraper Google Maps — tools/outscraper AWS SM secret, _get_outscraper_key(), outscraper in requirements.txt, process_outscraper_massive() Thread 16, outscraper_maps wired into POST /api/search/massive (default methods + jobs + thread + response dict). 2/3 tests pass (3rd skips until real API key set). Deployed to VPS. |
 | 2026-03-23 | Phase 3 Plan 03: Prospeo LinkedIn enrichment — tools/prospeo AWS SM secret, _get_prospeo_key(), enrich_linkedin_prospeo(), POST /api/leads/<id>/enrich-linkedin (rate limit 30/hour), 75-credit cap in process_linkedin_massive(), Minha Receita docker-compose deploy guide in RECEITA_FEDERAL_IMPORT.md. 3/3 tests passing. Deployed to VPS. |
+| 2026-03-24 | Phase 4 Plan 01: DB foundation — role column on users, credits_per_month on plan_limits, credit_ledger table (BIGSERIAL, SELECT FOR UPDATE), user_lead_reveals table (PK user_id+lead_id), require_role() decorator, deduct_credit() atomic helper, grant_monthly_credits() APScheduler job (day=1 00:05 with double-fire guard), mask_email(), mask_phone(), portal_lead_to_dict(). /api/me returns role. 12 Wave 0 test stubs. 53 passed, 17 skipped. |
 
 ## Research Available
 
@@ -85,6 +86,10 @@ progress:
 | Prospeo key stored as empty placeholder in AWS SM | Endpoint returns 503 until real key set — same pattern as ZeroBounce/Outscraper |
 | with get_db() as conn in enrich_lead_linkedin | Consistent with all other Flask endpoints; get_db_connection() does not exist |
 | prospeo_credits_used per-run counter (not persisted) | Simple and sufficient for Prospeo free tier 75-credit cap per run |
+| deduct_credit takes open conn (not get_db()) | Caller controls transaction boundary — atomicity with user_lead_reveals INSERT in plan 02 |
+| ROLE_HIERARCHY uses integers (admin=3, operator=2, client=1) | Single >= comparison handles future role additions |
+| portal_lead_to_dict uses positional row indexing | Callers in plans 02/03 must SELECT columns in documented order |
+| grant_monthly_credits double-fire guard uses 5-min window | Same pattern as daily pipeline guard — consistent across schedulers |
 
 ## Performance Metrics
 
@@ -99,8 +104,10 @@ progress:
 | 03-novas-fontes | 01 | ~6 min | 4/4 | 6 |
 | 03-novas-fontes | 02 | ~5 min | 3/3 | 3 |
 | 03-novas-fontes | 03 | ~6 min | 3/3 | 3 |
+| Phase 04-tier-cliente-reveal-gate-busca-avan-ada P01 | 12 | 2 tasks | 5 files |
+| 04-tier-cliente-reveal-gate-busca-avan-ada | 01 | ~12 min | 2/2 | 5 |
 
 ## Last Session
 
-- **Stopped at**: Milestone 1 COMPLETE. All 3 phases done, 48/48 regression tests passing. Fixed init_db transaction bug (ADD COLUMN IF NOT EXISTS). Verifier running for Phase 3 sign-off. Next: Phase 4 (Portal de Clientes — Tier Cliente + Reveal Gate).
-- **Timestamp**: 2026-03-23
+- **Stopped at**: Completed 04-tier-cliente-reveal-gate-busca-avan-ada/04-01-PLAN.md — DB foundation + RBAC + credit ledger helpers. 53 passed, 17 skipped, 0 failures.
+- **Timestamp**: 2026-03-24
