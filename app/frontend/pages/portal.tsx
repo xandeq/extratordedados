@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react'
-import { ChevronLeft, ChevronRight, Search as SearchIcon, Mail, Phone, Globe, Download } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Search as SearchIcon, Mail, Phone, Globe, Download, Bookmark } from 'lucide-react'
 import api from '../lib/api'
 import { useClientCredits } from '../lib/useClientCredits'
 import { RevealButton } from '../components/RevealButton'
@@ -74,6 +74,14 @@ export default function Portal() {
   // Per-lead reveal loading state
   const [revealingId, setRevealingId] = useState<number | null>(null)
 
+  // Save search modal state
+  const [showSaveModal, setShowSaveModal] = useState(false)
+  const [saveName, setSaveName] = useState('')
+  const [saveEmail, setSaveEmail] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [saveSuccess, setSaveSuccess] = useState('')
+  const [saveError, setSaveError] = useState('')
+
   const handleSearch = useCallback(async (pageNum = 1) => {
     setSearching(true)
     try {
@@ -128,6 +136,41 @@ export default function Portal() {
       setRevealingId(null)
     }
   }, [refetchCredits])
+
+  const saveSearch = async () => {
+    if (!saveName.trim()) { setSaveError('Informe um nome para esta busca.'); return }
+    setSaving(true)
+    setSaveError('')
+    try {
+      await api.post('/api/client/saved-searches', {
+        name: saveName.trim(),
+        filters: {
+          category,
+          city,
+          state,
+          quality_grade: qualityGrade,
+          has_email: hasEmail,
+          has_phone: hasPhone,
+          has_whatsapp: hasWhatsapp,
+          has_website: hasWebsite,
+          has_cnpj: hasCnpj,
+        },
+        notify_enabled: true,
+        notify_email: saveEmail.trim() || undefined,
+      })
+      setSaveSuccess('Busca salva! Voce sera notificado por email sobre novos leads.')
+      setTimeout(() => {
+        setShowSaveModal(false)
+        setSaveSuccess('')
+        setSaveName('')
+        setSaveEmail('')
+      }, 2500)
+    } catch {
+      setSaveError('Erro ao salvar busca.')
+    } finally {
+      setSaving(false)
+    }
+  }
 
   const GRADES = ['A', 'B', 'C', 'D', 'F']
 
@@ -235,6 +278,16 @@ export default function Portal() {
           >
             <SearchIcon className="w-4 h-4" />
             {searching ? 'Buscando...' : 'Buscar Leads'}
+          </button>
+
+          <button
+            onClick={() => setShowSaveModal(true)}
+            className="w-full flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-lg border
+                       border-blue-300 text-blue-700 dark:border-blue-600 dark:text-blue-400
+                       hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors"
+          >
+            <Bookmark size={15} />
+            Salvar Busca
           </button>
         </div>
       </aside>
@@ -397,6 +450,61 @@ export default function Portal() {
       )}
       {showUpgradeModal && (
         <UpgradeModal onClose={() => setShowUpgradeModal(false)} reason="export" />
+      )}
+
+      {showSaveModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl p-6 w-full max-w-sm mx-4">
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+              Salvar Busca
+            </h2>
+
+            <label className="block text-sm text-gray-700 dark:text-gray-300 mb-1">
+              Nome da busca *
+            </label>
+            <input
+              type="text"
+              value={saveName}
+              onChange={e => setSaveName(e.target.value)}
+              placeholder="Ex: Clinicas em Vitoria/ES"
+              className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2
+                         text-sm dark:bg-gray-700 dark:text-white mb-3"
+            />
+
+            <label className="block text-sm text-gray-700 dark:text-gray-300 mb-1">
+              Email para notificacoes (opcional)
+            </label>
+            <input
+              type="email"
+              value={saveEmail}
+              onChange={e => setSaveEmail(e.target.value)}
+              placeholder="seu@email.com"
+              className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2
+                         text-sm dark:bg-gray-700 dark:text-white mb-4"
+            />
+
+            {saveError   && <p className="text-sm text-red-500 mb-2">{saveError}</p>}
+            {saveSuccess && <p className="text-sm text-green-600 mb-2">{saveSuccess}</p>}
+
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { setShowSaveModal(false); setSaveError(''); setSaveName(''); setSaveEmail('') }}
+                className="px-4 py-2 text-sm rounded-lg border border-gray-300 dark:border-gray-600
+                           text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={saveSearch}
+                disabled={saving}
+                className="px-4 py-2 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-700
+                           disabled:opacity-50 transition-colors"
+              >
+                {saving ? 'Salvando...' : 'Salvar'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )
