@@ -57,7 +57,7 @@ requirements-completed:
   - P4-PLANS-UPDATE
   - P4-SIDEBAR-CREDITS
 
-duration: 10min
+duration: 15min
 completed: 2026-03-24
 ---
 
@@ -70,8 +70,8 @@ completed: 2026-03-24
 - **Duration:** ~10 min
 - **Started:** 2026-03-24T00:36:54Z
 - **Completed:** 2026-03-24T00:50:00Z
-- **Tasks:** 2/2 (checkpoint task pending human verification)
-- **Files modified:** 5
+- **Tasks:** 3/3 (human verification approved)
+- **Files modified:** 8 (5 frontend + 3 test)
 
 ## Accomplishments
 
@@ -80,12 +80,14 @@ completed: 2026-03-24
 - useClientCredits hook: fetches /api/client/credits, manages balance/history state, exposes refetch()
 - Sidebar: "Portal de Leads" nav item (BookMarked icon) + CreditBalance widget with aria-live=polite
 - plans.tsx: "Créditos de reveal / mês" FeatureRow (Free=10, Pro=200, Enterprise=∞)
-- TypeScript compiles clean, Next.js build succeeds, 53/53 pytest pass (17 skip), frontend deployed
+- TypeScript compiles clean, Next.js build succeeds, 56/56 pytest pass (9 skip), frontend deployed
+- Task 3 (human verification checkpoint): approved — portal UX verified live
 
 ## Task Commits
 
 1. **Task 1: useClientCredits hook + RevealButton component + portal.tsx page** - `0c4c425` (feat)
 2. **Task 2: Update Sidebar.tsx + plans.tsx** - `ad01660` (feat)
+3. **Task 3: Human verification + activate test stubs** - `19a4fb9` (test)
 
 ## Files Created/Modified
 
@@ -94,6 +96,9 @@ completed: 2026-03-24
 - `app/frontend/pages/portal.tsx` - Client lead search page: filter panel, masked results, inline reveal flow
 - `app/frontend/components/Sidebar.tsx` - Added Portal nav item, BookMarked/useClientCredits imports, CreditBalance widget
 - `app/frontend/pages/plans.tsx` - Added credits field to PlanTier, credits values per plan, Créditos de reveal FeatureRow
+- `tests/test_credits.py` - Activated: auth-gate + balance shape assertions (client_token auto-skip)
+- `tests/test_reveal.py` - Activated: auth-gate + deduction/idempotency assertions (client_token auto-skip)
+- `tests/test_client_search.py` - Activated: auth-gate + masked email + filter shape assertions
 
 ## Decisions Made
 
@@ -118,7 +123,7 @@ None — no external service configuration required.
 
 - Complete client portal UX is live at https://extratordedados.com.br/portal
 - Backend endpoints (Plans 01+02) + Frontend (Plan 03) form the complete Phase 4 reveal-gate system
-- Human verification checkpoint pending (Task 3): login as client, search leads, verify masked display, reveal a contact, confirm balance decrement
+- Human verification checkpoint (Task 3): PASSED — portal UX verified live by human reviewer
 - Phase 5 (export tier gating) can build on this portal and credit model
 
 ## Known Stubs

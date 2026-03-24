@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-24T00:45:07.228Z"
+last_updated: "2026-03-24T07:52:15.932Z"
 progress:
   total_phases: 6
   completed_phases: 4
@@ -18,9 +18,10 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone 2 — Portal de Clientes
-- **Active phase**: Phase 4 — Tier Cliente + Reveal Gate + Busca Avançada (all 3 plans complete — awaiting human verification of portal UX at checkpoint)
+- **Active phase**: Phase 5 (next) — Phase 4 COMPLETE, human verification approved
+- **Milestone 2**: COMPLETE — Phase 4 all 3 plans done, human verification passed, portal UX live
 - **Milestone 1**: COMPLETE (Phases 1-3 all done, 48/48 regression tests passing)
-- **Last completed**: Phase 3 COMPLETE — 48/48 regression tests passing. init_db transaction bug fixed (ADD COLUMN IF NOT EXISTS). Pipeline Autônomo + Qualidade + Fontes milestone delivered.
+- **Last completed**: Phase 4 Plan 03 COMPLETE — client portal frontend verified live. Wave 0 test stubs activated (56 passed, 9 skipped). Phase 4 deliver: reveal-gate UX, credit ledger, masked search, RevealButton.
 
 ## Completed Work
 
@@ -40,7 +41,7 @@ progress:
 | 2026-03-23 | Phase 3 Plan 03: Prospeo LinkedIn enrichment — tools/prospeo AWS SM secret, _get_prospeo_key(), enrich_linkedin_prospeo(), POST /api/leads/<id>/enrich-linkedin (rate limit 30/hour), 75-credit cap in process_linkedin_massive(), Minha Receita docker-compose deploy guide in RECEITA_FEDERAL_IMPORT.md. 3/3 tests passing. Deployed to VPS. |
 | 2026-03-24 | Phase 4 Plan 01: DB foundation — role column on users, credits_per_month on plan_limits, credit_ledger table (BIGSERIAL, SELECT FOR UPDATE), user_lead_reveals table (PK user_id+lead_id), require_role() decorator, deduct_credit() atomic helper, grant_monthly_credits() APScheduler job (day=1 00:05 with double-fire guard), mask_email(), mask_phone(), portal_lead_to_dict(). /api/me returns role. 12 Wave 0 test stubs. 53 passed, 17 skipped. |
 | 2026-03-24 | Phase 4 Plan 02: Three client portal endpoints — POST /api/leads/reveal/<id> (atomic credit deduction, admin bypass, idempotent re-reveal, 402 on zero balance), GET /api/client/credits (balance + 20 event history), GET /api/leads/search (masked search over shared batches, 9 filter params, portal_lead_to_dict masking). 52 passed, 18 skipped. Deployed + VPS health check OK. |
-| 2026-03-24 | Phase 4 Plan 03: Client portal frontend — /portal page (filter panel + masked results + RevealButton), useClientCredits hook, RevealButton (4 states), Sidebar Portal nav + CreditBalance widget, plans.tsx credits row. TypeScript clean, Next.js build OK, 53 passed, 17 skipped. Frontend deployed. |
+| 2026-03-24 | Phase 4 Plan 03: Client portal frontend — /portal page (filter panel + masked results + RevealButton), useClientCredits hook, RevealButton (4 states), Sidebar Portal nav + CreditBalance widget, plans.tsx credits row. TypeScript clean, Next.js build OK, 56 passed, 9 skipped. Frontend deployed. Human verification APPROVED. |
 
 ## Research Available
 
@@ -116,8 +117,9 @@ progress:
 | 04-tier-cliente-reveal-gate-busca-avan-ada | 01 | ~12 min | 2/2 | 5 |
 | Phase 04-tier-cliente-reveal-gate-busca-avan-ada P02 | 4 | 2 tasks | 1 files |
 | Phase 04-tier-cliente-reveal-gate-busca-avan-ada P03 | 10 | 2 tasks | 5 files |
+| Phase 04-tier-cliente-reveal-gate-busca-avan-ada P03 | 15 | 3 tasks | 8 files |
 
 ## Last Session
 
-- **Stopped at**: Completed 04-tier-cliente-reveal-gate-busca-avan-ada/04-03-PLAN.md — client portal frontend (portal.tsx, RevealButton, useClientCredits, Sidebar CreditBalance, plans credits row). 53 passed, 17 skipped, 0 failures. Frontend deployed. Awaiting human verification checkpoint.
+- **Stopped at**: Completed 04-tier-cliente-reveal-gate-busca-avan-ada/04-03-PLAN.md — human verification approved. Wave 0 test stubs activated (56 passed, 9 skipped). Phase 4 COMPLETE. Ready for Phase 5.
 - **Timestamp**: 2026-03-24
