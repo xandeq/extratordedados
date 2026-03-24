@@ -124,13 +124,20 @@ Plans:
 - `GET /api/leads/search` — busca cliente com filtros: nicho, cidade, estado, quality_grade, has_email, has_phone, has_whatsapp, has_website
 - Response mascarado: `"jo***@gmail.com"`, `"27 9****-5678"`
 - Planos: Free(10cr/mês), Básico(200), Pro(1000), Enterprise(ilimitado)
-- Frontend `/leads` para clientes (sem bulk actions, sem export direto)
+- Frontend `/portal` para clientes (sem bulk actions, sem export direto)
 - Sidebar créditos, reveal button, filtros avançados
-- Página `/plans` com comparativo
+- Página `/plans` com comparativo e créditos por plano
 
 **Dependencies**: Phase 1+2 concluídas (leads com quality grade, pipeline rodando)
 
 **Out of scope**: Stripe (pagamento manual por agora), API keys para clientes
+
+**Plans:** 3 plans
+
+Plans:
+- [ ] 04-01-PLAN.md — Wave 0 test stubs + DB migrations (credit_ledger, user_lead_reveals, role col, credits_per_month) + deduct_credit() + grant_monthly_credits() + require_role() + mask_email/phone + portal_lead_to_dict
+- [ ] 04-02-PLAN.md — POST /api/leads/reveal/<id> + GET /api/client/credits + GET /api/leads/search (masked, filtered)
+- [ ] 04-03-PLAN.md — Frontend portal.tsx (client search page) + RevealButton component + useClientCredits hook + Sidebar credit widget + plans.tsx credits row
 
 ---
 
@@ -197,7 +204,7 @@ Plans:
     [✓] Phase 3 — Receita Federal + Outscraper + Prospeo (3/3 plans complete)
 
 [ ] Milestone 2 — Portal de Clientes
-    [ ] Phase 4 — Reveal gate + créditos
+    [ ] Phase 4 — Reveal gate + créditos (3 plans, ready to execute)
     [ ] Phase 5 — Export + niche requests
     [ ] Phase 6 — Saved searches + notificações
 ```
