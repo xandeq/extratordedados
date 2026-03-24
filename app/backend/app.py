@@ -16148,14 +16148,69 @@ def admin_approve_niche_request(req_id):
     # Trigger extraction in background thread (daemon — same pattern as daily pipeline)
     def _trigger_niche_extraction(req_id=req_id, niche=niche, city=city, state_val=state_val):
         try:
-            print(f'[niche_request] Starting extraction for req_id={req_id} niche={niche} city={city}')
+            print(f'[niche_request] Starting extraction for req_id={req_id} niche={niche} city={city} state={state_val}')
+
+            # 1. Create a shared batch for the niche extraction results
+            batch_name = f'Niche Request #{req_id} — {niche}'
+            if city:
+                batch_name += f' em {city}'
+            max_pages = 2
+
             with get_db() as conn:
                 c = conn.cursor()
                 c.execute(
-                    "UPDATE niche_requests SET status = 'done', updated_at = NOW(), completed_at = NOW() WHERE id = %s",
-                    (req_id,)
+                    'INSERT INTO batches (user_id, name, status, total_urls, created_at, is_shared) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id',
+                    (1, batch_name, 'pending', 3, datetime.now(), True)
                 )
-            print(f'[niche_request] Extraction completed for req_id={req_id}')
+                batch_id = c.fetchone()[0]
+
+                # 2. Create search_jobs for search_engines method (DuckDuckGo + Bing)
+                #    Use 3 engine variants for better coverage
+                jobs_data = []
+                for engine in ['duckduckgo', 'bing', 'yahoo']:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, 1, niche, city or '', state_val or '', 'manual',
+                         max_pages, 'pending', engine, datetime.now())
+                    )
+                    search_job_id = c.fetchone()[0]
+                    jobs_data.append({
+                        'search_job_id': search_job_id,
+                        'niche': niche,
+                        'city': city or '',
+                        'state': state_val or '',
+                        'max_pages': max_pages,
+                    })
+
+            # 3. Count leads before running extraction
+            leads_before = 0
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute('SELECT COUNT(*) FROM leads WHERE batch_id = %s', (batch_id,))
+                leads_before = c.fetchone()[0]
+
+            # 4. Run the search engines processor (blocking — runs in this daemon thread)
+            #    process_search_job runs DuckDuckGo + Bing — no Playwright, safe for daemon thread
+            process_search_job(batch_id, jobs_data, 1)
+
+            # 5. Count leads added and update niche request as done
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute('SELECT COUNT(*) FROM leads WHERE batch_id = %s', (batch_id,))
+                leads_after = c.fetchone()[0]
+                leads_added = leads_after - leads_before
+
+                c.execute(
+                    "UPDATE batches SET status = 'completed' WHERE id = %s",
+                    (batch_id,)
+                )
+                c.execute(
+                    "UPDATE niche_requests SET status = 'done', leads_added = %s, updated_at = NOW(), completed_at = NOW() WHERE id = %s",
+                    (leads_added, req_id)
+                )
+            print(f'[niche_request] Extraction complete req_id={req_id} leads_added={leads_added} batch_id={batch_id}')
+
         except Exception as e:
             print(f'[niche_request] Error processing req_id={req_id}: {e}')
             try:
