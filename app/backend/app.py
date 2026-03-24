@@ -15736,6 +15736,122 @@ def client_credits():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/leads/search', methods=['GET'])
+@limiter.limit("100/hour")
+def client_search_leads():
+    """Client-facing lead search. Returns masked contact data by default.
+    Checks user_lead_reveals and returns unmasked data for already-revealed leads.
+    Supported filters: category, city, state, quality_grade, has_email, has_phone,
+                       has_whatsapp, has_website, has_cnpj, q, page, per_page (max 50).
+    Never returns: crm_status, notes, batch_id, tags (internal fields).
+    Rate limit: 100/hour.
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    # Parse client-specific filters
+    category = request.args.get('category', '').strip()
+    city = request.args.get('city', '').strip()
+    state = request.args.get('state', '').strip()
+    quality_grade = request.args.get('quality_grade', '').strip().upper()
+    q = request.args.get('q', '').strip()  # free-text search on company_name
+    has_email = request.args.get('has_email', '').lower() == 'true'
+    has_phone = request.args.get('has_phone', '').lower() == 'true'
+    has_whatsapp = request.args.get('has_whatsapp', '').lower() == 'true'
+    has_website = request.args.get('has_website', '').lower() == 'true'
+    has_cnpj = request.args.get('has_cnpj', '').lower() == 'true'
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        per_page = min(50, max(10, int(request.args.get('per_page', 20))))
+    except (ValueError, TypeError):
+        per_page = 20
+
+    # Base query — only shared batches
+    base_query = """
+        SELECT l.id, l.company_name, l.city, l.state, l.category,
+               l.email, l.phone, l.whatsapp, l.website, l.cnpj,
+               l.lead_score, l.quality_grade, l.source, l.captured_at
+        FROM leads l JOIN batches b ON l.batch_id = b.id
+        WHERE b.is_shared = TRUE
+    """
+    params = []
+
+    if q:
+        base_query += ' AND l.company_name ILIKE %s'
+        params.append(f'%{q}%')
+    if category:
+        base_query += ' AND l.category ILIKE %s'
+        params.append(f'%{category}%')
+    if city:
+        base_query += ' AND l.city ILIKE %s'
+        params.append(f'%{city}%')
+    if state:
+        base_query += ' AND l.state ILIKE %s'
+        params.append(f'%{state}%')
+    if quality_grade in ('A', 'B', 'C', 'D', 'F'):
+        # Return leads at or better than requested grade (A=best, F=worst)
+        grade_order = {'A': 1, 'B': 2, 'C': 3, 'D': 4, 'F': 5}
+        min_order = grade_order[quality_grade]
+        allowed_grades = [g for g, o in grade_order.items() if o <= min_order]
+        base_query += ' AND l.quality_grade = ANY(%s)'
+        params.append(allowed_grades)
+    if has_email:
+        base_query += " AND l.email IS NOT NULL AND l.email != ''"
+    if has_phone:
+        base_query += " AND l.phone IS NOT NULL AND l.phone != ''"
+    if has_whatsapp:
+        base_query += " AND l.whatsapp IS NOT NULL AND l.whatsapp != ''"
+    if has_website:
+        base_query += " AND l.website IS NOT NULL AND l.website != ''"
+    if has_cnpj:
+        base_query += " AND l.cnpj IS NOT NULL AND l.cnpj != ''"
+
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+
+            # Count total matching leads
+            c.execute(f'SELECT COUNT(*) FROM ({base_query}) _sub', params)
+            total = c.fetchone()[0]
+
+            # Fetch paginated results
+            paged_query = base_query + ' ORDER BY l.lead_score DESC NULLS LAST LIMIT %s OFFSET %s'
+            c.execute(paged_query, params + [per_page, (page - 1) * per_page])
+            rows = c.fetchall()
+
+            # Determine which leads this user has already revealed
+            lead_ids = [row[0] for row in rows]
+            revealed_set = set()
+            if lead_ids:
+                c.execute(
+                    'SELECT lead_id FROM user_lead_reveals WHERE user_id = %s AND lead_id = ANY(%s)',
+                    (user_id, lead_ids)
+                )
+                revealed_set = {r[0] for r in c.fetchall()}
+
+        leads = [
+            portal_lead_to_dict(row, revealed=(row[0] in revealed_set))
+            for row in rows
+        ]
+
+        return jsonify({
+            'leads': leads,
+            'total': total,
+            'page': page,
+            'per_page': per_page,
+            'pages': (total + per_page - 1) // per_page if per_page > 0 else 1
+        }), 200
+
+    except Exception as e:
+        print(f'[ERROR] /api/leads/search: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/admin/users', methods=['GET'])
 @limiter.limit("30/minute")
 def admin_users():
