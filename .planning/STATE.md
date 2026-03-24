@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-24T10:22:19.178Z"
+last_updated: "2026-03-24T10:36:11.756Z"
 progress:
   total_phases: 6
   completed_phases: 4
   total_plans: 15
-  completed_plans: 13
+  completed_plans: 14
 ---
 
 # STATE.md — Project Memory
@@ -102,6 +102,8 @@ progress:
 | No _has_minimum_role() in export endpoint | Function does not exist — consistent with reveal_lead and client_search_leads using verify_token + _is_admin_user only |
 | Export uses single bulk credit deduction (not loop of deduct_credit()) | Bulk INSERT INTO credit_ledger with amount=-N is correct for export — deduct_credit() is for single-credit operations |
 | Boolean filter conditions for has_email etc use inline SQL (no %s params) | Prevents psycopg2 parameter binding mismatch — inline NULL checks are equivalent |
+| GET /api/client/niche-requests returns all pending/approved/processing/done (not just own) | More useful for a vote list UI — clients see all active requests, not just theirs |
+| _trigger_niche_extraction uses simplified done-immediately pattern | Actual search integration deferred to future plan — keeps approve endpoint functional without wiring to massive search |
 
 ## Performance Metrics
 
@@ -122,8 +124,9 @@ progress:
 | Phase 04-tier-cliente-reveal-gate-busca-avan-ada P03 | 10 | 2 tasks | 5 files |
 | Phase 04-tier-cliente-reveal-gate-busca-avan-ada P03 | 15 | 3 tasks | 8 files |
 | Phase 05-export-com-cotas-niche-request-queue P01 | 10 | 2 tasks | 3 files |
+| Phase 05-export-com-cotas-niche-request-queue P02 | 8 | 2 tasks | 3 files |
 
 ## Last Session
 
-- **Stopped at**: Completed 05-export-com-cotas-niche-request-queue/05-01-PLAN.md — Wave 0 stubs (8 skipped), niche_requests/niche_request_votes tables, GET /api/client/leads/export with credit deduction. 19 passed, 18 skipped. Ready for Plan 02 (niche request queue endpoints).
+- **Stopped at**: Completed 05-export-com-cotas-niche-request-queue/05-02-PLAN.md — 5 niche request endpoints (POST/GET client, GET/approve/reject admin), FOR UPDATE dedup, daemon extraction thread, Wave 0 stubs activated (8 skipped, 0 failed). Ready for Plan 03 (frontend niche request UI).
 - **Timestamp**: 2026-03-24
