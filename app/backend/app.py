@@ -2301,6 +2301,50 @@ def init_db():
         )''')
         c.execute('CREATE INDEX IF NOT EXISTS idx_user_lead_reveals_user ON user_lead_reveals(user_id)')
 
+    # Phase 5: niche_requests and niche_request_votes tables
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS niche_requests (
+                    id SERIAL PRIMARY KEY,
+                    requester_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    niche VARCHAR(200) NOT NULL,
+                    city VARCHAR(100),
+                    state VARCHAR(2),
+                    notes TEXT,
+                    votes INTEGER NOT NULL DEFAULT 1,
+                    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    admin_notes TEXT,
+                    leads_added INTEGER,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_niche_requests_status
+                ON niche_requests(status, votes DESC)
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_niche_requests_user
+                ON niche_requests(requester_user_id)
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS niche_request_votes (
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    niche_request_id INTEGER NOT NULL REFERENCES niche_requests(id) ON DELETE CASCADE,
+                    voted_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (user_id, niche_request_id)
+                )
+            """)
+        print('[init_db] niche_requests and niche_request_votes tables ready')
+    except Exception as e:
+        print(f'[init_db] niche_requests tables warning: {e}')
+
+    with get_db() as conn:
+        c = conn.cursor()
+
         # Insert admin user if not exists
         c.execute('SELECT id FROM users WHERE username = %s', (ADMIN_USERNAME,))
         if not c.fetchone():
@@ -2550,6 +2594,30 @@ def portal_lead_to_dict(row, revealed=False):
         'has_cnpj': cnpj is not None and cnpj != '',
         'revealed': revealed,
     }
+
+
+def _generate_csv_bytes(leads_dicts):
+    """Generate CSV bytes from list of lead dicts (output of portal_lead_to_dict).
+    Returns bytes object (utf-8-sig with BOM for Excel compatibility).
+    None values are replaced with empty string.
+    """
+    import csv
+    import io
+    if not leads_dicts:
+        return b''
+    fieldnames = [
+        'id', 'company_name', 'city', 'state', 'category',
+        'email', 'phone', 'whatsapp', 'website', 'cnpj',
+        'lead_score', 'quality_grade', 'source', 'captured_at',
+        'has_email', 'has_phone', 'has_whatsapp', 'has_website', 'has_cnpj'
+    ]
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
+    writer.writeheader()
+    for lead in leads_dicts:
+        row = {k: (v if v is not None else '') for k, v in lead.items()}
+        writer.writerow(row)
+    return output.getvalue().encode('utf-8-sig')
 
 
 # ============= Email Normalization =============
@@ -15733,6 +15801,160 @@ def client_credits():
 
     except Exception as e:
         print(f'[ERROR] /api/client/credits: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/client/leads/export', methods=['GET'])
+@limiter.limit("10/hour")
+def client_export_leads():
+    """Export filtered leads as CSV or JSON. Debits credits equal to leads exported.
+    Admin users bypass credit check (unlimited export).
+    Query params: format (csv|json), category, city, state, quality_grade,
+                  has_email, has_phone, has_whatsapp, has_website, has_cnpj.
+    Returns: file download (text/csv or application/json).
+    HTTP 401 if not authenticated, 402 if insufficient credits, 404 if no leads match.
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    fmt = request.args.get('format', 'csv').lower()
+    if fmt not in ('csv', 'json'):
+        return jsonify({'error': 'format must be csv or json'}), 400
+
+    # Build filter params (same as GET /api/leads/search)
+    category = request.args.get('category', '').strip()
+    city = request.args.get('city', '').strip()
+    state_param = request.args.get('state', '').strip()
+    quality_grade = request.args.get('quality_grade', '').strip().upper()
+    has_email = request.args.get('has_email', '').lower() in ('true', '1')
+    has_phone = request.args.get('has_phone', '').lower() in ('true', '1')
+    has_whatsapp = request.args.get('has_whatsapp', '').lower() in ('true', '1')
+    has_website = request.args.get('has_website', '').lower() in ('true', '1')
+    has_cnpj = request.args.get('has_cnpj', '').lower() in ('true', '1')
+
+    # Build WHERE clause — same logic as client_search_leads
+    conditions = ['b.is_shared = TRUE']
+    params = []
+    if category:
+        conditions.append('l.category ILIKE %s')
+        params.append(f'%{category}%')
+    if city:
+        conditions.append('l.city ILIKE %s')
+        params.append(f'%{city}%')
+    if state_param:
+        conditions.append('l.state ILIKE %s')
+        params.append(f'%{state_param}%')
+    if quality_grade:
+        grade_order = {'A': 5, 'B': 4, 'C': 3, 'D': 2, 'F': 1}
+        min_grade = grade_order.get(quality_grade, 0)
+        matching_grades = [g for g, v in grade_order.items() if v >= min_grade]
+        if matching_grades:
+            conditions.append('l.quality_grade = ANY(%s)')
+            params.append(matching_grades)
+    if has_email:
+        conditions.append("l.email IS NOT NULL AND l.email != ''")
+    if has_phone:
+        conditions.append("l.phone IS NOT NULL AND l.phone != ''")
+    if has_whatsapp:
+        conditions.append("l.whatsapp IS NOT NULL AND l.whatsapp != ''")
+    if has_website:
+        conditions.append("l.website IS NOT NULL AND l.website != ''")
+    if has_cnpj:
+        conditions.append("l.cnpj IS NOT NULL AND l.cnpj != ''")
+
+    where_clause = ' AND '.join(conditions)
+    base_query = f"""
+        SELECT l.id, l.company_name, l.city, l.state, l.category,
+               l.email, l.phone, l.whatsapp, l.website, l.cnpj,
+               l.lead_score, l.quality_grade, l.source, l.captured_at
+        FROM leads l
+        JOIN batches b ON l.batch_id = b.id
+        WHERE {where_clause}
+    """
+
+    is_admin = _is_admin_user(user_id)
+
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+
+            # 1. Count matching leads
+            c.execute(f'SELECT COUNT(*) FROM ({base_query}) _sub', params)
+            total_count = c.fetchone()[0]
+            if total_count == 0:
+                return jsonify({'error': 'no_leads_match', 'count': 0}), 404
+
+            # 2. Determine export cap from credit balance
+            if is_admin:
+                export_count = total_count
+                balance = None
+            else:
+                # Get current balance (SELECT FOR UPDATE to prevent concurrent exports)
+                c.execute(
+                    'SELECT id, balance_after FROM credit_ledger WHERE user_id = %s ORDER BY id DESC LIMIT 1 FOR UPDATE',
+                    (user_id,)
+                )
+                row = c.fetchone()
+                balance = row[1] if row else 0
+                if balance <= 0:
+                    return jsonify({'error': 'insufficient_credits', 'balance': 0}), 402
+                # Cap at balance
+                export_count = min(total_count, balance)
+
+            # 3. Fetch the actual rows (ordered by lead_score desc, capped)
+            paged_query = base_query + ' ORDER BY l.lead_score DESC NULLS LAST LIMIT %s'
+            c.execute(paged_query, params + [export_count])
+            rows = c.fetchall()
+            actual_count = len(rows)
+
+            if actual_count == 0:
+                return jsonify({'error': 'no_leads_match', 'count': 0}), 404
+
+            # 4. Build lead dicts (all revealed=True for export)
+            leads_dicts = [portal_lead_to_dict(r, revealed=True) for r in rows]
+            lead_ids = [r[0] for r in rows]
+
+            # 5. Atomically debit credits + mark reveals in same transaction
+            if not is_admin and actual_count > 0:
+                new_balance = balance - actual_count
+                c.execute("""
+                    INSERT INTO credit_ledger (user_id, amount, operation, ref_id, balance_after)
+                    VALUES (%s, %s, 'export', NULL, %s)
+                """, (user_id, -actual_count, new_balance))
+                # Mark all exported leads as revealed (idempotent)
+                c.executemany(
+                    'INSERT INTO user_lead_reveals (user_id, lead_id) VALUES (%s, %s) ON CONFLICT DO NOTHING',
+                    [(user_id, lid) for lid in lead_ids]
+                )
+            # get_db() context manager auto-commits on __exit__
+
+        # 6. Generate and return file (outside transaction — file gen after credits committed)
+        if fmt == 'json':
+            import json as json_lib
+            from flask import Response as FlaskResponse
+            json_bytes = json_lib.dumps(leads_dicts, default=str, ensure_ascii=False).encode('utf-8')
+            return FlaskResponse(
+                json_bytes,
+                mimetype='application/json',
+                headers={
+                    'Content-Disposition': f'attachment; filename="leads_{datetime.now().strftime("%Y%m%d")}.json"'
+                }
+            )
+        else:
+            from flask import Response as FlaskResponse
+            csv_bytes = _generate_csv_bytes(leads_dicts)
+            return FlaskResponse(
+                csv_bytes,
+                mimetype='text/csv; charset=utf-8-sig',
+                headers={
+                    'Content-Disposition': f'attachment; filename="leads_{datetime.now().strftime("%Y%m%d")}.csv"'
+                }
+            )
+
+    except Exception as e:
+        print(f'[ERROR] /api/client/leads/export: {e}')
         return jsonify({'error': str(e)}), 500
 
 
