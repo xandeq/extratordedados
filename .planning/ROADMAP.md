@@ -156,10 +156,10 @@ Plans:
 
 **Dependencies**: Phase 4 (credit ledger já implementado)
 
-**Plans:** 3 plans
+**Plans:** 1/3 plans executed
 
 Plans:
-- [ ] 05-01-PLAN.md — Wave 0 test stubs + niche_requests/niche_request_votes DB tables + _generate_csv_bytes() + GET /api/client/leads/export
+- [x] 05-01-PLAN.md — Wave 0 test stubs + niche_requests/niche_request_votes DB tables + _generate_csv_bytes() + GET /api/client/leads/export
 - [ ] 05-02-PLAN.md — POST/GET /api/client/niche-requests + GET/POST /api/admin/niche-requests (approve + reject) + activate Wave 0 test stubs
 - [ ] 05-03-PLAN.md — ClientExportModal.tsx + portal.tsx export button + Sidebar nav item + /request-niche page + /admin/niche-requests page
 

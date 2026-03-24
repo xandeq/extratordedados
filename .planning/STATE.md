@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-24T08:17:12.817Z"
+last_updated: "2026-03-24T10:22:19.178Z"
 progress:
   total_phases: 6
   completed_phases: 4
-  total_plans: 12
-  completed_plans: 12
+  total_plans: 15
+  completed_plans: 13
 ---
 
 # STATE.md — Project Memory
@@ -99,6 +99,9 @@ progress:
 | alert() for reveal toast in portal.tsx | No custom toast system in Phase 4 scope; sufficient for MVP |
 | RevealButton balance=null treated as hasCredits=true | Safe default for loading state and admin users without prop drilling null checks |
 | useClientCredits called independently in Sidebar and portal.tsx | Acceptable parallel calls vs prop-drilling complexity through layout tree |
+| No _has_minimum_role() in export endpoint | Function does not exist — consistent with reveal_lead and client_search_leads using verify_token + _is_admin_user only |
+| Export uses single bulk credit deduction (not loop of deduct_credit()) | Bulk INSERT INTO credit_ledger with amount=-N is correct for export — deduct_credit() is for single-credit operations |
+| Boolean filter conditions for has_email etc use inline SQL (no %s params) | Prevents psycopg2 parameter binding mismatch — inline NULL checks are equivalent |
 
 ## Performance Metrics
 
@@ -118,8 +121,9 @@ progress:
 | Phase 04-tier-cliente-reveal-gate-busca-avan-ada P02 | 4 | 2 tasks | 1 files |
 | Phase 04-tier-cliente-reveal-gate-busca-avan-ada P03 | 10 | 2 tasks | 5 files |
 | Phase 04-tier-cliente-reveal-gate-busca-avan-ada P03 | 15 | 3 tasks | 8 files |
+| Phase 05-export-com-cotas-niche-request-queue P01 | 10 | 2 tasks | 3 files |
 
 ## Last Session
 
-- **Stopped at**: Completed 04-tier-cliente-reveal-gate-busca-avan-ada/04-03-PLAN.md — human verification approved. Wave 0 test stubs activated (56 passed, 9 skipped). Phase 4 COMPLETE. Ready for Phase 5.
+- **Stopped at**: Completed 05-export-com-cotas-niche-request-queue/05-01-PLAN.md — Wave 0 stubs (8 skipped), niche_requests/niche_request_votes tables, GET /api/client/leads/export with credit deduction. 19 passed, 18 skipped. Ready for Plan 02 (niche request queue endpoints).
 - **Timestamp**: 2026-03-24
