@@ -2184,6 +2184,27 @@ def init_db():
             UNIQUE(name)
         )''')
 
+        # Phase 8: Niche catalog table
+        c.execute('''CREATE TABLE IF NOT EXISTS niches (
+            id           SERIAL PRIMARY KEY,
+            name         VARCHAR(255) NOT NULL,
+            category     VARCHAR(100) NOT NULL DEFAULT 'Outros',
+            keywords     TEXT[]       DEFAULT '{}',
+            active       BOOLEAN      DEFAULT TRUE,
+            priority     INTEGER      DEFAULT 100,
+            last_used_at TIMESTAMP,
+            created_at   TIMESTAMP    DEFAULT NOW(),
+            UNIQUE(name)
+        )''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_niches_active ON niches(active)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_niches_last_used ON niches(last_used_at ASC NULLS FIRST)')
+        # Migrate existing custom_niches rows (category = 'Outros', priority = 100)
+        c.execute('''
+            INSERT INTO niches (name, category, created_at)
+            SELECT name, 'Outros', created_at FROM custom_niches
+            ON CONFLICT (name) DO NOTHING
+        ''')
+
         # enrichment_source column on search_jobs
         c.execute("ALTER TABLE search_jobs ADD COLUMN IF NOT EXISTS enrichment_source VARCHAR(30) DEFAULT 'scraping'")
 
