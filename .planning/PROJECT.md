@@ -25,22 +25,51 @@ Sistema web de extração e agregação automatizada de leads empresariais brasi
 
 ### Active
 
-#### Pipeline & Automação
+#### Milestone v1.0 — Completed ✓
+
+##### Pipeline & Automação
 - [x] Pipeline diário executa nichos configuráveis (não hardcoded) — Validated in Phase 1: pipeline-100-automatico
 - [x] Relatório automático pós-pipeline enviado por email (Brevo) — Validated in Phase 1: pipeline-100-automatico
 - [x] Painel de health do pipeline: última execução, leads capturados, erros, próxima execução — Validated in Phase 1: pipeline-100-automatico
 - [x] Configuração de nichos e regiões por interface (sem editar código) — Validated in Phase 1: pipeline-100-automatico
 
-#### Qualidade de Leads
+##### Qualidade de Leads
 - [x] Validação de email em tempo real antes de salvar (verificar formato + MX record) — Validated in Phase 2: qualidade-de-leads
 - [x] Score de qualidade aprimorado: penalizar leads sem telefone/email/website — Validated in Phase 2: qualidade-de-leads
 - [x] Deduplicação cross-batch (detectar email duplicado entre batches diferentes) — Validated in Phase 2: qualidade-de-leads
 
-#### Portal de Clientes
-- [ ] Tier de acesso "cliente" — vê base agregada, não pode disparar extrações
-- [ ] Busca avançada: nicho, cidade, estado, segmento, score mínimo, tem WhatsApp/email/site
-- [ ] Exportação com cota por plano (ex: 500 leads/mês no plano básico)
-- [ ] Solicitação de novo nicho: cliente pede nicho+cidade, entra na fila de extração
+##### Portal de Clientes
+- [x] Tier de acesso "cliente" — vê base agregada, não pode disparar extrações — Validated in Phase 4
+- [x] Busca avançada: nicho, cidade, estado, segmento, score mínimo, tem WhatsApp/email/site — Validated in Phase 4
+- [x] Exportação com cota por plano (ex: 500 leads/mês no plano básico) — Validated in Phase 5
+- [x] Solicitação de novo nicho: cliente pede nicho+cidade, entra na fila de extração — Validated in Phase 5
+- [x] Buscas salvas com notificação por email de novos leads — Validated in Phase 6
+
+#### Milestone v1.1 — Lead Quality Engine (Active)
+
+##### Qualidade de Leads Avançada
+- [ ] QUAL-01: Lead com email inválido/bounceável é rejeitado antes de entrar na base
+- [ ] QUAL-02: Lead com TLD estrangeiro (.es, .pt, .pl, .com.ar, etc.) é rejeitado automaticamente
+- [ ] QUAL-03: Lead com email no estilo slogan/frase é detectado e rejeitado
+- [ ] QUAL-04: Lead duplicado já existente no CRM (por email ou telefone) não é re-inserido
+- [ ] QUAL-05: Número de WhatsApp é validado antes de salvar (formato + DD válido BR)
+- [ ] QUAL-06: Apenas leads com email válido OR WhatsApp válido são enviados ao CRM
+
+##### Novas Fontes de Extração
+- [ ] SRC-01: Apple Maps integrado na busca massiva como nova fonte
+- [ ] SRC-02: Pesquisa e integração das melhores APIs de leads disponíveis (avaliação + integração)
+- [ ] SRC-03: Google Maps melhorado (mais resultados por nicho, menos bloqueios, retry inteligente)
+- [ ] SRC-04: Busca no Google melhorada com mais variações de query por nicho
+
+##### Catálogo de Nichos
+- [ ] NICHE-01: Catálogo completo de nichos + subnichos pesquisado e armazenado no banco (tabela niches)
+- [ ] NICHE-02: Pipeline automático usa nichos do banco (não hardcoded) para rotação
+- [ ] NICHE-03: Script/SQL para popular e atualizar catálogo de nichos facilmente
+- [ ] NICHE-04: Botão "Selecionar todos / Desselecionar todos" na busca massiva
+
+##### Expansão Regional
+- [ ] REG-01: Todas as cidades do Espírito Santo disponíveis no pipeline (tabela ou config)
+- [ ] REG-02: Pipeline automático rotaciona pelas cidades do ES progressivamente (não só Grande Vitória)
 
 ### Out of Scope
 
@@ -77,7 +106,7 @@ Sistema web de extração e agregação automatizada de leads empresariais brasi
 | Monolito Flask continua | Evitar reescrita — incrementar | — Pending |
 | Pipeline diário às 02:00 (APScheduler) | Sem tráfego, não compete com usuários | ✓ Good |
 | DuckDuckGo como motor primário | Evitar bloqueio do Google | ✓ Good |
-| Nichos hardcoded no código | Tech debt — mover para DB/config | ⚠️ Revisit |
+| Nichos hardcoded no código | Tech debt — mover para DB/config | ⚠️ Revisit → Milestone v1.1 NICHE-01/02/03 |
 
 ## Evolution
 
@@ -97,4 +126,4 @@ Este documento evolui a cada fase completada.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-03-24 after Phase 6 completion — saved searches + email notifications live*
+*Last updated: 2026-03-24 — Milestone v1.0 complete (6 phases, 20 plans). Milestone v1.1 Lead Quality Engine started.*

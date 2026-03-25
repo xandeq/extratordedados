@@ -176,6 +176,108 @@
 
 ---
 
+---
+
+## Milestone v1.1 — Lead Quality Engine
+
+**Objetivo**: Base de leads de altíssima qualidade. Apenas leads com email válido OR WhatsApp válido entram. Pipeline roda automaticamente por todos os nichos e cidades do ES.
+
+**Contexto**: Milestones v1.0 (Phases 1-6) 100% completos. Agora é escalar qualidade e volume.
+
+---
+
+### Fase 7 — Qualidade de Leads Avançada (QUAL-01 a QUAL-06)
+
+**Goal**: Zero leads ruins na base. Cada lead que entra tem email válido ou WhatsApp válido, sem duplicatas com o CRM, sem emails estrangeiros ou slogans.
+
+#### Backend
+- [ ] **QUAL-01**: Expandir `validate_email_free()` — rejeitar emails bounceáveis conhecidos (disposable + domínios de baixa reputação), integrar lista de bounce domains atualizada
+- [ ] **QUAL-02**: Filtro de TLD estrangeiro em `save_lead_to_db()` — rejeitar `.es`, `.pt`, `.pl`, `.com.ar`, `.mx`, `.co`, `.uk`, `.de`, `.fr`, `.it` e outros TLDs não-BR
+- [ ] **QUAL-03**: Detector de email-slogan — regex + heurística: email com 4+ palavras, contém verbos, frases (ex: `contato@faleconoscoagora.com.br` OK, `venhaserfeliz@empresa.com` → rejeitar)
+- [ ] **QUAL-04**: Dedup contra CRM — antes do CRM sync, verificar se email/telefone já existe via `GET /api/crm/check` ou lookup local em cache; não re-enviar leads já no CRM
+- [ ] **QUAL-05**: Validar WhatsApp com `phonenumbers` — verificar DDD válido BR (11-99 para celular), formato correto, comprimento mínimo; rejeitar números claramente inválidos
+- [ ] **QUAL-06**: Gate CRM — `auto_sync_new_leads_background()` só envia leads que têm email válido (quality_grade != 'F' no campo email) OR whatsapp não-nulo e válido
+- [ ] Novo campo `rejection_reason` (varchar) em `leads` — registra motivo de rejeição quando lead é descartado
+- [ ] Endpoint `GET /api/admin/quality-stats` — métricas: taxa de rejeição por motivo, leads aceitos/rejeitados por dia
+
+#### Frontend
+- [ ] Card de qualidade no admin dashboard: "N leads rejeitados hoje / motivo mais comum"
+- [ ] Filtro na página de leads: "Rejeitados" / "Aceitos" / "Todos"
+
+#### Critérios de aceite
+- Nenhum email com TLD estrangeiro entra na base após a fase
+- Taxa de rejeição por email-slogan < 5% (evita over-rejection)
+- 0 duplicatas enviadas ao CRM (leads já existentes não re-enviados)
+- Leads sem email válido E sem WhatsApp válido não chegam ao CRM
+
+---
+
+### Fase 8 — Catálogo de Nichos (NICHE-01 a NICHE-04)
+
+**Goal**: Pipeline roda automaticamente por 200+ nichos e subnichos. Admin seleciona "todos" ou subsets via UI.
+
+#### Backend
+- [ ] **NICHE-01**: Tabela `niches` (id, name, category, subcategory, keywords[], active, priority, created_at) — catálogo completo de nichos BR relevantes
+- [ ] **NICHE-02**: `get_pipeline_config()` lê nichos ativos da tabela `niches` (não mais `pipeline_config.nichos`) para rotação diária
+- [ ] **NICHE-03**: Script `scripts/import/populate_niches.sql` — INSERT de 150+ nichos + subnichos organizados por categoria (saúde, beleza, alimentação, serviços, educação, etc.)
+- [ ] `GET /api/admin/niches` — lista todos os nichos com status ativo/inativo
+- [ ] `PUT /api/admin/niches/bulk` — ativar/desativar múltiplos nichos de uma vez
+- [ ] Pipeline rotaciona: em vez de rodar todos os nichos em 1 dia, rotaciona grupos de 20 nichos/dia
+
+#### Frontend
+- [ ] **NICHE-04**: Botão "Selecionar todos / Desselecionar todos" na página de busca massiva
+- [ ] Página `/admin/niches` — lista categorizada de nichos, toggle ativo, prioridade
+
+#### Critérios de aceite
+- 150+ nichos cadastrados no banco após execução do script
+- Pipeline usa nichos do banco (zero hardcoded)
+- "Selecionar todos" funciona em 1 clique na busca massiva
+
+---
+
+### Fase 9 — Expansão Regional ES (REG-01 a REG-02)
+
+**Goal**: Pipeline cobre todo o Espírito Santo progressivamente, não só Grande Vitória.
+
+#### Backend
+- [ ] **REG-01**: Tabela `regions` (id, name, city, state, ibge_code, priority, active) — todas as 78 cidades do ES
+- [ ] Script `scripts/import/populate_es_cities.sql` — INSERT das 78 cidades do ES com dados IBGE
+- [ ] **REG-02**: `run_daily_pipeline()` rotaciona por cidades do ES em grupos de 5-10/dia (round-robin por `last_used_at`)
+- [ ] `GET /api/admin/regions` — listar regiões com última execução, leads capturados
+- [ ] `PUT /api/admin/regions/bulk` — ativar/desativar regiões
+
+#### Frontend
+- [ ] Mapa ou lista de cidades na página de pipeline config — verde = executado nos últimos 7 dias
+- [ ] Seletor de região na busca massiva atualizado com todas as cidades do ES
+
+#### Critérios de aceite
+- 78 cidades do ES disponíveis (não só Grande Vitória)
+- Pipeline rotaciona automaticamente, sem repetir cidades na mesma semana
+- Admin vê quais cidades foram cobertas e quando
+
+---
+
+### Fase 10 — Novas Fontes (SRC-01 a SRC-04)
+
+**Goal**: Mais volume de leads de qualidade via fontes novas e melhorias nas existentes.
+
+#### Backend
+- [ ] **SRC-01**: Apple Maps scraper — `process_apple_maps_massive()` usando API não-oficial ou Playwright; integrar como Thread 17 no massive search
+- [ ] **SRC-02**: Pesquisar e avaliar top 5 APIs de leads BR (FindThatLead, Snov.io, Hunter.io, Apollo, Lusha BR) — implementar a melhor opção gratuita/low-cost; integrar como método adicional
+- [ ] **SRC-03**: Melhorar `process_outscraper_massive()` — retry com backoff, cursor-based pagination, aumentar max_results por query de 20 → 100, usar `search_queries` em batch
+- [ ] **SRC-04**: Melhorar `process_search_job()` — adicionar 5 templates de query por nicho (ex: `"[nicho] [cidade] contato"`, `"[nicho] [cidade] email"`, `"[nicho] [cidade] whatsapp"`, `site:*.com.br "[nicho]" "[cidade]"`, `"[nicho]" "[cidade]" OR "[cidade vizinha]"`)
+- [ ] Novo endpoint `GET /api/admin/source-stats` — leads capturados por fonte nos últimos 30 dias
+
+#### Frontend
+- [ ] Gráfico de barras no admin dashboard: leads por fonte (Google Maps, Apple Maps, diretórios, etc.)
+
+#### Critérios de aceite
+- Apple Maps gera leads em teste piloto com Grande Vitória
+- Google Maps (Outscraper) aumenta volume ≥ 50% vs baseline
+- Cada nicho tem ≥ 5 variações de query na busca por motores
+
+---
+
 ## Backlog (não neste milestone)
 
 | Ideia | Razão |
@@ -187,7 +289,8 @@
 | Celery/RQ para jobs | Requer Redis — desnecessário para 1 job/dia |
 | LinkedIn Sales Navigator | Custo alto, scraping atual suficiente |
 | MillionVerifier bulk validation | Pago — implementar como feature de plano pago |
+| Expansão para outros estados (SP, RJ, MG) | Após ES coberto 100% |
 
 ---
 
-*Last updated: 2026-03-22*
+*Last updated: 2026-03-24 — Milestone v1.1 Lead Quality Engine requirements added*

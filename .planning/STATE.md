@@ -1,14 +1,14 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: milestone
-status: unknown
-last_updated: "2026-03-24T15:43:03.138Z"
+milestone: v1.1
+milestone_name: lead-quality-engine
+status: planning
+last_updated: "2026-03-24T00:00:00.000Z"
 progress:
-  total_phases: 6
-  completed_phases: 6
-  total_plans: 20
-  completed_plans: 20
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
 ---
 
 # STATE.md — Project Memory
@@ -17,34 +17,44 @@ progress:
 
 ## Current Status
 
-- **Active milestone**: Milestone 2 — Portal de Clientes
-- **Active phase**: Phase 6 — Plan 03 COMPLETE (Wave 3: Frontend — /saved-searches page, Salvar Busca modal, Sidebar nav link, deployed)
-- **Milestone 2**: Phase 5 COMPLETE — export com cotas + niche request queue fully operational. Phase 6 Plans 01/02/03 COMPLETE — full CRUD + scheduler + frontend deployed.
-- **Milestone 1**: COMPLETE (Phases 1-3 all done, 48/48 regression tests passing)
-- **Last completed**: Phase 6 Plan 03 — saved-searches.tsx (147 lines, GET/PATCH/DELETE wired), Salvar Busca button + modal on portal.tsx (POST /api/client/saved-searches), Sidebar Buscas Salvas nav link, frontend deployed 54 files via FTP.
+- **Active milestone**: Milestone v1.1 — Lead Quality Engine
+- **Active phase**: Planning — ROADMAP.md pending creation
+- **Milestone v1.0**: COMPLETE (Phases 1-6 all done, 20/20 plans, all features live)
+- **Last completed**: Milestone v1.0 Phase 6 Plan 03 — saved searches + notifications frontend deployed
 
-## Completed Work
+## Milestone v1.1 Scope
+
+| ID | Requirement |
+|----|-------------|
+| QUAL-01 | Rejeitar emails inválidos/bounceáveis antes de inserir na base |
+| QUAL-02 | Rejeitar TLDs estrangeiros (.es, .pt, .pl, .com.ar, etc.) |
+| QUAL-03 | Rejeitar emails no estilo slogan/frase |
+| QUAL-04 | Não re-inserir leads já existentes no CRM (dedup por email/telefone) |
+| QUAL-05 | Validar formato + DD válido de WhatsApp antes de salvar |
+| QUAL-06 | Enviar ao CRM apenas leads com email válido OR WhatsApp válido |
+| SRC-01 | Integrar Apple Maps na busca massiva |
+| SRC-02 | Pesquisar e integrar melhores APIs de leads disponíveis |
+| SRC-03 | Melhorar Google Maps scraper (mais resultados, menos bloqueios) |
+| SRC-04 | Melhorar busca Google com mais variações de query por nicho |
+| NICHE-01 | Criar catálogo completo de nichos + subnichos no banco |
+| NICHE-02 | Pipeline usa nichos do banco (não hardcoded) para rotação |
+| NICHE-03 | Script/SQL para popular e atualizar catálogo facilmente |
+| NICHE-04 | Botão "Selecionar todos / Desselecionar todos" na busca massiva |
+| REG-01 | Todas as cidades do ES disponíveis no pipeline |
+| REG-02 | Pipeline rotaciona progressivamente pelas cidades do ES |
+
+## Completed Work (Milestone v1.0 History)
 
 | Date | What |
 |------|------|
 | 2026-03-22 | Project reorganized: app/, scripts/, docs/, data/, .planning/ |
 | 2026-03-22 | PROJECT.md, REQUIREMENTS.md, ROADMAP.md created |
-| 2026-03-22 | 4 research reports created in .planning/research/ |
-| 2026-03-22 | Phase 1 Plan 01: pipeline_config table, get_pipeline_config(), GET/PUT /api/admin/pipeline-config endpoints |
-| 2026-03-23 | Phase 1 Plan 02: GET /api/admin/pipeline/health endpoint, Brevo email report, healthchecks.io ping, hooked into run_daily_pipeline() |
-| 2026-03-23 | Phase 1 Plan 03: /admin/pipeline-config editor page (niche toggles, region, schedule, notifications) + pipeline health card + 30-day history on admin/index.tsx |
-| 2026-03-23 | Phase 2 Plan 01: DB foundation — 4 quality columns (captured_at, quality_grade, etc.), global unique index, 157 dedup rows removed, Wave 0 test scaffold (14 tests), Phase 2 stub endpoints |
-| 2026-03-23 | Phase 2 Plan 02: Core quality functions — validate_email_free, normalize_phone_br, compute_lead_quality_score, save_lead_to_db; all 10 extraction INSERT paths refactored; validate-batch endpoint; quality_grade filter; 14/14 tests passing |
-| 2026-03-23 | Phase 2 Plan 03: validate_zerobounce() + POST /api/leads/<id>/verify-email; GradeBadge + FreshnessIndicator; A-F quality filter; Verificar Email button; tools/zerobounce in AWS SM |
-| 2026-03-23 | Phase 3 Plan 01: cnpj_rf table (20 cols, 2 partial indexes), enrich_from_rf_local() (3s SQL timeout), enrich_cnpj_with_fallback() (5-level chain), import_receita_federal.py (nohup-safe, --dry-run), RECEITA_FEDERAL_IMPORT.md runbook. 10 test stubs (10 skipped). Deployed to VPS. |
-| 2026-03-23 | Phase 3 Plan 02: Outscraper Google Maps — tools/outscraper AWS SM secret, _get_outscraper_key(), outscraper in requirements.txt, process_outscraper_massive() Thread 16, outscraper_maps wired into POST /api/search/massive (default methods + jobs + thread + response dict). 2/3 tests pass (3rd skips until real API key set). Deployed to VPS. |
-| 2026-03-23 | Phase 3 Plan 03: Prospeo LinkedIn enrichment — tools/prospeo AWS SM secret, _get_prospeo_key(), enrich_linkedin_prospeo(), POST /api/leads/<id>/enrich-linkedin (rate limit 30/hour), 75-credit cap in process_linkedin_massive(), Minha Receita docker-compose deploy guide in RECEITA_FEDERAL_IMPORT.md. 3/3 tests passing. Deployed to VPS. |
-| 2026-03-24 | Phase 4 Plan 01: DB foundation — role column on users, credits_per_month on plan_limits, credit_ledger table (BIGSERIAL, SELECT FOR UPDATE), user_lead_reveals table (PK user_id+lead_id), require_role() decorator, deduct_credit() atomic helper, grant_monthly_credits() APScheduler job (day=1 00:05 with double-fire guard), mask_email(), mask_phone(), portal_lead_to_dict(). /api/me returns role. 12 Wave 0 test stubs. 53 passed, 17 skipped. |
-| 2026-03-24 | Phase 4 Plan 02: Three client portal endpoints — POST /api/leads/reveal/<id> (atomic credit deduction, admin bypass, idempotent re-reveal, 402 on zero balance), GET /api/client/credits (balance + 20 event history), GET /api/leads/search (masked search over shared batches, 9 filter params, portal_lead_to_dict masking). 52 passed, 18 skipped. Deployed + VPS health check OK. |
-| 2026-03-24 | Phase 4 Plan 03: Client portal frontend — /portal page (filter panel + masked results + RevealButton), useClientCredits hook, RevealButton (4 states), Sidebar Portal nav + CreditBalance widget, plans.tsx credits row. TypeScript clean, Next.js build OK, 56 passed, 9 skipped. Frontend deployed. Human verification APPROVED. |
-| 2026-03-24 | Phase 6 Plan 01: Wave 0 — saved_searches table (DDL + 2 indexes), test scaffold (1 pass 5 skip), stub endpoints /api/client/saved-searches (auth gate), _build_portal_filter_query() helper, send_notification_email() via Brevo. Deployed to VPS. |
-| 2026-03-24 | Phase 6 Plan 02: Wave 1 — 4 REST CRUD endpoints (POST upsert, GET list, DELETE owner-guarded, PATCH toggle), trigger_saved_search_notifications APScheduler job (08:00 BRT, double-fire guard, 23h re-send prevention), all 6 tests activated. Deployed to VPS. |
-| 2026-03-24 | Phase 6 Plan 03: Wave 3 Frontend — /saved-searches page (list, toggle notify, delete), Salvar Busca button + modal on /portal, Sidebar Buscas Salvas nav link. TypeScript clean, frontend deployed via FTP (54 files, 0 errors). |
+| 2026-03-22 | Phase 1: pipeline_config table, nichos configuráveis, health endpoint, Brevo reports, admin UI |
+| 2026-03-23 | Phase 2: email validation, quality score, dedup cross-batch, ZeroBounce integration |
+| 2026-03-23 | Phase 3: Receita Federal local import, Outscraper Google Maps, Prospeo LinkedIn |
+| 2026-03-24 | Phase 4: client tier + reveal gate + portal frontend + credit system |
+| 2026-03-24 | Phase 5: export com cotas + niche request queue + admin approval UI |
+| 2026-03-24 | Phase 6: saved searches + email notifications + frontend deployed |
 
 ## Research Available
 
@@ -55,94 +65,20 @@ progress:
 | `.planning/research/saas-portal.md` | Credit-per-reveal, SELECT FOR UPDATE, niche request queue |
 | `.planning/research/lead-quality.md` | email-validator, phonenumbers, 6-dimension score |
 
-## Key Decisions Made
+## Key Decisions Made (Milestone v1.0)
 
 | Decision | Rationale |
 |----------|-----------|
-| Brevo email for reports (not WhatsApp now) | Zero setup, key already in AWS SM |
+| Brevo email for reports | Zero setup, key already in AWS SM |
 | Credit-per-reveal model | Industry standard (Apollo, Hunter, Lusha) |
 | SELECT FOR UPDATE for credits | Prevents race condition on concurrent reveals |
 | Receita Federal local import | Zero cost, 60M+ companies, no rate limits |
-| APScheduler 3.x (keep, don't upgrade) | 4.x is pre-release/not production-ready |
+| APScheduler 3.x (keep) | 4.x is pre-release/not production-ready |
 | pipeline_config table (not hardcoded) | Enables admin UI config without code changes |
-| Reveal gate before export in roadmap | You reveal before you bulk-export |
-| Config values stored as JSON strings | Lists serialize cleanly, parsed with json.loads() |
-| get_pipeline_config() never raises | Falls back to module constants on any DB error — pipeline never blocked |
-| reschedule_job only on hour/minute change | Region/niches take effect on next trigger without APScheduler restart |
-| pipeline_start as absolute first line of run_daily_pipeline | Guarantees it is always bound, even on early-exception paths |
-| Notification helpers inserted before run_daily_pipeline in code | Logical grouping near pipeline code; helpers are pipeline-specific |
-| Failure report call uses locals().get() for optional counters | Defensive: counters may not be assigned if exception fires before step 4/5/6 |
-| PipelineHealth fetch uses .catch(() => null) — safe defaults | Admin index never fails to load if pipeline endpoint is down |
-| getStatusBadge() extracted as module-level function (not inline) | Called in two places: status row and history table rows |
-| History table sliced to 10 rows | daily-job/status returns all-time history; 10 rows is readable without pagination |
-| ADD COLUMN IF NOT EXISTS in init_db ALTER TABLE loop | Avoids silent rollback when DuplicateColumn is thrown inside multi-column transaction |
-| Phase 2 stub endpoints in Wave 0 | auth-gate tests must pass immediately; stubs return 401 unauth / 501 auth until Wave 2 |
-| validate_email_free uses check_deliverability=False | Avoid per-call DNS in batch — MX check delegates to has_valid_mx() cache |
-| save_lead_to_db is canonical INSERT helper | quality_grade written on every lead INSERT regardless of extraction pipeline |
-| quality filter supports both A/B/C/D/F and legacy tiers | Backward compat with existing frontend quality dropdown |
-| ZeroBounce key stored as placeholder in AWS SM | Operator must update tools/zerobounce with real key — endpoint returns 503 until then |
-| Verificar Email logic in leads.tsx via onVerifyEmail callback prop | Keeps LeadDrawer stateless, centralized in page component |
-| quality filter param remains 'quality' (not 'quality_grade') | Backend handles both A-F grades and legacy basico/medio/premium tiers |
-| enrich_from_rf_local uses threading timeout (not signal-based) | Windows/Linux compat; signal.alarm not available on Windows |
-| Level 2 (Minha Receita) silently passes on any exception | Connection refused is expected until Plan 03 deploys it on VPS |
-| ONLY_ACTIVE=True default in import script | 60M total vs ~22M active — saves ~3x disk space; inactive CNPJs rarely needed |
-| municipio_cod stored as integer (RF code), not city name | Would require separate municipios lookup table — city lookup deferred to future plan |
-| Outscraper ApiClient lazy-imported inside thread function | Avoids import-time cost for optional SDK at startup |
-| tools/outscraper placeholder in AWS SM | Missing key treated as quota_exceeded (graceful degradation) — same pattern as serper/apify |
-| Prospeo key stored as empty placeholder in AWS SM | Endpoint returns 503 until real key set — same pattern as ZeroBounce/Outscraper |
-| with get_db() as conn in enrich_lead_linkedin | Consistent with all other Flask endpoints; get_db_connection() does not exist |
-| prospeo_credits_used per-run counter (not persisted) | Simple and sufficient for Prospeo free tier 75-credit cap per run |
-| deduct_credit takes open conn (not get_db()) | Caller controls transaction boundary — atomicity with user_lead_reveals INSERT in plan 02 |
-| ROLE_HIERARCHY uses integers (admin=3, operator=2, client=1) | Single >= comparison handles future role additions |
-| portal_lead_to_dict uses positional row indexing | Callers in plans 02/03 must SELECT columns in documented order |
-| grant_monthly_credits double-fire guard uses 5-min window | Same pattern as daily pipeline guard — consistent across schedulers |
-| reveal_lead() verifies lead exists before credit logic | Prevents credit deduction attempts for nonexistent leads — 404 check before any DB credit operations |
-| client_search_leads() delegates masking to portal_lead_to_dict() | Single source of truth for reveal state — no inline masking in endpoint |
-| quality_grade filter uses grade_order dict + = ANY(%s) | Cleaner than multiple OR conditions — allows A/B/C/D/F scale filtering at-or-better |
-| alert() for reveal toast in portal.tsx | No custom toast system in Phase 4 scope; sufficient for MVP |
-| RevealButton balance=null treated as hasCredits=true | Safe default for loading state and admin users without prop drilling null checks |
-| useClientCredits called independently in Sidebar and portal.tsx | Acceptable parallel calls vs prop-drilling complexity through layout tree |
-| No _has_minimum_role() in export endpoint | Function does not exist — consistent with reveal_lead and client_search_leads using verify_token + _is_admin_user only |
-| Export uses single bulk credit deduction (not loop of deduct_credit()) | Bulk INSERT INTO credit_ledger with amount=-N is correct for export — deduct_credit() is for single-credit operations |
-| Boolean filter conditions for has_email etc use inline SQL (no %s params) | Prevents psycopg2 parameter binding mismatch — inline NULL checks are equivalent |
-| GET /api/client/niche-requests returns all pending/approved/processing/done (not just own) | More useful for a vote list UI — clients see all active requests, not just theirs |
-| _trigger_niche_extraction uses simplified done-immediately pattern | Actual search integration deferred to future plan — keeps approve endpoint functional without wiring to massive search |
-| Use process_search_job (not process_search_engines_massive) for niche extraction | Correct function name in app.py for search engines thread — plan had wrong name in interfaces block |
-| _trigger_niche_extraction creates batch + 3 search_jobs then calls process_search_job blocking | leads_added persisted to niche_requests row after extraction completes |
-| Wave 0 stub endpoints return 401/501 | Enables auth guard test to pass immediately while deferring full CRUD to Plan 02 |
-| _build_portal_filter_query returns (conditions, params) tuple | Shared by client_search_leads and future notification scheduler — caller joins conditions |
-| 4 separate endpoint functions instead of 2 combined handlers | Clearer route dispatch, easier to test and read individually |
-| test_notification_email_format skips if DB_HOST not set | Flask monolith import hangs in local dev — skip guard prevents infinite hang without losing test value |
-| Double-fire guard in notification scheduler uses last_notified_at 10-min window | No separate lock table needed — consistent pattern with last_notified_at semantics |
-
-## Performance Metrics
-
-| Phase | Plan | Duration | Tasks | Files |
-|-------|------|----------|-------|-------|
-| 01 | 01 | ~15 min | 2/2 | 2 |
-| 01 | 02 | ~15 min | 2/2 | 2 |
-| 01 | 03 | ~20 min | 2/2 | 2 |
-| 02-qualidade-de-leads | 01 | ~16 min | 2/2 | 3 |
-| 02-qualidade-de-leads | 02 | ~11 min | 2/2 | 2 |
-| 02-qualidade-de-leads | 03 | ~7 min | 2/2 | 3 |
-| 03-novas-fontes | 01 | ~6 min | 4/4 | 6 |
-| 03-novas-fontes | 02 | ~5 min | 3/3 | 3 |
-| 03-novas-fontes | 03 | ~6 min | 3/3 | 3 |
-| Phase 04-tier-cliente-reveal-gate-busca-avan-ada P01 | 12 | 2 tasks | 5 files |
-| 04-tier-cliente-reveal-gate-busca-avan-ada | 01 | ~12 min | 2/2 | 5 |
-| Phase 04-tier-cliente-reveal-gate-busca-avan-ada P02 | 4 | 2 tasks | 1 files |
-| Phase 04-tier-cliente-reveal-gate-busca-avan-ada P03 | 10 | 2 tasks | 5 files |
-| Phase 04-tier-cliente-reveal-gate-busca-avan-ada P03 | 15 | 3 tasks | 8 files |
-| Phase 05-export-com-cotas-niche-request-queue P01 | 10 | 2 tasks | 3 files |
-| Phase 05-export-com-cotas-niche-request-queue P02 | 8 | 2 tasks | 3 files |
-| Phase 05-export-com-cotas-niche-request-queue P03 | 15 | 3 tasks | 5 files |
-| Phase 05-export-com-cotas-niche-request-queue P04 | 5 | 2 tasks | 2 files |
-| Phase 05-export-com-cotas-niche-request-queue P05 | 6 | 1 tasks | 1 files |
-| Phase 06 P01 | 11 | 2 tasks | 2 files |
-| Phase 06-saved-searches-notifica-es-de-novos-leads P02 | 15 | 2 tasks | 2 files |
-| Phase 06-saved-searches-notifica-es-de-novos-leads P03 | 16 | 2 tasks | 3 files |
+| save_lead_to_db is canonical INSERT | quality_grade written on every INSERT |
+| _build_portal_filter_query shared helper | Used by search + notification scheduler |
 
 ## Last Session
 
-- **Stopped at**: Completed Phase 06 Plan 03 — saved-searches.tsx + Salvar Busca modal + Sidebar nav link, frontend deployed. Checkpoint reached for human verification of /portal and /saved-searches.
+- **Stopped at**: Milestone v1.0 complete. Starting Milestone v1.1 — REQUIREMENTS.md + ROADMAP.md creation in progress.
 - **Timestamp**: 2026-03-24
