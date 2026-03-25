@@ -219,12 +219,12 @@ Plans:
 
 **Out of scope**: MillionVerifier bulk, ZeroBounce para validação em lote
 
-**Plans:** 0/3 plans complete
+**Plans:** 3 plans
 
 Plans:
-- [ ] 07-01-PLAN.md — Wave 0: DB migration rejection_reason + expand validate_email_free() bounce domains + foreign TLD filter + email-slogan detector
-- [ ] 07-02-PLAN.md — Wave 1: CRM dedup cache + WhatsApp validator + CRM gate in auto_sync + GET /api/admin/quality-stats
-- [ ] 07-03-PLAN.md — Wave 2: admin quality card (dashboard) + Rejected/Accepted filter on leads page + frontend deploy
+- [ ] 07-01-PLAN.md — Wave 1: _is_foreign_tld() + _is_slogan_email() + save_lead_to_db() guards (QUAL-01/02/03/05) + test scaffold
+- [ ] 07-02-PLAN.md — Wave 2: crm_sent_leads table + cache READ/WRITE in sync_lead_to_alexandrequeiroz() (QUAL-04)
+- [ ] 07-03-PLAN.md — Wave 3: QUAL-06 gate in 3 sync functions + GET /api/admin/quality-stats endpoint
 
 ---
 
