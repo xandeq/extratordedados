@@ -190,6 +190,127 @@ Plans:
 
 ---
 
+## Milestone v1.1 — Lead Quality Engine
+
+**Objetivo**: Base de leads de altíssima qualidade. Apenas leads com email válido OR WhatsApp válido entram. Pipeline roda automaticamente por todos os nichos e cidades do ES.
+
+**Contexto**: Milestones v1.0 (Phases 1-6) 100% completos. Agora é escalar qualidade e volume.
+
+---
+
+### Phase 7: Qualidade de Leads Avançada
+
+**Goal**: Zero leads ruins na base — emails inválidos, TLDs estrangeiros, slogans e duplicatas de CRM são bloqueados na entrada.
+
+**Value delivered**: CRM recebe apenas leads acionáveis. Taxa de bounce no email marketing cai. Nenhum lead já existente no CRM é re-enviado.
+
+**Scope**:
+- Expandir `validate_email_free()` com lista de bounce domains atualizada (QUAL-01)
+- Filtro de TLD estrangeiro em `save_lead_to_db()` — rejeitar `.es`, `.pt`, `.pl`, `.com.ar` etc. (QUAL-02)
+- Detector de email-slogan via regex + heurística (QUAL-03)
+- Dedup contra CRM antes do sync — verificar email/telefone existente, não re-enviar (QUAL-04)
+- Validar WhatsApp com `phonenumbers`: DDD válido BR (11-99 para celular), comprimento mínimo (QUAL-05)
+- Gate CRM em `auto_sync_new_leads_background()`: enviar somente leads com email válido OR whatsapp válido (QUAL-06)
+- Campo `rejection_reason` (varchar) na tabela `leads`
+- `GET /api/admin/quality-stats` — taxa de rejeição por motivo, aceitos/rejeitados por dia
+- Frontend: card de qualidade no admin dashboard + filtro "Rejeitados/Aceitos/Todos" na página de leads
+
+**Dependencies**: Phase 2 (validate_email_free + quality_grade já existem como base)
+
+**Out of scope**: MillionVerifier bulk, ZeroBounce para validação em lote
+
+**Plans:** 0/3 plans complete
+
+Plans:
+- [ ] 07-01-PLAN.md — Wave 0: DB migration rejection_reason + expand validate_email_free() bounce domains + foreign TLD filter + email-slogan detector
+- [ ] 07-02-PLAN.md — Wave 1: CRM dedup cache + WhatsApp validator + CRM gate in auto_sync + GET /api/admin/quality-stats
+- [ ] 07-03-PLAN.md — Wave 2: admin quality card (dashboard) + Rejected/Accepted filter on leads page + frontend deploy
+
+---
+
+### Phase 8: Catálogo de Nichos
+
+**Goal**: Pipeline rotaciona automaticamente por 150+ nichos cadastrados no banco. Admin ativa/desativa nichos via UI sem tocar em código.
+
+**Value delivered**: Volume de leads escala com zero esforço manual. Novos nichos entram sem deploy. Busca massiva ganha seleção inteligente de nicho em 1 clique.
+
+**Scope**:
+- Tabela `niches` (id, name, category, subcategory, keywords[], active, priority, created_at) (NICHE-01)
+- `get_pipeline_config()` lê nichos ativos da tabela `niches` para rotação diária (NICHE-02)
+- Script `scripts/import/populate_niches.sql` — 150+ nichos por categoria (saúde, beleza, alimentação, serviços, educação) (NICHE-03)
+- `GET /api/admin/niches` + `PUT /api/admin/niches/bulk` — ativar/desativar em lote
+- Pipeline rotaciona grupos de 20 nichos/dia em vez de rodar todos de uma vez
+- Frontend: botão "Selecionar todos / Desselecionar todos" na busca massiva (NICHE-04)
+- Página `/admin/niches` — lista categorizada, toggle ativo, prioridade editável
+
+**Dependencies**: Phase 1 (pipeline_config table e run_daily_pipeline() já existem)
+
+**Out of scope**: Interface para clientes sugerirem nichos (já existe em Phase 5 via niche_requests)
+
+**Plans:** 0/3 plans complete
+
+Plans:
+- [ ] 08-01-PLAN.md — Wave 0: niches DB migration + populate_niches.sql (150+ entries) + GET /api/admin/niches + PUT /api/admin/niches/bulk
+- [ ] 08-02-PLAN.md — Wave 1: get_pipeline_config() reads from niches table + daily rotation groups of 20 + wire into run_daily_pipeline()
+- [ ] 08-03-PLAN.md — Wave 2: /admin/niches page (categorized list + toggle + priority) + "Select all / Deselect all" on busca massiva + frontend deploy
+
+---
+
+### Phase 9: Expansão Regional ES
+
+**Goal**: Pipeline cobre progressivamente todas as 78 cidades do Espírito Santo, rotacionando sem repetir na mesma semana.
+
+**Value delivered**: Volume de leads do ES aumenta 10× ao longo do tempo. Admin vê mapa de cobertura e sabe quais cidades já foram trabalhadas.
+
+**Scope**:
+- Tabela `regions` (id, name, city, state, ibge_code, priority, active, last_used_at) (REG-01)
+- Script `scripts/import/populate_es_cities.sql` — 78 cidades do ES com dados IBGE
+- `run_daily_pipeline()` rotaciona por grupos de 5-10 cidades/dia via round-robin em `last_used_at` (REG-02)
+- `GET /api/admin/regions` — lista com última execução e leads capturados por cidade
+- `PUT /api/admin/regions/bulk` — ativar/desativar regiões
+- Frontend: lista de cidades na página de pipeline config com indicador verde/cinza de cobertura
+- Seletor de região na busca massiva atualizado com todas as cidades do ES
+
+**Dependencies**: Phase 1 (run_daily_pipeline() e pipeline_config existem), Phase 8 recomendada (nichos do banco disponíveis para combinar com cidades)
+
+**Out of scope**: Expansão para outros estados (SP, RJ, MG) — após ES coberto 100%
+
+**Plans:** 0/3 plans complete
+
+Plans:
+- [ ] 09-01-PLAN.md — Wave 0: regions DB migration + populate_es_cities.sql (78 cities) + GET /api/admin/regions + PUT /api/admin/regions/bulk
+- [ ] 09-02-PLAN.md — Wave 1: round-robin city rotation in run_daily_pipeline() + last_used_at update logic + leads_captured counter per region
+- [ ] 09-03-PLAN.md — Wave 2: pipeline-config page city coverage list + busca massiva region selector update + frontend deploy
+
+---
+
+### Phase 10: Novas Fontes de Extração
+
+**Goal**: Volume de leads aumenta via Apple Maps e melhorias nos scrapers existentes. Cada nicho tem 5 variações de query no motor de busca.
+
+**Value delivered**: Outscraper entrega ≥ 50% mais leads por query. Motor de busca explora mais ângulos por nicho. Apple Maps abre nova fonte não usada antes.
+
+**Scope**:
+- Apple Maps scraper — `process_apple_maps_massive()` via Playwright; integrar como novo thread no massive search (SRC-01)
+- Pesquisar e implementar melhor API de leads BR disponível no free tier (SRC-02)
+- Melhorar `process_outscraper_massive()` — retry com backoff, cursor pagination, max_results 20 → 100, batch queries (SRC-03)
+- Melhorar `process_search_job()` — 5 templates de query por nicho: `"[nicho] [cidade] contato"`, `"[nicho] [cidade] email"`, `"[nicho] [cidade] whatsapp"`, `site:*.com.br "[nicho]" "[cidade]"`, `"[nicho]" "[cidade]" OR "[cidade vizinha]"` (SRC-04)
+- `GET /api/admin/source-stats` — leads por fonte nos últimos 30 dias
+- Frontend: gráfico de barras no admin dashboard mostrando leads por fonte
+
+**Dependencies**: Phase 3 (process_outscraper_massive existe), Phase 9 recomendada (cidades do ES disponíveis para teste de volume)
+
+**Out of scope**: LinkedIn Sales Navigator (custo), MillionVerifier bulk
+
+**Plans:** 0/3 plans complete
+
+Plans:
+- [ ] 10-01-PLAN.md — Wave 0: Apple Maps Playwright scraper + process_apple_maps_massive() + wire into massive search + GET /api/admin/source-stats
+- [ ] 10-02-PLAN.md — Wave 1: Outscraper improvements (retry, pagination, batch, max_results 100) + 5-template query expansion in process_search_job() + leads_by_source tracking
+- [ ] 10-03-PLAN.md — Wave 2: best BR leads API integration (SRC-02 research → implement) + source stats bar chart on admin dashboard + frontend deploy
+
+---
+
 ## Visão de Futuro (Backlog)
 
 | Feature | Quando considerar |
@@ -201,6 +322,7 @@ Plans:
 | Minha Receita como API pública | Se VPS tiver capacidade extra |
 | Redis + rate limits globais | Se escalar para 10+ usuários simultâneos |
 | Celery/RQ para jobs complexos | Apenas com Redis instalado |
+| Expansão para outros estados (SP, RJ, MG) | Após ES coberto 100% |
 
 ---
 
@@ -219,10 +341,16 @@ Plans:
     [✓] Phase 2 — Qualidade de leads (3/3 plans complete)
     [✓] Phase 3 — Receita Federal + Outscraper + Prospeo (3/3 plans complete)
 
-[ ] Milestone 2 — Portal de Clientes
+[✓] Milestone 2 — Portal de Clientes
     [✓] Phase 4 — Reveal gate + créditos (3/3 plans complete)
     [✓] Phase 5 — Export + niche requests (5/5 plans complete, gaps closed, backend deployed)
-    [ ] Phase 6 — Saved searches + notificações
+    [✓] Phase 6 — Saved searches + notificações (3/3 plans complete)
+
+[ ] Milestone v1.1 — Lead Quality Engine
+    [ ] Phase 7 — Qualidade avançada: TLD filter, slogan detector, CRM dedup, WhatsApp gate (0/3 plans)
+    [ ] Phase 8 — Catálogo de nichos: 150+ nichos no banco, rotação diária, admin UI (0/3 plans)
+    [ ] Phase 9 — Expansão regional ES: 78 cidades, round-robin pipeline (0/3 plans)
+    [ ] Phase 10 — Novas fontes: Apple Maps, Outscraper melhorado, 5 query templates (0/3 plans)
 ```
 
 ---
@@ -236,4 +364,4 @@ Plans:
 
 ---
 
-*Last updated: 2026-03-24 — Phase 5 complete (5/5 plans, gaps closed, backend deployed)*
+*Last updated: 2026-03-24 — Milestone v1.1 Lead Quality Engine roadmap appended (Phases 7-10)*
