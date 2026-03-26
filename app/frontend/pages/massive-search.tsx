@@ -14,44 +14,11 @@ interface SearchMethod {
   enabled: boolean;
 }
 
-interface Niche {
+interface NicheWithCategory {
   id: string;
   name: string;
+  category: string;
   selected: boolean;
-}
-
-const PREDEFINED_NICHES: Niche[] = [
-  { id: 'clinica_medica', name: 'Clínica Médica', selected: false },
-  { id: 'clinica_odontologica', name: 'Clínica Odontológica', selected: false },
-  { id: 'clinica_veterinaria', name: 'Clínica Veterinária', selected: false },
-  { id: 'escritorio_advocacia', name: 'Escritório de Advocacia', selected: false },
-  { id: 'escritorio_contabilidade', name: 'Escritório de Contabilidade', selected: false },
-  { id: 'consultoria_empresarial', name: 'Consultoria Empresarial', selected: false },
-  { id: 'escola_particular', name: 'Escola Particular', selected: false },
-  { id: 'imobiliaria', name: 'Imobiliária', selected: false },
-  { id: 'academia', name: 'Academia/Fitness', selected: false },
-  { id: 'restaurante', name: 'Restaurante', selected: false },
-];
-
-const LS_KEY_CUSTOM_NICHES = 'massive_search_custom_niches';
-
-function loadLocalNiches(): string[] {
-  try {
-    const raw = localStorage.getItem(LS_KEY_CUSTOM_NICHES);
-    return raw ? JSON.parse(raw) : [];
-  } catch { return []; }
-}
-
-function saveLocalNiches(names: string[]) {
-  try { localStorage.setItem(LS_KEY_CUSTOM_NICHES, JSON.stringify(names)); } catch {}
-}
-
-function mergeCustomNiches(base: Niche[], customNames: string[]): Niche[] {
-  const existing = new Set(base.map(n => n.name.toLowerCase()));
-  const newOnes: Niche[] = customNames
-    .filter(name => !existing.has(name.toLowerCase()))
-    .map((name, i) => ({ id: `custom_${i}_${name}`, name, selected: false }));
-  return newOnes.length > 0 ? [...base, ...newOnes] : base;
 }
 
 const REGIONS = [
@@ -63,26 +30,28 @@ const REGIONS = [
 
 export default function MassiveSearch() {
   const router = useRouter();
-  // Initialize with predefined + localStorage (instant, no network)
-  const [niches, setNiches] = useState<Niche[]>(() =>
-    mergeCustomNiches(PREDEFINED_NICHES, loadLocalNiches())
-  );
+  const [niches, setNiches] = useState<NicheWithCategory[]>([]);
+  const [loadingNiches, setLoadingNiches] = useState(true);
+  const [nicheWarning, setNicheWarning] = useState('');
   const [customNiche, setCustomNiche] = useState('');
 
-  // Also load from DB and merge (in case localStorage is incomplete)
+  // Load niches from DB catalog
   useEffect(() => {
-    api.get('/api/niches/custom')
+    api.get('/api/niches?active=true')
       .then(res => {
-        const saved: { id: number; name: string }[] = res.data?.niches || [];
-        if (saved.length === 0) return;
-        const dbNames = saved.map(s => s.name);
-        // Sync DB niches to localStorage too
-        const localNames = loadLocalNiches();
-        const allNames = Array.from(new Set([...localNames, ...dbNames]));
-        saveLocalNiches(allNames);
-        setNiches(prev => mergeCustomNiches(prev, dbNames));
+        const grouped: Record<string, { id: number; name: string }[]> = res.data?.niches || {};
+        const flat: NicheWithCategory[] = Object.entries(grouped).flatMap(
+          ([category, items]) => items.map(n => ({
+            id: String(n.id),
+            name: n.name,
+            category,
+            selected: false,
+          }))
+        );
+        setNiches(flat);
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => setLoadingNiches(false));
   }, []);
   const [selectedRegion, setSelectedRegion] = useState('grande_vitoria_es');
   const [maxPages, setMaxPages] = useState(2);
@@ -197,32 +166,32 @@ export default function MassiveSearch() {
       return;
     }
 
-    const newNiche: Niche = { id: `custom_${Date.now()}`, name, selected: true };
+    const newNiche: NicheWithCategory = { id: `custom_${Date.now()}`, name, category: 'Personalizado', selected: true };
     setNiches(prev => [...prev, newNiche]);
     setCustomNiche('');
-
-    // Save to localStorage (always works)
-    const localNames = loadLocalNiches();
-    if (!localNames.some(n => n.toLowerCase() === name.toLowerCase())) {
-      saveLocalNiches([...localNames, name]);
-    }
 
     // Also persist to DB
     try {
       await api.post('/api/niches/custom', { name });
     } catch {
-      // localStorage already saved — niche persists regardless
+      // niche already added to local state
     }
   };
 
-  const removeCustomNiche = (id: string, name: string) => {
-    // Only allow removing custom niches, not predefined ones
-    if (PREDEFINED_NICHES.some(n => n.id === id)) return;
-    setNiches(prev => prev.filter(n => n.id !== id));
-    const localNames = loadLocalNiches().filter(n => n.toLowerCase() !== name.toLowerCase());
-    saveLocalNiches(localNames);
-    // Also remove from DB (fire-and-forget)
-    api.delete(`/api/niches/custom/${encodeURIComponent(name)}`).catch(() => {});
+  const selectAll = () => {
+    const allSelected = niches.map(n => ({ ...n, selected: true }));
+    const selectedCount = allSelected.length;
+    if (selectedCount > 50) {
+      setNicheWarning('Máximo de 50 nichos por busca para não sobrecarregar o servidor.');
+    } else {
+      setNicheWarning('');
+    }
+    setNiches(allSelected);
+  };
+
+  const clearAll = () => {
+    setNicheWarning('');
+    setNiches(niches.map(n => ({ ...n, selected: false })));
   };
 
   const toggleMethod = (id: string) => {
@@ -332,50 +301,84 @@ export default function MassiveSearch() {
           <div className="lg:col-span-2 space-y-6">
             {/* Step 1: Select Niches */}
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-6">
-              <div className="flex items-center gap-2 mb-4">
-                <div className="w-8 h-8 rounded-full bg-blue-100 dark:bg-blue-900 flex items-center justify-center text-blue-600 dark:text-blue-400 font-bold">
-                  1
+              {/* Step 1 header row */}
+              <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded-full bg-blue-100 dark:bg-blue-900 flex items-center justify-center text-blue-600 dark:text-blue-400 font-bold">
+                    1
+                  </div>
+                  <div>
+                    <h2 className="text-xl font-bold text-gray-900 dark:text-white">Selecione os Nichos</h2>
+                    <p className="text-sm text-gray-500 dark:text-gray-400">
+                      {niches.filter(n => n.selected).length} de {niches.length} selecionados
+                    </p>
+                  </div>
+                  <Tooltip text="Nicho = tipo de negocio. Escolha um ou mais. Voce pode adicionar um nicho personalizado se o seu segmento nao estiver na lista." position="right" />
                 </div>
-                <h2 className="text-xl font-bold text-gray-900 dark:text-white">Selecione os Nichos</h2>
-                <Tooltip text="Nicho = tipo de negocio. Escolha um ou mais. Voce pode adicionar um nicho personalizado se o seu segmento nao estiver na lista." position="right" />
+                <div className="flex gap-2">
+                  <button
+                    onClick={selectAll}
+                    className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
+                  >
+                    Selecionar todos
+                  </button>
+                  <button
+                    onClick={clearAll}
+                    className="px-3 py-1.5 text-sm bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200 rounded-lg transition-colors"
+                  >
+                    Limpar seleção
+                  </button>
+                </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3 mb-4">
-                {niches.map((niche) => {
-                  const isCustom = !PREDEFINED_NICHES.some(p => p.id === niche.id);
-                  return (
-                    <div key={niche.id} className="relative group">
-                      <button
-                        onClick={() => toggleNiche(niche.id)}
-                        className={`w-full p-3 rounded-lg border-2 transition-all ${
-                          niche.selected
-                            ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300'
-                            : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600 text-gray-700 dark:text-gray-300'
-                        }`}
-                      >
-                        <div className="flex items-center gap-2">
-                          {niche.selected && <CheckCircle2 className="h-4 w-4 flex-shrink-0" />}
-                          <span className="text-sm font-medium">{niche.name}</span>
-                          {isCustom && (
-                            <span className="ml-auto text-xs px-1.5 py-0.5 bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 rounded">
-                              custom
-                            </span>
-                          )}
-                        </div>
-                      </button>
-                      {isCustom && (
-                        <button
-                          onClick={(e) => { e.stopPropagation(); removeCustomNiche(niche.id, niche.name); }}
-                          className="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
-                          title="Remover nicho"
-                        >
-                          &times;
-                        </button>
-                      )}
+              {nicheWarning && (
+                <div className="mb-3 p-2 bg-yellow-50 dark:bg-yellow-900/20 text-yellow-700 dark:text-yellow-400 rounded text-sm">
+                  {nicheWarning}
+                </div>
+              )}
+
+              {/* Grouped niche display */}
+              {loadingNiches ? (
+                <p className="text-sm text-gray-500 dark:text-gray-400 py-4">Carregando nichos...</p>
+              ) : niches.length === 0 ? (
+                <p className="text-sm text-yellow-600 dark:text-yellow-400 py-4">
+                  Nenhum nicho cadastrado — contate o admin.
+                </p>
+              ) : (
+                <div className="space-y-4 mb-4">
+                  {Array.from(new Set(niches.map(n => n.category))).map(category => (
+                    <div key={category}>
+                      <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-2">
+                        {category}
+                      </h3>
+                      <div className="flex flex-wrap gap-2">
+                        {niches.filter(n => n.category === category).map(niche => (
+                          <button
+                            key={niche.id}
+                            onClick={() => {
+                              const newNiches = niches.map(n => n.id === niche.id ? { ...n, selected: !n.selected } : n);
+                              setNiches(newNiches);
+                              const selectedCount = newNiches.filter(n => n.selected).length;
+                              if (selectedCount > 50) {
+                                setNicheWarning('Máximo de 50 nichos por busca para não sobrecarregar o servidor.');
+                              } else {
+                                setNicheWarning('');
+                              }
+                            }}
+                            className={`px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
+                              niche.selected
+                                ? 'bg-blue-600 text-white'
+                                : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'
+                            }`}
+                          >
+                            {niche.name}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                  );
-                })}
-              </div>
+                  ))}
+                </div>
+              )}
 
               {/* Custom Niche Input */}
               <div className="flex gap-2">
