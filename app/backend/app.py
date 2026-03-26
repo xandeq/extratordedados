@@ -15291,6 +15291,130 @@ def delete_custom_niche(name):
     return jsonify({'deleted': name}), 200
 
 
+@app.route('/api/admin/niches', methods=['GET'])
+@limiter.limit("60/minute")
+def admin_get_niches():
+    """Return all niches grouped by category. Admin only."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        row = c.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+        c.execute('''
+            SELECT id, name, category, active, priority, last_used_at, created_at
+            FROM niches
+            ORDER BY category, priority ASC, name ASC
+        ''')
+        rows = c.fetchall()
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for r in rows:
+        grouped[r[2]].append({
+            'id': r[0], 'name': r[1], 'category': r[2],
+            'active': r[3], 'priority': r[4],
+            'last_used_at': r[5].isoformat() if r[5] else None,
+            'created_at': r[6].isoformat() if r[6] else None,
+        })
+    return jsonify({'niches': dict(grouped), 'total': len(rows)}), 200
+
+
+@app.route('/api/admin/niches/bulk', methods=['PUT'])
+@limiter.limit("30/minute")
+def admin_bulk_toggle_niches():
+    """Activate or deactivate multiple niches by ID list. Admin only."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        row = c.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+        data = request.get_json() or {}
+        ids = data.get('ids', [])
+        active = data.get('active', True)
+        if not ids or not isinstance(ids, list):
+            return jsonify({'error': 'ids deve ser lista não vazia'}), 400
+        try:
+            c.execute('UPDATE niches SET active = %s WHERE id = ANY(%s)', (bool(active), ids))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return jsonify({'error': str(e)}), 500
+    return jsonify({'updated': len(ids), 'active': bool(active)}), 200
+
+
+@app.route('/api/admin/niches/<int:niche_id>', methods=['PUT'])
+@limiter.limit("120/minute")
+def admin_update_niche(niche_id):
+    """Toggle active or update priority for a single niche. Admin only."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        row = c.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+        data = request.get_json() or {}
+        updates = []
+        params = []
+        if 'active' in data:
+            updates.append('active = %s')
+            params.append(bool(data['active']))
+        if 'priority' in data:
+            updates.append('priority = %s')
+            params.append(int(data['priority']))
+        if not updates:
+            return jsonify({'error': 'Nenhum campo para atualizar'}), 400
+        params.append(niche_id)
+        try:
+            c.execute(f'UPDATE niches SET {", ".join(updates)} WHERE id = %s RETURNING id, name, active, priority', params)
+            updated = c.fetchone()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return jsonify({'error': str(e)}), 500
+    if not updated:
+        return jsonify({'error': 'Nicho não encontrado'}), 404
+    return jsonify({'id': updated[0], 'name': updated[1], 'active': updated[2], 'priority': updated[3]}), 200
+
+
+@app.route('/api/niches', methods=['GET'])
+@limiter.limit("120/minute")
+def get_niches_catalog():
+    """Return niches grouped by category. Auth required. ?active=true filters to active only."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    active_only = request.args.get('active', '').lower() == 'true'
+    with get_db() as conn:
+        c = conn.cursor()
+        if active_only:
+            c.execute('SELECT id, name, category, priority FROM niches WHERE active = TRUE ORDER BY category, priority ASC, name ASC')
+        else:
+            c.execute('SELECT id, name, category, priority, active FROM niches ORDER BY category, priority ASC, name ASC')
+        rows = c.fetchall()
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for r in rows:
+        entry = {'id': r[0], 'name': r[1], 'priority': r[3]}
+        if not active_only:
+            entry['active'] = r[4]
+        grouped[r[2]].append(entry)
+    return jsonify({'niches': dict(grouped)}), 200
+
+
 @app.route('/api/admin/logs', methods=['GET'])
 @limiter.limit("60/minute")
 def admin_logs():
