@@ -880,30 +880,64 @@ DAILY_CRM_SYNC_HOUR = 9                 # 09:00 da manhã para sync CRM automát
 
 
 def get_pipeline_config():
-    """Read current pipeline config from DB. Falls back to module constants on any error."""
+    """Read current pipeline config from DB. Falls back to module constants on any error.
+    NOTE: This function is READ-ONLY. It does NOT update last_used_at.
+    Call _mark_niches_used(names) separately after pipeline is triggered.
+    """
     try:
         with get_db() as conn:
             cur = conn.cursor()
             cur.execute("SELECT key, value FROM pipeline_config")
             rows = {k: json.loads(v) for k, v in cur.fetchall()}
+            # Phase 8: read niches from catalog table (round-robin)
+            n = int(rows.get('daily_niches_per_run', 20))
+            cur.execute(
+                "SELECT name FROM niches WHERE active = TRUE "
+                "ORDER BY last_used_at ASC NULLS FIRST, priority ASC, id ASC "
+                "LIMIT %s",
+                (n,)
+            )
+            niche_rows = cur.fetchall()
+            niches = [r[0] for r in niche_rows] if niche_rows else DAILY_JOB_NICHES
         return {
-            'niches':          rows.get('daily_niches',    DAILY_JOB_NICHES),
-            'region':          rows.get('daily_region',    DAILY_JOB_REGION),
-            'hour':            int(rows.get('daily_hour',  DAILY_JOB_HOUR)),
-            'minute':          int(rows.get('daily_minute', 0)),
-            'notify_email':    rows.get('notify_email'),
-            'healthcheck_url': rows.get('healthcheck_url'),
+            'niches':               niches,
+            'region':               rows.get('daily_region',    DAILY_JOB_REGION),
+            'hour':                 int(rows.get('daily_hour',  DAILY_JOB_HOUR)),
+            'minute':               int(rows.get('daily_minute', 0)),
+            'notify_email':         rows.get('notify_email'),
+            'healthcheck_url':      rows.get('healthcheck_url'),
+            'daily_niches_per_run': n,
         }
     except Exception as e:
         print(f"[CONFIG] Erro ao ler pipeline_config: {e} — usando defaults")
         return {
-            'niches':          DAILY_JOB_NICHES,
-            'region':          DAILY_JOB_REGION,
-            'hour':            DAILY_JOB_HOUR,
-            'minute':          0,
-            'notify_email':    None,
-            'healthcheck_url': None,
+            'niches':               DAILY_JOB_NICHES,
+            'region':               DAILY_JOB_REGION,
+            'hour':                 DAILY_JOB_HOUR,
+            'minute':               0,
+            'notify_email':         None,
+            'healthcheck_url':      None,
+            'daily_niches_per_run': 20,
         }
+
+
+def _mark_niches_used(names):
+    """Update last_used_at for the given niche names. Called once per pipeline trigger.
+    Safe to call with empty list (no-op). Errors are logged, not raised.
+    """
+    if not names:
+        return
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE niches SET last_used_at = NOW() WHERE name = ANY(%s)",
+                (names,)
+            )
+            conn.commit()
+        print(f"[NICHES] Marked {len(names)} niches used: {names[:5]}{'...' if len(names) > 5 else ''}")
+    except Exception as e:
+        print(f"[NICHES] _mark_niches_used error (non-fatal): {e}")
 
 
 SKIP_DOMAINS = {
@@ -14985,6 +15019,8 @@ def trigger_daily_pipeline(niches=None, region_id=None):
     cfg       = get_pipeline_config()
     niches    = niches    or cfg['niches']
     region_id = region_id or cfg['region']
+    # Phase 8: mark selected niches as used (advances round-robin for next run)
+    _mark_niches_used(niches)
 
     if region_id not in SEARCH_REGIONS:
         print(f"[DAILY] Região desconhecida: {region_id}")
@@ -15570,7 +15606,7 @@ def daily_job_run():
             return jsonify({'error': 'Admin only'}), 403
 
     data      = request.get_json() or {}
-    niches    = data.get('niches')    or DAILY_JOB_NICHES
+    niches    = data.get('niches')    or get_pipeline_config()['niches']
     region_id = data.get('region')    or DAILY_JOB_REGION
 
     daily_job_id = trigger_daily_pipeline(niches=niches, region_id=region_id)
