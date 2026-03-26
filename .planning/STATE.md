@@ -1,14 +1,14 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.1
-milestone_name: lead-quality-engine
-status: planning
-last_updated: "2026-03-24T00:00:00.000Z"
+milestone_name: — Lead Quality Engine
+status: unknown
+last_updated: "2026-03-26T00:22:53.857Z"
 progress:
   total_phases: 10
   completed_phases: 6
-  total_plans: 32
-  completed_plans: 20
+  total_plans: 26
+  completed_plans: 21
 ---
 
 # STATE.md — Project Memory
@@ -18,9 +18,9 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone v1.1 — Lead Quality Engine
-- **Active phase**: Phase 7 — Qualidade de Leads Avançada (not started)
+- **Active phase**: Phase 8 — Catálogo de Nichos (Plan 01 complete)
 - **Milestone v1.0**: COMPLETE (Phases 1-6 all done, 20/20 plans, all features live)
-- **Last completed**: Milestone v1.0 Phase 6 Plan 03 — saved searches + notifications frontend deployed
+- **Last completed**: Phase 08 Plan 01 — niches table + populate script + CRUD endpoints + 170 niches deployed
 
 ## Milestone v1.1 Scope
 
@@ -48,7 +48,7 @@ progress:
 | Phase | Name | Requirements | Plans | Status |
 |-------|------|--------------|-------|--------|
 | 7 | Qualidade de Leads Avançada | QUAL-01 to QUAL-06 | 3 | Not started |
-| 8 | Catálogo de Nichos | NICHE-01 to NICHE-04 | 3 | Not started |
+| 8 | Catálogo de Nichos | NICHE-01 to NICHE-04 | 3 | In progress (1/3 complete) |
 | 9 | Expansão Regional ES | REG-01, REG-02 | 3 | Not started |
 | 10 | Novas Fontes de Extração | SRC-01 to SRC-04 | 3 | Not started |
 
@@ -65,6 +65,7 @@ progress:
 | 2026-03-24 | Phase 5: export com cotas + niche request queue + admin approval UI |
 | 2026-03-24 | Phase 6: saved searches + email notifications + frontend deployed |
 | 2026-03-24 | Milestone v1.1 roadmap created (Phases 7-10, 12 plans) |
+| 2026-03-26 | Phase 8 Plan 01: niches table + populate_niches.sql (156 rows, 170 in DB) + 4 CRUD endpoints deployed |
 
 ## Research Available
 
@@ -87,9 +88,11 @@ progress:
 | pipeline_config table (not hardcoded) | Enables admin UI config without code changes |
 | save_lead_to_db is canonical INSERT | quality_grade written on every INSERT |
 | _build_portal_filter_query shared helper | Used by search + notification scheduler |
+| bulk route before <int:niche_id> | Flask routing: 'bulk' would match as integer ID otherwise |
+| niches.keywords TEXT[] column | Future fuzzy-matching for pipeline niche selection |
 
 ## Last Session
 
-- **Stopped at**: Milestone v1.1 roadmap created (Phases 7-10). Ready to start Phase 7 planning.
-- **Next action**: `/gsd:plan-phase 7`
-- **Timestamp**: 2026-03-24
+- **Stopped at**: Completed 08-01-PLAN.md — niches table + populate script + CRUD endpoints deployed
+- **Next action**: `/gsd:execute-phase 08` (Plan 02: pipeline rotation from DB)
+- **Timestamp**: 2026-03-26

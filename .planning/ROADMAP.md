@@ -247,10 +247,10 @@ Plans:
 
 **Out of scope**: Interface para clientes sugerirem nichos (já existe em Phase 5 via niche_requests)
 
-**Plans:** 0/3 plans complete
+**Plans:** 1/3 plans executed
 
 Plans:
-- [ ] 08-01-PLAN.md — Wave 0: niches DB migration + populate_niches.sql (150+ entries) + GET /api/admin/niches + PUT /api/admin/niches/bulk
+- [x] 08-01-PLAN.md — Wave 0: niches DB migration + populate_niches.sql (150+ entries) + GET /api/admin/niches + PUT /api/admin/niches/bulk
 - [ ] 08-02-PLAN.md — Wave 1: get_pipeline_config() reads from niches table + daily rotation groups of 20 + wire into run_daily_pipeline()
 - [ ] 08-03-PLAN.md — Wave 2: /admin/niches page (categorized list + toggle + priority) + "Select all / Deselect all" on busca massiva + frontend deploy
 

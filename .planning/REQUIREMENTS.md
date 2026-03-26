@@ -217,15 +217,15 @@
 **Goal**: Pipeline roda automaticamente por 200+ nichos e subnichos. Admin seleciona "todos" ou subsets via UI.
 
 #### Backend
-- [ ] **NICHE-01**: Tabela `niches` (id, name, category, subcategory, keywords[], active, priority, created_at) — catálogo completo de nichos BR relevantes
+- [x] **NICHE-01**: Tabela `niches` (id, name, category, subcategory, keywords[], active, priority, created_at) — catálogo completo de nichos BR relevantes
 - [ ] **NICHE-02**: `get_pipeline_config()` lê nichos ativos da tabela `niches` (não mais `pipeline_config.nichos`) para rotação diária
-- [ ] **NICHE-03**: Script `scripts/import/populate_niches.sql` — INSERT de 150+ nichos + subnichos organizados por categoria (saúde, beleza, alimentação, serviços, educação, etc.)
+- [x] **NICHE-03**: Script `scripts/import/populate_niches.sql` — INSERT de 150+ nichos + subnichos organizados por categoria (saúde, beleza, alimentação, serviços, educação, etc.)
 - [ ] `GET /api/admin/niches` — lista todos os nichos com status ativo/inativo
 - [ ] `PUT /api/admin/niches/bulk` — ativar/desativar múltiplos nichos de uma vez
 - [ ] Pipeline rotaciona: em vez de rodar todos os nichos em 1 dia, rotaciona grupos de 20 nichos/dia
 
 #### Frontend
-- [ ] **NICHE-04**: Botão "Selecionar todos / Desselecionar todos" na página de busca massiva
+- [x] **NICHE-04**: Botão "Selecionar todos / Desselecionar todos" na página de busca massiva
 - [ ] Página `/admin/niches` — lista categorizada de nichos, toggle ativo, prioridade
 
 #### Critérios de aceite
