@@ -247,12 +247,12 @@ Plans:
 
 **Out of scope**: Interface para clientes sugerirem nichos (já existe em Phase 5 via niche_requests)
 
-**Plans:** 2/3 plans executed
+**Plans:** 3/3 plans complete
 
 Plans:
 - [x] 08-01-PLAN.md — Wave 0: niches DB migration + populate_niches.sql (150+ entries) + GET /api/admin/niches + PUT /api/admin/niches/bulk
 - [x] 08-02-PLAN.md — Wave 1: get_pipeline_config() reads from niches table + daily rotation groups of 20 + wire into run_daily_pipeline()
-- [ ] 08-03-PLAN.md — Wave 2: /admin/niches page (categorized list + toggle + priority) + "Select all / Deselect all" on busca massiva + frontend deploy
+- [x] 08-03-PLAN.md — Wave 2: /admin/niches page (categorized list + toggle + priority) + "Selecionar todos / Limpar selecao" on busca massiva + frontend deployed to HostGator
 
 ---
 
@@ -348,7 +348,7 @@ Plans:
 
 [ ] Milestone v1.1 — Lead Quality Engine
     [ ] Phase 7 — Qualidade avançada: TLD filter, slogan detector, CRM dedup, WhatsApp gate (0/3 plans)
-    [ ] Phase 8 — Catálogo de nichos: 150+ nichos no banco, rotação diária, admin UI (0/3 plans)
+    [✓] Phase 8 — Catálogo de nichos: 150+ nichos no banco, rotação diária, admin UI (3/3 plans complete)
     [ ] Phase 9 — Expansão regional ES: 78 cidades, round-robin pipeline (0/3 plans)
     [ ] Phase 10 — Novas fontes: Apple Maps, Outscraper melhorado, 5 query templates (0/3 plans)
 ```

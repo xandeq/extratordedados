@@ -8,7 +8,7 @@ progress:
   total_phases: 10
   completed_phases: 6
   total_plans: 26
-  completed_plans: 22
+  completed_plans: 23
 ---
 
 # STATE.md — Project Memory
@@ -18,9 +18,9 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone v1.1 — Lead Quality Engine
-- **Active phase**: Phase 8 — Catálogo de Nichos (Plan 02 complete)
+- **Active phase**: Phase 8 — Catálogo de Nichos (COMPLETE — all 3 plans done)
 - **Milestone v1.0**: COMPLETE (Phases 1-6 all done, 20/20 plans, all features live)
-- **Last completed**: Phase 08 Plan 02 — get_pipeline_config() reads from niches table (round-robin) + _mark_niches_used() + daily_job_run fallback fixed
+- **Last completed**: Phase 08 Plan 03 — /admin/niches UI + massive-search DB-loaded niches + Sidebar nav links + frontend deployed to HostGator
 
 ## Milestone v1.1 Scope
 
@@ -48,7 +48,7 @@ progress:
 | Phase | Name | Requirements | Plans | Status |
 |-------|------|--------------|-------|--------|
 | 7 | Qualidade de Leads Avançada | QUAL-01 to QUAL-06 | 3 | Not started |
-| 8 | Catálogo de Nichos | NICHE-01 to NICHE-04 | 3 | In progress (2/3 complete) |
+| 8 | Catálogo de Nichos | NICHE-01 to NICHE-04 | 3 | COMPLETE (3/3) |
 | 9 | Expansão Regional ES | REG-01, REG-02 | 3 | Not started |
 | 10 | Novas Fontes de Extração | SRC-01 to SRC-04 | 3 | Not started |
 
@@ -67,6 +67,7 @@ progress:
 | 2026-03-24 | Milestone v1.1 roadmap created (Phases 7-10, 12 plans) |
 | 2026-03-26 | Phase 8 Plan 01: niches table + populate_niches.sql (156 rows, 170 in DB) + 4 CRUD endpoints deployed |
 | 2026-03-26 | Phase 8 Plan 02: get_pipeline_config() reads from niches table (round-robin) + _mark_niches_used() helper + daily_job_run fallback fixed |
+| 2026-03-26 | Phase 8 Plan 03: /admin/niches page (tabs + toggle + priority) + massive-search loads niches from DB + Sidebar nav links + frontend deployed |
 
 ## Research Available
 
@@ -93,9 +94,12 @@ progress:
 | niches.keywords TEXT[] column | Future fuzzy-matching for pipeline niche selection |
 | get_pipeline_config() read-only, _mark_niches_used() separate | Health checks call get_pipeline_config() — must not advance rotation on every call |
 | DAILY_JOB_NICHES constant preserved | Fallback when niches table is empty (prevents crash on cold start) |
+| PREDEFINED_NICHES removed from massive-search.tsx | Single source of truth is niches DB table; massive-search fetches /api/niches?active=true |
+| isActive() exact-match for /admin/niches + /admin/pipeline-config | Prevents false "Painel Admin" highlight when visiting sub-admin routes (startsWith pitfall) |
+| 50-niche cap warning client-side only | UX guard in massive-search; backend enforces actual limit independently |
 
 ## Last Session
 
-- **Stopped at**: Completed 08-02-PLAN.md — pipeline rotation from DB deployed
-- **Next action**: `/gsd:execute-phase 08` (Plan 03: admin UI for niche catalog + select-all button)
+- **Stopped at**: Completed 08-03-PLAN.md — Phase 8 complete (all 3 plans done)
+- **Next action**: `/gsd:execute-phase 07` (Phase 7: Lead Quality Engine — QUAL-01 to QUAL-06) or `/gsd:execute-phase 09` (Expansao Regional ES)
 - **Timestamp**: 2026-03-26
