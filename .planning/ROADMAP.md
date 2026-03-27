@@ -275,10 +275,10 @@ Plans:
 
 **Out of scope**: Expansão para outros estados (SP, RJ, MG) — após ES coberto 100%
 
-**Plans:** 0/3 plans complete
+**Plans:** 1/3 plans complete
 
 Plans:
-- [ ] 09-01-PLAN.md — Wave 0: regions DB migration + populate_es_cities.sql (78 cities) + GET /api/admin/regions + PUT /api/admin/regions/bulk
+- [x] 09-01-PLAN.md — Wave 0: regions DB migration + populate_es_cities.sql (78 cities) + GET /api/admin/regions + PUT /api/admin/regions/bulk
 - [ ] 09-02-PLAN.md — Wave 1: round-robin city rotation in run_daily_pipeline() + last_used_at update logic + leads_captured counter per region
 - [ ] 09-03-PLAN.md — Wave 2: pipeline-config page city coverage list + busca massiva region selector update + frontend deploy
 
@@ -349,7 +349,7 @@ Plans:
 [ ] Milestone v1.1 — Lead Quality Engine
     [ ] Phase 7 — Qualidade avançada: TLD filter, slogan detector, CRM dedup, WhatsApp gate (0/3 plans)
     [✓] Phase 8 — Catálogo de nichos: 150+ nichos no banco, rotação diária, admin UI (3/3 plans complete)
-    [ ] Phase 9 — Expansão regional ES: 78 cidades, round-robin pipeline (0/3 plans)
+    [ ] Phase 9 — Expansão regional ES: 78 cidades, round-robin pipeline (1/3 plans)
     [ ] Phase 10 — Novas fontes: Apple Maps, Outscraper melhorado, 5 query templates (0/3 plans)
 ```
 

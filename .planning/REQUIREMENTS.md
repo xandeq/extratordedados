@@ -240,11 +240,11 @@
 **Goal**: Pipeline cobre todo o Espírito Santo progressivamente, não só Grande Vitória.
 
 #### Backend
-- [ ] **REG-01**: Tabela `regions` (id, name, city, state, ibge_code, priority, active) — todas as 78 cidades do ES
-- [ ] Script `scripts/import/populate_es_cities.sql` — INSERT das 78 cidades do ES com dados IBGE
+- [x] **REG-01**: Tabela `regions` (id, name, city, state, ibge_code, priority, active) — todas as 78 cidades do ES
+- [x] Script `scripts/import/populate_es_cities.sql` — INSERT das 78 cidades do ES com dados IBGE
 - [ ] **REG-02**: `run_daily_pipeline()` rotaciona por cidades do ES em grupos de 5-10/dia (round-robin por `last_used_at`)
-- [ ] `GET /api/admin/regions` — listar regiões com última execução, leads capturados
-- [ ] `PUT /api/admin/regions/bulk` — ativar/desativar regiões
+- [x] `GET /api/admin/regions` — listar regiões com última execução, leads capturados
+- [x] `PUT /api/admin/regions/bulk` — ativar/desativar regiões
 
 #### Frontend
 - [ ] Mapa ou lista de cidades na página de pipeline config — verde = executado nos últimos 7 dias

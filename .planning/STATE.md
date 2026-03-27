@@ -3,11 +3,11 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Lead Quality Engine
 status: unknown
-last_updated: "2026-03-26T11:19:17.361Z"
+last_updated: "2026-03-26T12:19:12.454Z"
 progress:
   total_phases: 10
   completed_phases: 7
-  total_plans: 26
+  total_plans: 29
   completed_plans: 23
 ---
 
@@ -49,7 +49,7 @@ progress:
 |-------|------|--------------|-------|--------|
 | 7 | Qualidade de Leads Avançada | QUAL-01 to QUAL-06 | 3 | Not started |
 | 8 | Catálogo de Nichos | NICHE-01 to NICHE-04 | 3 | COMPLETE (3/3) |
-| 9 | Expansão Regional ES | REG-01, REG-02 | 3 | Not started |
+| 9 | Expansão Regional ES | REG-01, REG-02 | 3 | In progress (1/3) |
 | 10 | Novas Fontes de Extração | SRC-01 to SRC-04 | 3 | Not started |
 
 ## Completed Work (Milestone v1.0 History)
@@ -68,6 +68,7 @@ progress:
 | 2026-03-26 | Phase 8 Plan 01: niches table + populate_niches.sql (156 rows, 170 in DB) + 4 CRUD endpoints deployed |
 | 2026-03-26 | Phase 8 Plan 02: get_pipeline_config() reads from niches table (round-robin) + _mark_niches_used() helper + daily_job_run fallback fixed |
 | 2026-03-26 | Phase 8 Plan 03: /admin/niches page (tabs + toggle + priority) + massive-search loads niches from DB + Sidebar nav links + frontend deployed |
+| 2026-03-27 | Phase 9 Plan 01: regions table DDL (9 cols + UNIQUE(city,state)) + populate_es_cities.sql (78 cities + IBGE codes) + GET /api/admin/regions + PUT /api/admin/regions/bulk + test stubs |
 
 ## Research Available
 
@@ -91,6 +92,9 @@ progress:
 | save_lead_to_db is canonical INSERT | quality_grade written on every INSERT |
 | _build_portal_filter_query shared helper | Used by search + notification scheduler |
 | bulk route before <int:niche_id> | Flask routing: 'bulk' would match as integer ID otherwise |
+| regions table mirrors niches table exactly | Same pattern from Phase 8 — zero learning curve, proven in codebase |
+| city (ASCII) + name (accented) dual-column | city used in scraper URL queries, name shown in UI — both required |
+| idx_leads_city_state in Wave 0 | Added immediately because GET /api/admin/regions uses it; prevents slow JOIN as leads table grows |
 | niches.keywords TEXT[] column | Future fuzzy-matching for pipeline niche selection |
 | get_pipeline_config() read-only, _mark_niches_used() separate | Health checks call get_pipeline_config() — must not advance rotation on every call |
 | DAILY_JOB_NICHES constant preserved | Fallback when niches table is empty (prevents crash on cold start) |
@@ -100,6 +104,6 @@ progress:
 
 ## Last Session
 
-- **Stopped at**: Completed 08-03-PLAN.md — Phase 8 complete (all 3 plans done)
-- **Next action**: `/gsd:execute-phase 07` (Phase 7: Lead Quality Engine — QUAL-01 to QUAL-06) or `/gsd:execute-phase 09` (Expansao Regional ES)
-- **Timestamp**: 2026-03-26
+- **Stopped at**: Completed 09-01-PLAN.md — Phase 9 Plan 01 done (regions DB foundation)
+- **Next action**: `/gsd:execute-phase 09` Plan 02 (round-robin rotation) — requires deploy to VPS first (VPS was unreachable during Plan 01 execution)
+- **Timestamp**: 2026-03-27
