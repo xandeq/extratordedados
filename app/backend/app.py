@@ -2232,6 +2232,25 @@ def init_db():
         )''')
         c.execute('CREATE INDEX IF NOT EXISTS idx_niches_active ON niches(active)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_niches_last_used ON niches(last_used_at ASC NULLS FIRST)')
+
+        # Phase 9: Regional expansion — ES cities table
+        c.execute('''CREATE TABLE IF NOT EXISTS regions (
+            id           SERIAL PRIMARY KEY,
+            name         VARCHAR(255) NOT NULL,   -- Display name with accents, e.g. "Vitória"
+            city         VARCHAR(255) NOT NULL,   -- ASCII form used in search queries, e.g. "Vitoria"
+            state        VARCHAR(2)   NOT NULL DEFAULT 'ES',
+            ibge_code    VARCHAR(10),             -- 7-digit IBGE code, e.g. "3205309"
+            priority     INTEGER      DEFAULT 100,
+            active       BOOLEAN      DEFAULT TRUE,
+            last_used_at TIMESTAMP,
+            created_at   TIMESTAMP    DEFAULT NOW(),
+            UNIQUE(city, state)
+        )''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_regions_active ON regions(active)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_regions_last_used ON regions(last_used_at ASC NULLS FIRST)')
+        # Performance index for leads-per-city JOIN in GET /api/admin/regions
+        c.execute('CREATE INDEX IF NOT EXISTS idx_leads_city_state ON leads(city, state)')
+
         # Migrate existing custom_niches rows (category = 'Outros', priority = 100)
         c.execute('''
             INSERT INTO niches (name, category, created_at)
