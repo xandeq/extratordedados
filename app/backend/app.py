@@ -15078,15 +15078,27 @@ def trigger_daily_pipeline(niches=None, region_id=None):
     # Phase 8: mark selected niches as used (advances round-robin for next run)
     _mark_niches_used(niches)
 
-    if region_id not in SEARCH_REGIONS:
-        print(f"[DAILY] Região desconhecida: {region_id}")
+    # Phase 9: prefer DB-driven cities (round-robin from regions table)
+    db_cities = cfg.get('cities')
+    if db_cities:
+        cities_to_search = [
+            {'city': c['city'], 'state': c['state'], 'region': 'es_round_robin'}
+            for c in db_cities
+        ]
+        _mark_cities_used([c['city'] for c in db_cities])
+        region_label = f"es_round_robin_{len(db_cities)}cidades"
+    elif region_id in SEARCH_REGIONS:
+        # Legacy fallback — SEARCH_REGIONS dict preserved for non-ES regions and cold start
+        region_data = SEARCH_REGIONS[region_id]
+        cities_to_search = [
+            {'city': c, 'state': region_data['state'], 'region': region_id}
+            for c in region_data['cities']
+        ]
+        region_label = region_id
+        print(f"[DAILY] regions table vazia — usando fallback {region_id} ({len(cities_to_search)} cidades)")
+    else:
+        print(f"[DAILY] Região desconhecida e regions table vazia: {region_id}")
         return None
-
-    region_data      = SEARCH_REGIONS[region_id]
-    cities_to_search = [
-        {'city': city, 'state': region_data['state'], 'region': region_id}
-        for city in region_data['cities']
-    ]
 
     try:
         with get_db() as conn:
@@ -15109,7 +15121,7 @@ def trigger_daily_pipeline(niches=None, region_id=None):
             cur.execute(
                 "INSERT INTO daily_jobs (status, niches_used, region_used, started_at) "
                 "VALUES ('running', %s, %s, NOW()) RETURNING id",
-                (niches, region_id)
+                (niches, region_label)
             )
             daily_job_id = cur.fetchone()[0]
 
