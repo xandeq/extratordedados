@@ -882,7 +882,9 @@ DAILY_CRM_SYNC_HOUR = 9                 # 09:00 da manhã para sync CRM automát
 def get_pipeline_config():
     """Read current pipeline config from DB. Falls back to module constants on any error.
     NOTE: This function is READ-ONLY. It does NOT update last_used_at.
-    Call _mark_niches_used(names) separately after pipeline is triggered.
+    Call _mark_niches_used(names) / _mark_cities_used(names) separately after pipeline is triggered.
+    Phase 9 addition: also reads next N cities from regions table (round-robin by last_used_at).
+    This function is READ-ONLY — it does not advance the rotation (that is trigger_daily_pipeline's job).
     """
     try:
         with get_db() as conn:
@@ -899,6 +901,16 @@ def get_pipeline_config():
             )
             niche_rows = cur.fetchall()
             niches = [r[0] for r in niche_rows] if niche_rows else DAILY_JOB_NICHES
+            # Phase 9: read next N cities from regions table (round-robin)
+            n_cities = int(rows.get('daily_cities_per_run', 7))
+            cur.execute(
+                "SELECT city, state FROM regions WHERE active = TRUE "
+                "ORDER BY last_used_at ASC NULLS FIRST, priority ASC, id ASC "
+                "LIMIT %s",
+                (n_cities,)
+            )
+            city_rows = cur.fetchall()
+            cities = [{'city': r[0], 'state': r[1]} for r in city_rows] if city_rows else None
         return {
             'niches':               niches,
             'region':               rows.get('daily_region',    DAILY_JOB_REGION),
@@ -907,6 +919,8 @@ def get_pipeline_config():
             'notify_email':         rows.get('notify_email'),
             'healthcheck_url':      rows.get('healthcheck_url'),
             'daily_niches_per_run': n,
+            'cities':               cities,
+            'daily_cities_per_run': n_cities,
         }
     except Exception as e:
         print(f"[CONFIG] Erro ao ler pipeline_config: {e} — usando defaults")
@@ -918,6 +932,8 @@ def get_pipeline_config():
             'notify_email':         None,
             'healthcheck_url':      None,
             'daily_niches_per_run': 20,
+            'cities':               None,
+            'daily_cities_per_run': 7,
         }
 
 
