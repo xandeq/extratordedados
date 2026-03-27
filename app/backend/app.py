@@ -940,6 +940,27 @@ def _mark_niches_used(names):
         print(f"[NICHES] _mark_niches_used error (non-fatal): {e}")
 
 
+def _mark_cities_used(city_names):
+    """Update last_used_at for the given ASCII city names in the regions table.
+    Called once per trigger_daily_pipeline() call, after city list is selected.
+    Safe to call with empty list (no-op). Errors are logged, not raised.
+    Uses the 'city' column (ASCII form), not 'name' (accented display form).
+    """
+    if not city_names:
+        return
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE regions SET last_used_at = NOW() WHERE city = ANY(%s) AND state = 'ES'",
+                (city_names,)
+            )
+            conn.commit()
+        print(f"[REGIONS] Marked {len(city_names)} cities used: {city_names[:5]}{'...' if len(city_names) > 5 else ''}")
+    except Exception as e:
+        print(f"[REGIONS] _mark_cities_used error (non-fatal): {e}")
+
+
 SKIP_DOMAINS = {
     # Redes sociais
     'facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'linkedin.com',
