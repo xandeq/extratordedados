@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Lead Quality Engine
 status: unknown
-last_updated: "2026-03-26T12:19:12.454Z"
+last_updated: "2026-03-27T11:42:13.154Z"
 progress:
   total_phases: 10
-  completed_phases: 7
+  completed_phases: 8
   total_plans: 29
-  completed_plans: 24
+  completed_plans: 26
 ---
 
 # STATE.md — Project Memory
@@ -18,9 +18,9 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone v1.1 — Lead Quality Engine
-- **Active phase**: Phase 8 — Catálogo de Nichos (COMPLETE — all 3 plans done)
+- **Active phase**: Phase 9 — Expansão Regional ES (COMPLETE — all 3 plans done)
 - **Milestone v1.0**: COMPLETE (Phases 1-6 all done, 20/20 plans, all features live)
-- **Last completed**: Phase 08 Plan 03 — /admin/niches UI + massive-search DB-loaded niches + Sidebar nav links + frontend deployed to HostGator
+- **Last completed**: Phase 09 Plan 03 — pipeline-config city coverage badges + massive-search ES city selector + frontend deployed to HostGator
 
 ## Milestone v1.1 Scope
 
@@ -49,7 +49,7 @@ progress:
 |-------|------|--------------|-------|--------|
 | 7 | Qualidade de Leads Avançada | QUAL-01 to QUAL-06 | 3 | Not started |
 | 8 | Catálogo de Nichos | NICHE-01 to NICHE-04 | 3 | COMPLETE (3/3) |
-| 9 | Expansão Regional ES | REG-01, REG-02 | 3 | In progress (2/3) |
+| 9 | Expansão Regional ES | REG-01, REG-02 | 3 | COMPLETE (3/3) |
 | 10 | Novas Fontes de Extração | SRC-01 to SRC-04 | 3 | Not started |
 
 ## Completed Work (Milestone v1.0 History)
@@ -70,6 +70,7 @@ progress:
 | 2026-03-26 | Phase 8 Plan 03: /admin/niches page (tabs + toggle + priority) + massive-search loads niches from DB + Sidebar nav links + frontend deployed |
 | 2026-03-27 | Phase 9 Plan 01: regions table DDL (9 cols + UNIQUE(city,state)) + populate_es_cities.sql (78 cities + IBGE codes) + GET /api/admin/regions + PUT /api/admin/regions/bulk + test stubs |
 | 2026-03-27 | Phase 9 Plan 02: _mark_cities_used() helper + get_pipeline_config() cities query (round-robin) + trigger_daily_pipeline() DB-driven city path with SEARCH_REGIONS fallback |
+| 2026-03-27 | Phase 9 Plan 03: pipeline-config city coverage badges (green/gray, GET /api/admin/regions) + massive-search ES city selector (es_city mode, {city, state: 'ES'} POST routing) + frontend deployed to HostGator |
 
 ## Research Available
 
@@ -105,9 +106,11 @@ progress:
 | PREDEFINED_NICHES removed from massive-search.tsx | Single source of truth is niches DB table; massive-search fetches /api/niches?active=true |
 | isActive() exact-match for /admin/niches + /admin/pipeline-config | Prevents false "Painel Admin" highlight when visiting sub-admin routes (startsWith pitfall) |
 | 50-niche cap warning client-side only | UX guard in massive-search; backend enforces actual limit independently |
+| coverage section below Região dropdown (not inside) | Keeps region selector unchanged; coverage is read-only info |
+| es_city sentinel value reuses selectedRegion state | Avoids new boolean state variable; fits existing region selector flow |
 
 ## Last Session
 
-- **Stopped at**: Completed 09-02-PLAN.md — Phase 9 Plan 02 done (round-robin rotation wired)
-- **Next action**: `/gsd:execute-phase 09` Plan 03 (frontend coverage UI) — VPS deploy still pending (unreachable from this machine)
+- **Stopped at**: Completed 09-03-PLAN.md — Phase 9 COMPLETE (all 3 plans done, frontend deployed)
+- **Next action**: Phase 7 (Qualidade Avançada) or Phase 10 (Novas Fontes) — VPS SSH still pending (unreachable, run `python deploy.py backend` + populate SQL when VPS is accessible)
 - **Timestamp**: 2026-03-27

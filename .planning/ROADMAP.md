@@ -275,12 +275,12 @@ Plans:
 
 **Out of scope**: Expansão para outros estados (SP, RJ, MG) — após ES coberto 100%
 
-**Plans:** 2/3 plans complete
+**Plans:** 3/3 plans complete
 
 Plans:
 - [x] 09-01-PLAN.md — Wave 0: regions DB migration + populate_es_cities.sql (78 cities) + GET /api/admin/regions + PUT /api/admin/regions/bulk
 - [x] 09-02-PLAN.md — Wave 1: _mark_cities_used() + get_pipeline_config() cities query + trigger_daily_pipeline() DB-driven path with SEARCH_REGIONS fallback
-- [ ] 09-03-PLAN.md — Wave 2: pipeline-config page city coverage list + busca massiva region selector update + frontend deploy
+- [x] 09-03-PLAN.md — Wave 2: pipeline-config page city coverage list + busca massiva region selector update + frontend deploy
 
 ---
 
