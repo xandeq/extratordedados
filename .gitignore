@@ -28,3 +28,11 @@ __pycache__/
 # OS
 NUL
 .deploy.env
+
+# Node.js / Next.js build artifacts (never commit these)
+node_modules/
+app/frontend/node_modules/
+app/frontend/.next/
+app/frontend/out/
+app/frontend/tsconfig.tsbuildinfo
+.secrets.cache.json
