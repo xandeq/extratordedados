@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { useRouter } from 'next/router'
 import Link from 'next/link'
 import {
@@ -56,6 +57,23 @@ interface PipelineJob {
   leads_synced: number
   region: string
   niches: string[]
+}
+
+interface SourceStat { source: string; count: number }
+
+const SOURCE_LABELS: Record<string, string> = {
+  google_maps: 'G. Maps',
+  search_engine: 'Motores',
+  outscraper_maps: 'Outscraper',
+  apify_maps: 'Apify',
+  instagram: 'Instagram',
+  linkedin: 'LinkedIn',
+  local_business_data: 'Local Biz',
+  apple_maps: 'Apple Maps',
+  foursquare: 'Foursquare',
+  directories: 'Diretórios',
+  serper_google: 'Serper',
+  cnpj_open: 'CNPJ',
 }
 
 const PLAN_LABELS: Record<string, string> = { free: 'Grátis', pro: 'Pro', enterprise: 'Enterprise' }
@@ -171,6 +189,7 @@ export default function AdminHome() {
   const [loading, setLoading] = useState(true)
   const [pipelineHealth, setPipelineHealth] = useState<PipelineHealth | null>(null)
   const [pipelineJobs, setPipelineJobs] = useState<PipelineJob[]>([])
+  const [sourceStats, setSourceStats] = useState<SourceStat[]>([])
 
   const fetchSummary = useCallback(async () => {
     try {
@@ -195,6 +214,14 @@ export default function AdminHome() {
     api.get('/api/admin/daily-job/status')
       .then(res => setPipelineJobs(res.data.jobs || []))
       .catch(() => setPipelineJobs([]))
+    api.get('/api/admin/source-stats')
+      .then(res => setSourceStats(
+        (res.data as SourceStat[]).map(s => ({
+          ...s,
+          source: SOURCE_LABELS[s.source] || s.source
+        }))
+      ))
+      .catch(() => setSourceStats([]))
   }, [fetchSummary])
 
   const planOrder = ['free', 'pro', 'enterprise']
@@ -478,6 +505,23 @@ export default function AdminHome() {
           })}
         </div>
       </div>
+
+      {/* Source Stats Bar Chart */}
+      {sourceStats.length > 0 && (
+        <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-200 dark:border-gray-700">
+          <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
+            Leads por Fonte (últimos 30 dias)
+          </h3>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={sourceStats} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
+              <XAxis dataKey="source" tick={{ fontSize: 11 }} />
+              <YAxis tick={{ fontSize: 11 }} />
+              <Tooltip />
+              <Bar dataKey="count" fill="#6366f1" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
     </div>
   )
 }
