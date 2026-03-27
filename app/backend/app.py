@@ -11818,6 +11818,8 @@ def start_massive_search():
             total_jobs += min(3, len(niches)) * min(2, len(cities_to_search))
         if 'outscraper_maps' in methods:
             total_jobs += min(2, len(niches)) * min(2, len(cities_to_search))
+        if 'apple_maps' in methods:
+            total_jobs += min(2, len(niches)) * min(2, len(cities_to_search))
 
         is_shared_val = not is_draft  # draft → is_shared=FALSE; normal → TRUE
         c.execute(
@@ -12078,6 +12080,17 @@ def start_massive_search():
                          city_data.get('region', 'manual'), 1, 'pending', 'outscraper_maps', datetime.now()))
                     outscraper_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
 
+        apple_maps_jobs = []
+        if 'apple_maps' in methods:
+            for niche in niches[:2]:
+                for city_data in cities_to_search[:2]:
+                    c.execute(
+                        '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                        (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                         city_data.get('region', 'manual'), 1, 'pending', 'apple_maps', datetime.now()))
+                    apple_maps_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
+
         # Bug 2 fix: mark batch as 'processing' now that all jobs are queued
         c.execute("UPDATE batches SET status='processing' WHERE id=%s", (batch_id,))
 
@@ -12196,6 +12209,14 @@ def start_massive_search():
             daemon=True
         ).start()
 
+    # Thread 17: Apple Maps (Playwright)
+    if apple_maps_jobs:
+        threading.Thread(
+            target=process_apple_maps_massive,
+            args=(batch_id, apple_maps_jobs, user_id),
+            daemon=True
+        ).start()
+
     # Bug 4 fix: monitor thread marks batch 'completed' when all jobs finish
     monitor_thread = threading.Thread(target=_monitor_batch_completion, args=(batch_id,), daemon=True)
     monitor_thread.start()
@@ -12224,6 +12245,7 @@ def start_massive_search():
             'olx_ads': len(olx_ads_jobs),
             'whatsapp_dorks': len(whatsapp_dorks_jobs),
             'outscraper_maps': len(outscraper_jobs),
+            'apple_maps': len(apple_maps_jobs),
         },
         'status': 'processing',
         'message': f'Busca massiva iniciada com {total_jobs} jobs em {len(methods)} métodos'
@@ -12618,6 +12640,100 @@ def _massive_retry(fn, provider, query, max_attempts=3):
     scraper_log('ERROR', provider, query,
                 f'Todas {max_attempts} tentativas falharam. Último erro: {last_exc}', last_exc)
     return None, last_exc
+
+
+@_persist_thread_errors('apple_maps')
+def process_apple_maps_massive(batch_id, jobs_data, user_id):
+    """
+    Thread 17: Apple Maps via Playwright.
+    - Retry 3x com backoff via _massive_retry
+    - NUNCA para: itera todos os jobs até o fim
+    - Free: sem cota de API (scraping web público)
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[APPLE_MAPS] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'apple_maps', f'batch={batch_id}',
+                f'Iniciando Apple Maps. {len(jobs_data)} jobs.')
+    try:
+        c = conn.cursor()
+        total_saved = 0
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={'width': 1280, 'height': 800},
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+            page = context.new_page()
+            for job_idx, job_data in enumerate(jobs_data):
+                search_job_id = job_data['search_job_id']
+                niche = job_data['niche']
+                city  = job_data['city']
+                state = job_data['state']
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                              ('processing', datetime.now(), search_job_id))
+                    url = (f"https://maps.apple.com/?q={niche.replace(' ', '+')}+"
+                           f"{city.replace(' ', '+')}%2C+{state}"
+                           f"&near={city.replace(' ', '+')}")
+                    page.goto(url, wait_until='networkidle', timeout=30000)
+                    try:
+                        page.wait_for_selector('.place-list-item', timeout=15000)
+                    except PWTimeoutError:
+                        snippet = page.content()[:500]
+                        scraper_log('WARNING', 'apple_maps', f'batch={batch_id}',
+                                    f'Selector timeout job {search_job_id}. DOM: {snippet}')
+                        c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                                  ('paused', 'selector_timeout', datetime.now(), search_job_id))
+                        time.sleep(random.uniform(10, 20))
+                        continue
+
+                    items = page.query_selector_all('.place-list-item')[:20]
+                    leads = []
+                    for item in items:
+                        try:
+                            name_el = item.query_selector('.place-name') or item.query_selector('h1')
+                            name = name_el.inner_text().strip() if name_el else ''
+                            phone_el = item.query_selector('a[href^="tel:"]')
+                            phone = phone_el.get_attribute('href')[4:] if phone_el else ''
+                            addr_el = item.query_selector('.place-subtitle')
+                            address = addr_el.inner_text().strip() if addr_el else ''
+                            if name:
+                                leads.append({
+                                    'company_name': name,
+                                    'phone': phone,
+                                    'address': address,
+                                    'category': niche,
+                                    'city': city,
+                                    'state': state,
+                                    'source': 'apple_maps',
+                                })
+                        except Exception:
+                            pass
+
+                    leads_saved = _save_leads_to_batch(c, conn, batch_id, leads,
+                                                       'apple_maps', city, state, 'APPLE_MAPS')
+                    total_saved += leads_saved
+                    c.execute('UPDATE search_jobs SET status=%s, total_results=%s, total_leads=%s, finished_at=%s WHERE id=%s',
+                              ('completed', len(items), leads_saved, datetime.now(), search_job_id))
+                    print(f"[APPLE_MAPS] job {search_job_id} → {leads_saved} leads")
+                except Exception as e:
+                    scraper_log('ERROR', 'apple_maps', f'job={search_job_id}', str(e), e)
+                    try:
+                        c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                                  ('failed', str(e)[:200], datetime.now(), search_job_id))
+                    except Exception:
+                        pass
+                time.sleep(random.uniform(10, 20))
+            context.close()
+            browser.close()
+    except Exception as e:
+        scraper_log('CRITICAL', 'apple_maps', f'batch={batch_id}', str(e), e)
+    finally:
+        conn.close()
+    print(f"[APPLE_MAPS] Concluído. batch={batch_id}, total_saved={total_saved}")
 
 
 def _save_leads_to_batch(c, conn, batch_id, leads, source, city, state, provider):
@@ -17642,6 +17758,36 @@ def admin_auto_categorize_all():
         'source_normalized': source_fixed,
         'message': f'{categorized} leads categorizados, {source_fixed} sources normalizados'
     })
+
+
+@app.route('/api/admin/source-stats')
+def api_admin_source_stats():
+    """
+    Retorna contagem de leads por source dos últimos 30 dias.
+    Usado para o bar chart de fontes no painel admin.
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as _chk:
+        _cur = _chk.cursor()
+        _cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        _row = _cur.fetchone()
+        if not _row or not _row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('''
+            SELECT source, COUNT(*) AS total
+            FROM leads
+            WHERE captured_at >= NOW() - INTERVAL '30 days'
+              AND source IS NOT NULL
+            GROUP BY source
+            ORDER BY total DESC
+        ''')
+        rows = c.fetchall()
+    return jsonify([{'source': r[0], 'count': r[1]} for r in rows])
 
 
 def trigger_saved_search_notifications():
