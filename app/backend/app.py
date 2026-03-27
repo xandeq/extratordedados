@@ -1133,6 +1133,27 @@ SEARCH_DELAY_BETWEEN_PAGES = (5, 15)      # Between search result pages
 SEARCH_DELAY_BETWEEN_SITES = (3, 8)       # Between crawled sites
 SEARCH_DELAY_BETWEEN_CITIES = (10, 20)    # Between city searches
 
+# SRC-04: Five query templates per niche+city for search engine coverage
+SEARCH_QUERY_TEMPLATES = [
+    "{niche} {city} contato",
+    "{niche} {city} email",
+    "{niche} {city} whatsapp",
+    'site:*.com.br "{niche}" "{city}"',
+    '"{niche}" "{city}" OR "{vizinha}"',
+]
+
+ES_NEIGHBORING_CITIES = {
+    'Vitoria': 'Vila Velha',
+    'Vila Velha': 'Vitoria',
+    'Serra': 'Cariacica',
+    'Cariacica': 'Serra',
+    'Viana': 'Cariacica',
+    'Guarapari': 'Anchieta',
+    'Linhares': 'Colatina',
+    'Colatina': 'Linhares',
+    'Cachoeiro de Itapemirim': 'Marataizes',
+}
+
 CONTACT_PATHS = [
     '/contato', '/contact', '/contacto',
     '/sobre', '/about', '/quem-somos',
@@ -5091,14 +5112,20 @@ def process_search_job(batch_id, search_jobs_data, user_id):
             max_pages = job_data.get('max_pages', 2)
 
             # Update search job status
-            query_parts = [niche]
-            if city:
-                query_parts.append(city)
-            if state:
-                query_parts.append(state)
-            if not city and not state and region and region in SEARCH_REGIONS:
-                query_parts.append(SEARCH_REGIONS[region]['name'])
-            query = ' '.join(query_parts)
+            # SRC-04: use pre-built query from orchestrator if provided
+            query_override = job_data.get('query_override')
+            if query_override:
+                query = query_override
+            else:
+                # Fallback: original single-query build (backward compatibility)
+                query_parts = [niche]
+                if city:
+                    query_parts.append(city)
+                if state:
+                    query_parts.append(state)
+                if not city and not state and region and region in SEARCH_REGIONS:
+                    query_parts.append(SEARCH_REGIONS[region]['name'])
+                query = ' '.join(query_parts)
             c.execute('UPDATE search_jobs SET status = %s, started_at = %s, query = %s WHERE id = %s',
                       ('processing', datetime.now(), query, search_job_id))
 
@@ -11799,7 +11826,8 @@ def start_massive_search():
         if 'api_enrichment' in methods:
             total_jobs += min(3, len(niches)) * min(1, len(cities_to_search))
         if 'search_engines' in methods:
-            total_jobs += min(3, len(niches))
+            # SRC-04: 5 templates × niches[:2] × cities[:1]
+            total_jobs += min(2, len(niches)) * min(1, len(cities_to_search) or 1) * len(SEARCH_QUERY_TEMPLATES)
         if 'google_maps' in methods:
             total_jobs += min(2, len(niches)) * min(2, len(cities_to_search))
         if 'directories' in methods:
@@ -11855,21 +11883,35 @@ def start_massive_search():
         # ===========================================================
         search_engine_jobs = []
         if 'search_engines' in methods:
-            for niche in niches[:3]:  # Max 3 por rate limit
-                c.execute(
-                    '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
-                    (batch_id, user_id, niche, None, None, region_id, max_pages, 'pending', 'duckduckgo', datetime.now())
-                )
-                search_job_id = c.fetchone()[0]
-                search_engine_jobs.append({
-                    'search_job_id': search_job_id,
-                    'niche': niche,
-                    'city': None,
-                    'state': None,
-                    'region': region_id,
-                    'max_pages': max_pages,
-                })
+            # SRC-04: 5 templates per niche+city. Use niches[:2] x cities[:1] = 10 jobs max.
+            se_niches = niches[:2]
+            se_cities = cities_to_search[:1] if cities_to_search else [{'city': None, 'state': None, 'region': region_id}]
+            for niche in se_niches:
+                for city_data in se_cities:
+                    city_val  = city_data.get('city')
+                    state_val = city_data.get('state')
+                    vizinha   = ES_NEIGHBORING_CITIES.get(city_val or '', city_val or '')
+                    for tmpl in SEARCH_QUERY_TEMPLATES:
+                        query_str = tmpl.format(
+                            niche=niche,
+                            city=city_val or '',
+                            vizinha=vizinha,
+                        ).strip()
+                        c.execute(
+                            '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                            (batch_id, user_id, niche, city_val, state_val,
+                             city_data.get('region', region_id), max_pages, 'pending', 'duckduckgo', datetime.now())
+                        )
+                        search_engine_jobs.append({
+                            'search_job_id': c.fetchone()[0],
+                            'niche': niche,
+                            'city': city_val,
+                            'state': state_val,
+                            'region': city_data.get('region', region_id),
+                            'max_pages': max_pages,
+                            'query_override': query_str,
+                        })
 
         # ===========================================================
         # METHOD 3: GOOGLE MAPS (Playwright)
