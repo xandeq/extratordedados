@@ -11757,7 +11757,7 @@ def start_massive_search():
     if methods is not None and not isinstance(methods, list):
         return jsonify({'error': '"methods" deve ser uma lista'}), 400
     if methods is None:
-        methods = ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data', 'outscraper_maps']
+        methods = ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data', 'outscraper_maps', 'apple_maps']
 
     # Parameters
     region_id = (data.get('region') or '').strip()
@@ -11816,6 +11816,8 @@ def start_massive_search():
             total_jobs += min(3, len(niches)) * min(3, len(cities_to_search))
         if 'whatsapp_dorks' in methods:
             total_jobs += min(3, len(niches)) * min(2, len(cities_to_search))
+        if 'outscraper_maps' in methods:
+            total_jobs += min(2, len(niches)) * min(2, len(cities_to_search))
 
         is_shared_val = not is_draft  # draft → is_shared=FALSE; normal → TRUE
         c.execute(
@@ -12066,7 +12068,8 @@ def start_massive_search():
 
         outscraper_jobs = []
         if 'outscraper_maps' in methods:
-            for niche in niches[:3]:
+            # Free tier 500 records/month + limit=100 per job → cap at 4 jobs total (niches[:2] x cities[:2])
+            for niche in niches[:2]:
                 for city_data in cities_to_search[:2]:
                     c.execute(
                         '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
@@ -12497,9 +12500,10 @@ def process_outscraper_massive(batch_id, jobs_data, user_id):
                 except Exception:
                     pass
 
+                # SRC-03: limit 20→100 (5× more results per query, free tier 500/month)
                 result, err = _massive_retry(
                     lambda q=query: client.google_maps_search(
-                        [q], limit=20, language="pt", region="BR",
+                        [q], limit=100, language="pt", region="BR",
                         fields=["name", "phone", "email", "full_address", "site", "category"]
                     ),
                     provider='outscraper',
