@@ -15470,6 +15470,83 @@ def get_niches_catalog():
     return jsonify({'niches': dict(grouped)}), 200
 
 
+@app.route('/api/admin/regions', methods=['GET'])
+@limiter.limit("60/minute")
+def admin_get_regions():
+    """Return all regions with last execution time and leads captured. Admin only."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        row = c.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+        c.execute('''
+            SELECT
+                r.id,
+                r.name,
+                r.city,
+                r.state,
+                r.ibge_code,
+                r.priority,
+                r.active,
+                r.last_used_at,
+                COUNT(l.id) FILTER (WHERE l.extracted_at > NOW() - INTERVAL '30 days') AS leads_last_30d,
+                COUNT(l.id) AS leads_total
+            FROM regions r
+            LEFT JOIN leads l ON l.city = r.city AND l.state = r.state
+            GROUP BY r.id
+            ORDER BY r.priority ASC, r.name ASC
+        ''')
+        rows = c.fetchall()
+    result = []
+    for r in rows:
+        result.append({
+            'id':            r[0],
+            'name':          r[1],
+            'city':          r[2],
+            'state':         r[3],
+            'ibge_code':     r[4],
+            'priority':      r[5],
+            'active':        r[6],
+            'last_used_at':  r[7].isoformat() if r[7] else None,
+            'leads_last_30d': r[8] or 0,
+            'leads_total':   r[9] or 0,
+        })
+    return jsonify({'regions': result, 'total': len(result)}), 200
+
+
+@app.route('/api/admin/regions/bulk', methods=['PUT'])
+@limiter.limit("30/minute")
+def admin_bulk_update_regions():
+    """Activate or deactivate multiple regions by ID list. Admin only."""
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        row = c.fetchone()
+        if not row or not row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+        data = request.get_json() or {}
+        ids = data.get('ids', [])
+        active = data.get('active', True)
+        if not ids or not isinstance(ids, list):
+            return jsonify({'error': 'ids deve ser lista não vazia'}), 400
+        try:
+            c.execute('UPDATE regions SET active = %s WHERE id = ANY(%s)', (bool(active), ids))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return jsonify({'error': str(e)}), 500
+    return jsonify({'updated': len(ids), 'active': bool(active)}), 200
+
+
 @app.route('/api/admin/logs', methods=['GET'])
 @limiter.limit("60/minute")
 def admin_logs():
