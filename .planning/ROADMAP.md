@@ -302,7 +302,7 @@ Plans:
 
 **Out of scope**: LinkedIn Sales Navigator (custo), MillionVerifier bulk
 
-**Plans:** 3 plans
+**Plans:** 3/3 plans complete
 
 Plans:
 - [ ] 10-01-PLAN.md — Wave 0: process_apple_maps_massive() + Thread 17 wiring + GET /api/admin/source-stats + tests/test_sources.py (8 smoke tests)
