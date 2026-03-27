@@ -9557,6 +9557,30 @@ def _get_serper_key():
 _outscraper_key_cache = None
 _outscraper_key_failed = False
 
+# ---- METHOD 6 (Phase 10): Foursquare Places API ----
+_foursquare_key_cache = None
+_foursquare_key_failed = False
+
+
+def _get_foursquare_key():
+    """Fetch Foursquare API key from env or AWS SM extratordedados/prod."""
+    global _foursquare_key_cache, _foursquare_key_failed
+    if _foursquare_key_cache:
+        return _foursquare_key_cache
+    if _foursquare_key_failed:
+        return None
+    _foursquare_key_cache = resolve_secret_value(
+        'FOURSQUARE_API_KEY',
+        secret_ids=['extratordedados/prod'],
+        env_keys=['FOURSQUARE_API_KEY'],
+        db_provider='foursquare',
+    )
+    if _foursquare_key_cache:
+        return _foursquare_key_cache
+    _foursquare_key_failed = True
+    return None
+
+
 def _get_outscraper_key():
     """Fetch Outscraper API key — resolve_secret_value with module-level cache (same as _get_serper_key)."""
     global _outscraper_key_cache, _outscraper_key_failed
@@ -11784,7 +11808,7 @@ def start_massive_search():
     if methods is not None and not isinstance(methods, list):
         return jsonify({'error': '"methods" deve ser uma lista'}), 400
     if methods is None:
-        methods = ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data', 'outscraper_maps', 'apple_maps']
+        methods = ['api_enrichment', 'search_engines', 'google_maps', 'directories', 'instagram', 'linkedin', 'serper_google', 'local_business_data', 'outscraper_maps', 'apple_maps', 'foursquare']
 
     # Parameters
     region_id = (data.get('region') or '').strip()
@@ -11848,6 +11872,8 @@ def start_massive_search():
             total_jobs += min(2, len(niches)) * min(2, len(cities_to_search))
         if 'apple_maps' in methods:
             total_jobs += min(2, len(niches)) * min(2, len(cities_to_search))
+        if 'foursquare' in methods:
+            total_jobs += min(3, len(niches)) * min(2, len(cities_to_search))
 
         is_shared_val = not is_draft  # draft → is_shared=FALSE; normal → TRUE
         c.execute(
@@ -12133,6 +12159,26 @@ def start_massive_search():
                          city_data.get('region', 'manual'), 1, 'pending', 'apple_maps', datetime.now()))
                     apple_maps_jobs.append({'search_job_id': c.fetchone()[0], 'niche': niche, 'city': city_data['city'], 'state': city_data['state']})
 
+        foursquare_jobs = []
+        if 'foursquare' in methods:
+            _fsq_key = _get_foursquare_key()
+            if not _fsq_key:
+                scraper_log('WARNING', 'foursquare', f'batch={batch_id}', 'API key ausente — pulando foursquare')
+            else:
+                for niche in niches[:3]:
+                    for city_data in cities_to_search[:2]:
+                        c.execute(
+                            '''INSERT INTO search_jobs (batch_id, user_id, niche, city, state, region, max_pages, status, engine, created_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                            (batch_id, user_id, niche, city_data['city'], city_data['state'],
+                             city_data.get('region', 'manual'), 1, 'pending', 'foursquare', datetime.now()))
+                        foursquare_jobs.append({
+                            'search_job_id': c.fetchone()[0],
+                            'niche': niche,
+                            'city': city_data['city'],
+                            'state': city_data['state'],
+                        })
+
         # Bug 2 fix: mark batch as 'processing' now that all jobs are queued
         c.execute("UPDATE batches SET status='processing' WHERE id=%s", (batch_id,))
 
@@ -12259,6 +12305,14 @@ def start_massive_search():
             daemon=True
         ).start()
 
+    # Thread 18: Foursquare Places API
+    if foursquare_jobs:
+        threading.Thread(
+            target=process_foursquare_massive,
+            args=(batch_id, foursquare_jobs, user_id),
+            daemon=True
+        ).start()
+
     # Bug 4 fix: monitor thread marks batch 'completed' when all jobs finish
     monitor_thread = threading.Thread(target=_monitor_batch_completion, args=(batch_id,), daemon=True)
     monitor_thread.start()
@@ -12288,6 +12342,7 @@ def start_massive_search():
             'whatsapp_dorks': len(whatsapp_dorks_jobs),
             'outscraper_maps': len(outscraper_jobs),
             'apple_maps': len(apple_maps_jobs),
+            'foursquare': len(foursquare_jobs),
         },
         'status': 'processing',
         'message': f'Busca massiva iniciada com {total_jobs} jobs em {len(methods)} métodos'
@@ -12776,6 +12831,144 @@ def process_apple_maps_massive(batch_id, jobs_data, user_id):
     finally:
         conn.close()
     print(f"[APPLE_MAPS] Concluído. batch={batch_id}, total_saved={total_saved}")
+
+
+def search_foursquare_places(niche, city, state, api_key, limit=50):
+    """
+    Call Foursquare Places API v3 search.
+    Returns (list_of_lead_dicts, None) on success,
+            (None, 'quota_exceeded') on HTTP 429,
+            (None, error_str) on other errors.
+    Free tier: 10,000 calls/month, 50 QPS.
+    """
+    import requests as http_requests_local
+    url = "https://api.foursquare.com/v3/places/search"
+    headers = {
+        "Authorization": api_key,
+        "Accept": "application/json"
+    }
+    params = {
+        "query": niche,
+        "near": f"{city}, {state}, Brazil",
+        "limit": limit,
+        "fields": "name,tel,website,location,categories"
+    }
+    try:
+        resp = http_requests_local.get(url, headers=headers, params=params, timeout=15)
+        if resp.status_code == 429:
+            return None, 'quota_exceeded'
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        leads = []
+        for r in results:
+            loc = r.get("location", {})
+            leads.append({
+                'company_name': r.get('name', ''),
+                'phone': r.get('tel', ''),
+                'website': r.get('website', ''),
+                'address': loc.get('formatted_address', ''),
+                'city': city,
+                'state': state,
+                'category': niche,
+                'source': 'foursquare',
+            })
+        return leads, None
+    except Exception as e:
+        return None, str(e)
+
+
+@_persist_thread_errors('foursquare')
+def process_foursquare_massive(batch_id, jobs_data, user_id):
+    """
+    Thread 18: Foursquare Places API v3.
+    - Retry 3x com backoff via _massive_retry
+    - NUNCA para: itera todos os jobs até o fim
+    - Free tier: 10,000 calls/month
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    print(f"\n[FOURSQUARE] Iniciando. batch={batch_id}, jobs={len(jobs_data)}")
+    scraper_log('INFO', 'foursquare', f'batch={batch_id}',
+                f'Iniciando Foursquare Places. {len(jobs_data)} jobs.')
+    try:
+        c = conn.cursor()
+        total_saved    = 0
+        quota_exceeded = False
+
+        key = _get_foursquare_key()
+        if not key:
+            scraper_log('WARNING', 'foursquare', f'batch={batch_id}',
+                        'API key não disponível — pulando todos os jobs')
+            print('[FOURSQUARE] API key ausente — marcando todos os jobs como quota_exceeded')
+            for job_data in jobs_data:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', 'quota_exceeded', datetime.now(), job_data['search_job_id']))
+                except Exception:
+                    pass
+            return
+
+        for job_idx, job_data in enumerate(jobs_data):
+            search_job_id = job_data['search_job_id']
+            niche = job_data['niche']
+            city  = job_data['city']
+            state = job_data['state']
+
+            if quota_exceeded:
+                print(f"[FOURSQUARE] Quota excedida — marcando job {search_job_id} como skipped")
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', 'quota_exceeded', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+                continue
+
+            try:
+                c.execute('UPDATE search_jobs SET status=%s, started_at=%s WHERE id=%s',
+                          ('processing', datetime.now(), search_job_id))
+            except Exception:
+                pass
+
+            result, err = _massive_retry(
+                lambda n=niche, ci=city, st=state: search_foursquare_places(n, ci, st, key),
+                provider='foursquare',
+                query=f"{niche} {city}"
+            )
+
+            if err == 'quota_exceeded':
+                quota_exceeded = True
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', 'quota_exceeded', datetime.now(), search_job_id))
+                except Exception:
+                    pass
+                continue
+
+            if result is None:
+                try:
+                    c.execute('UPDATE search_jobs SET status=%s, error_message=%s, finished_at=%s WHERE id=%s',
+                              ('failed', str(err)[:200], datetime.now(), search_job_id))
+                except Exception:
+                    pass
+                time.sleep(random.uniform(3, 7))
+                continue
+
+            leads_saved = _save_leads_to_batch(c, conn, batch_id, result,
+                                               'foursquare', city, state, 'FOURSQUARE')
+            total_saved += leads_saved
+            try:
+                c.execute('UPDATE search_jobs SET status=%s, total_results=%s, total_leads=%s, finished_at=%s WHERE id=%s',
+                          ('completed', len(result), leads_saved, datetime.now(), search_job_id))
+            except Exception:
+                pass
+            print(f"[FOURSQUARE] job {search_job_id} → {leads_saved} leads")
+            time.sleep(random.uniform(3, 7))
+
+    except Exception as e:
+        scraper_log('CRITICAL', 'foursquare', f'batch={batch_id}', str(e), e)
+    finally:
+        conn.close()
+    print(f"[FOURSQUARE] Concluído. batch={batch_id}, total_saved={total_saved}")
 
 
 def _save_leads_to_batch(c, conn, batch_id, leads, source, city, state, provider):
