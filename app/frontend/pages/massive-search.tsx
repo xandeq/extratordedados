@@ -53,7 +53,18 @@ export default function MassiveSearch() {
       .catch(() => {})
       .finally(() => setLoadingNiches(false));
   }, []);
+
+  // Load ES cities from regions table
+  useEffect(() => {
+    api.get('/api/admin/regions')
+      .then(res => setEsCities((res.data.regions || []).filter((r: any) => r.active)))
+      .catch(() => setEsCities([]));
+  }, []);
+
   const [selectedRegion, setSelectedRegion] = useState('grande_vitoria_es');
+  const [esCities, setEsCities] = useState<Array<{id: number; name: string; city: string}>>([]);
+  const [selectedCity, setSelectedCity] = useState<string>('');
+  const [citySearch, setCitySearch] = useState<string>('');
   const [maxPages, setMaxPages] = useState(2);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -225,12 +236,20 @@ export default function MassiveSearch() {
     setSuccess('');
 
     try {
-      const response = await api.post('/api/search/massive', {
+      const payload: any = {
         niches: selectedNiches,
-        region: selectedRegion,
         methods: enabledMethods,
         max_pages: maxPages,
-      });
+      };
+
+      if (selectedRegion === 'es_city' && selectedCity) {
+        payload.city = selectedCity;
+        payload.state = 'ES';
+      } else {
+        payload.region = selectedRegion;
+      }
+
+      const response = await api.post('/api/search/massive', payload);
 
       const { batch_id } = response.data;
       setSuccess(`Busca massiva iniciada! ${response.data.total_jobs} jobs em execução.`);
@@ -436,6 +455,59 @@ export default function MassiveSearch() {
                     </div>
                   </button>
                 ))}
+
+                {/* ES individual city option */}
+                <button
+                  onClick={() => { setSelectedRegion('es_city'); setSelectedCity(''); }}
+                  className={`w-full p-4 rounded-lg border-2 transition-all text-left ${
+                    selectedRegion === 'es_city'
+                      ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20'
+                      : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'
+                  }`}
+                >
+                  <div className="flex items-start gap-3">
+                    <MapPin className={`h-5 w-5 flex-shrink-0 mt-0.5 ${selectedRegion === 'es_city' ? 'text-blue-600 dark:text-blue-400' : 'text-gray-400'}`} />
+                    <div className="flex-1">
+                      <h3 className={`font-bold mb-1 ${selectedRegion === 'es_city' ? 'text-blue-700 dark:text-blue-300' : 'text-gray-900 dark:text-white'}`}>
+                        Cidade específica do ES
+                      </h3>
+                      <p className="text-sm text-gray-600 dark:text-gray-400">
+                        {esCities.length} cidades disponíveis
+                      </p>
+                    </div>
+                    {selectedRegion === 'es_city' && (
+                      <CheckCircle2 className="h-5 w-5 text-blue-600 dark:text-blue-400" />
+                    )}
+                  </div>
+                </button>
+
+                {selectedRegion === 'es_city' && (
+                  <div className="mt-3 pl-1">
+                    <input
+                      type="text"
+                      placeholder="Buscar cidade..."
+                      value={citySearch}
+                      onChange={e => setCitySearch(e.target.value)}
+                      className="w-full bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded px-3 py-2 text-sm text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400 mb-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                    <select
+                      value={selectedCity}
+                      onChange={e => setSelectedCity(e.target.value)}
+                      size={6}
+                      className="w-full bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded px-3 py-2 text-sm text-gray-900 dark:text-white"
+                    >
+                      <option value="">— Selecione uma cidade —</option>
+                      {esCities
+                        .filter(c => c.name.toLowerCase().includes(citySearch.toLowerCase()))
+                        .map(c => (
+                          <option key={c.id} value={c.city}>{c.name}</option>
+                        ))}
+                    </select>
+                    {selectedCity && (
+                      <p className="text-xs text-green-600 dark:text-green-400 mt-1">Cidade selecionada: {selectedCity}</p>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -548,7 +620,7 @@ export default function MassiveSearch() {
 
                 <button
                   onClick={handleStartMassiveSearch}
-                  disabled={loading || selectedNichesCount === 0 || enabledMethodsCount === 0}
+                  disabled={loading || selectedNichesCount === 0 || enabledMethodsCount === 0 || (selectedRegion === 'es_city' && !selectedCity)}
                   className="w-full mt-6 px-6 py-4 bg-white text-blue-600 rounded-lg font-bold text-lg hover:bg-blue-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                 >
                   {loading ? (
