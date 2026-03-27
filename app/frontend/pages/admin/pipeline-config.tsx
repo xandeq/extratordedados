@@ -52,6 +52,30 @@ export default function PipelineConfigPage() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [customNiche, setCustomNiche] = useState('')
+  const [regions, setRegions] = useState<Array<{
+    id: number;
+    name: string;
+    city: string;
+    state: string;
+    active: boolean;
+    last_used_at: string | null;
+    leads_last_30d: number;
+  }>>([])
+  const [regionsLoading, setRegionsLoading] = useState(false)
+
+  useEffect(() => {
+    setRegionsLoading(true)
+    api.get('/api/admin/regions')
+      .then(res => setRegions(res.data.regions || []))
+      .catch(() => setRegions([]))
+      .finally(() => setRegionsLoading(false))
+  }, [])
+
+  const isRecentlyUsed = (lastUsedAt: string | null): boolean => {
+    if (!lastUsedAt) return false
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+    return new Date(lastUsedAt) > sevenDaysAgo
+  }
 
   useEffect(() => {
     api.get('/api/admin/pipeline-config')
@@ -235,6 +259,51 @@ export default function PipelineConfigPage() {
                 <option key={r.id} value={r.id}>{r.label}</option>
               ))}
             </select>
+          </div>
+
+          {/* ── Cobertura de Cidades — ES ── */}
+          <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <MapPin className="w-4 h-4 text-gray-400" />
+                <h3 className="text-sm font-semibold text-gray-900 dark:text-white">Cobertura de Cidades — ES</h3>
+              </div>
+              <span className="text-xs text-gray-400 dark:text-gray-500">
+                {regions.filter(r => isRecentlyUsed(r.last_used_at)).length}/{regions.length} visitadas (7 dias)
+              </span>
+            </div>
+            {regionsLoading ? (
+              <p className="text-sm text-gray-400 dark:text-gray-500">Carregando cidades...</p>
+            ) : regions.length === 0 ? (
+              <p className="text-sm text-gray-400 dark:text-gray-500">Nenhuma cidade cadastrada. Execute populate_es_cities.sql no VPS.</p>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {regions.map(region => (
+                  <span
+                    key={region.id}
+                    title={`${region.name} — ${region.leads_last_30d} leads (30d) | Último uso: ${region.last_used_at ? new Date(region.last_used_at).toLocaleDateString('pt-BR') : 'nunca'}`}
+                    className={`inline-flex items-center px-2 py-1 rounded text-xs font-medium ${
+                      !region.active
+                        ? 'bg-gray-100 dark:bg-gray-700 text-gray-400 dark:text-gray-500'
+                        : isRecentlyUsed(region.last_used_at)
+                        ? 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300'
+                        : 'bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400'
+                    }`}
+                  >
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full mr-1 flex-shrink-0 ${
+                        !region.active
+                          ? 'bg-gray-400 dark:bg-gray-500'
+                          : isRecentlyUsed(region.last_used_at)
+                          ? 'bg-green-500 dark:bg-green-400'
+                          : 'bg-gray-400 dark:bg-gray-500'
+                      }`}
+                    />
+                    {region.name}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* ── Schedule ── */}
