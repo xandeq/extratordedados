@@ -242,7 +242,7 @@
 #### Backend
 - [x] **REG-01**: Tabela `regions` (id, name, city, state, ibge_code, priority, active) — todas as 78 cidades do ES
 - [x] Script `scripts/import/populate_es_cities.sql` — INSERT das 78 cidades do ES com dados IBGE
-- [ ] **REG-02**: `run_daily_pipeline()` rotaciona por cidades do ES em grupos de 5-10/dia (round-robin por `last_used_at`)
+- [x] **REG-02**: `run_daily_pipeline()` rotaciona por cidades do ES em grupos de 5-10/dia (round-robin por `last_used_at`)
 - [x] `GET /api/admin/regions` — listar regiões com última execução, leads capturados
 - [x] `PUT /api/admin/regions/bulk` — ativar/desativar regiões
 

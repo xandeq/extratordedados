@@ -8,7 +8,7 @@ progress:
   total_phases: 10
   completed_phases: 7
   total_plans: 29
-  completed_plans: 23
+  completed_plans: 24
 ---
 
 # STATE.md — Project Memory
@@ -49,7 +49,7 @@ progress:
 |-------|------|--------------|-------|--------|
 | 7 | Qualidade de Leads Avançada | QUAL-01 to QUAL-06 | 3 | Not started |
 | 8 | Catálogo de Nichos | NICHE-01 to NICHE-04 | 3 | COMPLETE (3/3) |
-| 9 | Expansão Regional ES | REG-01, REG-02 | 3 | In progress (1/3) |
+| 9 | Expansão Regional ES | REG-01, REG-02 | 3 | In progress (2/3) |
 | 10 | Novas Fontes de Extração | SRC-01 to SRC-04 | 3 | Not started |
 
 ## Completed Work (Milestone v1.0 History)
@@ -69,6 +69,7 @@ progress:
 | 2026-03-26 | Phase 8 Plan 02: get_pipeline_config() reads from niches table (round-robin) + _mark_niches_used() helper + daily_job_run fallback fixed |
 | 2026-03-26 | Phase 8 Plan 03: /admin/niches page (tabs + toggle + priority) + massive-search loads niches from DB + Sidebar nav links + frontend deployed |
 | 2026-03-27 | Phase 9 Plan 01: regions table DDL (9 cols + UNIQUE(city,state)) + populate_es_cities.sql (78 cities + IBGE codes) + GET /api/admin/regions + PUT /api/admin/regions/bulk + test stubs |
+| 2026-03-27 | Phase 9 Plan 02: _mark_cities_used() helper + get_pipeline_config() cities query (round-robin) + trigger_daily_pipeline() DB-driven city path with SEARCH_REGIONS fallback |
 
 ## Research Available
 
@@ -95,6 +96,9 @@ progress:
 | regions table mirrors niches table exactly | Same pattern from Phase 8 — zero learning curve, proven in codebase |
 | city (ASCII) + name (accented) dual-column | city used in scraper URL queries, name shown in UI — both required |
 | idx_leads_city_state in Wave 0 | Added immediately because GET /api/admin/regions uses it; prevents slow JOIN as leads table grows |
+| cities=None (not []) as fallback signal | Enables truthy check in trigger_daily_pipeline() — None means "table empty", [] is never returned |
+| region_label in daily_jobs.region_used | 'es_round_robin_7cidades' vs 'grande_vitoria_es' — makes pipeline mode visible in admin UI and logs |
+| _mark_cities_used() before advisory lock | last_used_at advances before lock attempt — acceptable since round-robin picks oldest next anyway |
 | niches.keywords TEXT[] column | Future fuzzy-matching for pipeline niche selection |
 | get_pipeline_config() read-only, _mark_niches_used() separate | Health checks call get_pipeline_config() — must not advance rotation on every call |
 | DAILY_JOB_NICHES constant preserved | Fallback when niches table is empty (prevents crash on cold start) |
@@ -104,6 +108,6 @@ progress:
 
 ## Last Session
 
-- **Stopped at**: Completed 09-01-PLAN.md — Phase 9 Plan 01 done (regions DB foundation)
-- **Next action**: `/gsd:execute-phase 09` Plan 02 (round-robin rotation) — requires deploy to VPS first (VPS was unreachable during Plan 01 execution)
+- **Stopped at**: Completed 09-02-PLAN.md — Phase 9 Plan 02 done (round-robin rotation wired)
+- **Next action**: `/gsd:execute-phase 09` Plan 03 (frontend coverage UI) — VPS deploy still pending (unreachable from this machine)
 - **Timestamp**: 2026-03-27
