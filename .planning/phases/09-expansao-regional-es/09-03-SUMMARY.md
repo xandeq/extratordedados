@@ -129,6 +129,17 @@ None — plan executed exactly as written. Tasks 1 and 2 were already complete f
 - Phase 7 (Qualidade Avançada) and Phase 10 (Novas Fontes) remain pending in Milestone v1.1.
 - Pending blocker: VPS deploy and SQL population needed for city coverage badges and ES city dropdown to show data.
 
+## Self-Check: PASSED
+
+- FOUND: `.planning/phases/09-expansao-regional-es/09-03-SUMMARY.md`
+- FOUND: commit `3509fab` (pipeline-config city coverage badges)
+- FOUND: commit `e12f0dc` (ES city selector in massive-search)
+- FOUND: commit `620c67b` (docs/SUMMARY)
+- FOUND: commit `f513933` (.gitignore fix + push)
+- Live: `https://extratordedados.com.br/admin/pipeline-config/index.html` returns HTML
+- Live: `https://extratordedados.com.br/massive-search/index.html` returns HTML
+- Pushed: `git push origin main --force` (history rewritten to remove node_modules)
+
 ---
 *Phase: 09-expansao-regional-es*
 *Completed: 2026-03-27*
