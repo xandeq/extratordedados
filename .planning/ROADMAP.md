@@ -302,12 +302,12 @@ Plans:
 
 **Out of scope**: LinkedIn Sales Navigator (custo), MillionVerifier bulk
 
-**Plans:** 0/3 plans complete
+**Plans:** 3 plans
 
 Plans:
-- [ ] 10-01-PLAN.md — Wave 0: Apple Maps Playwright scraper + process_apple_maps_massive() + wire into massive search + GET /api/admin/source-stats
-- [ ] 10-02-PLAN.md — Wave 1: Outscraper improvements (retry, pagination, batch, max_results 100) + 5-template query expansion in process_search_job() + leads_by_source tracking
-- [ ] 10-03-PLAN.md — Wave 2: best BR leads API integration (SRC-02 research → implement) + source stats bar chart on admin dashboard + frontend deploy
+- [ ] 10-01-PLAN.md — Wave 0: process_apple_maps_massive() + Thread 17 wiring + GET /api/admin/source-stats + tests/test_sources.py (8 smoke tests)
+- [ ] 10-02-PLAN.md — Wave 1: Outscraper limit=100 + niches[:2] cap + SEARCH_QUERY_TEMPLATES constant + 5-template expansion in search_engine orchestrator + query_override in process_search_job()
+- [ ] 10-03-PLAN.md — Wave 2: Foursquare Places API Thread 18 (SRC-02) + BarChart "Leads por Fonte" in admin/index.tsx + backend + frontend deploy
 
 ---
 
@@ -349,8 +349,8 @@ Plans:
 [ ] Milestone v1.1 — Lead Quality Engine
     [ ] Phase 7 — Qualidade avançada: TLD filter, slogan detector, CRM dedup, WhatsApp gate (0/3 plans)
     [✓] Phase 8 — Catálogo de nichos: 150+ nichos no banco, rotação diária, admin UI (3/3 plans complete)
-    [ ] Phase 9 — Expansão regional ES: 78 cidades, round-robin pipeline (2/3 plans)
-    [ ] Phase 10 — Novas fontes: Apple Maps, Outscraper melhorado, 5 query templates (0/3 plans)
+    [✓] Phase 9 — Expansão regional ES: 78 cidades, round-robin pipeline (3/3 plans complete)
+    [ ] Phase 10 — Novas fontes: Apple Maps (Thread 17), Foursquare (Thread 18), Outscraper limit=100, 5 query templates (0/3 plans)
 ```
 
 ---
@@ -364,4 +364,4 @@ Plans:
 
 ---
 
-*Last updated: 2026-03-24 — Milestone v1.1 Lead Quality Engine roadmap appended (Phases 7-10)*
+*Last updated: 2026-03-27 — Phase 10 plans created (3 plans, Waves 0-2)*
