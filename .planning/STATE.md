@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Lead Quality Engine
 status: unknown
-last_updated: "2026-03-28T00:33:58.175Z"
+last_updated: "2026-03-28T00:55:21.367Z"
 progress:
   total_phases: 10
-  completed_phases: 9
+  completed_phases: 10
   total_plans: 32
-  completed_plans: 31
+  completed_plans: 32
 ---
 
 # STATE.md — Project Memory
@@ -18,9 +18,10 @@ progress:
 ## Current Status
 
 - **Active milestone**: Milestone v1.1 — Lead Quality Engine
-- **Active phase**: Phase 9 — Expansão Regional ES (COMPLETE — all 3 plans done)
+- **Active phase**: Phase 7 — Qualidade de Leads Avançada (COMPLETE — all 3 plans done)
 - **Milestone v1.0**: COMPLETE (Phases 1-6 all done, 20/20 plans, all features live)
-- **Last completed**: Phase 09 Plan 03 — pipeline-config city coverage badges + massive-search ES city selector + frontend deployed to HostGator
+- **Milestone v1.1**: COMPLETE (Phases 7-10 all done, 12 plans, all features live)
+- **Last completed**: Phase 07 Plan 03 — QUAL-06 CRM quality gate in all 3 sync paths + quality-stats endpoint + backend deployed
 
 ## Milestone v1.1 Scope
 
@@ -47,7 +48,7 @@ progress:
 
 | Phase | Name | Requirements | Plans | Status |
 |-------|------|--------------|-------|--------|
-| 7 | Qualidade de Leads Avançada | QUAL-01 to QUAL-06 | 3 | In Progress (2/3) |
+| 7 | Qualidade de Leads Avançada | QUAL-01 to QUAL-06 | 3 | COMPLETE (3/3) |
 | 8 | Catálogo de Nichos | NICHE-01 to NICHE-04 | 3 | COMPLETE (3/3) |
 | 9 | Expansão Regional ES | REG-01, REG-02 | 3 | COMPLETE (3/3) |
 | 10 | Novas Fontes de Extração | SRC-01 to SRC-04 | 3 | Not started |
@@ -73,6 +74,7 @@ progress:
 | 2026-03-27 | Phase 9 Plan 03: pipeline-config city coverage badges (green/gray, GET /api/admin/regions) + massive-search ES city selector (es_city mode, {city, state: 'ES'} POST routing) + frontend deployed to HostGator |
 | 2026-03-27 | Phase 7 Plan 01: _is_foreign_tld() + _is_slogan_email() helpers + QUAL-02/03/05 guards in save_lead_to_db() + 10-test Wave 0 scaffold + backend deployed, smoke test PASSED |
 | 2026-03-28 | Phase 7 Plan 02: crm_sent_leads table (UNIQUE LOWER(email) index) + cache READ/WRITE in sync_lead_to_alexandrequeiroz() + DB migration on VPS + backend deployed |
+| 2026-03-28 | Phase 7 Plan 03: QUAL-06 gate in auto_sync_new_leads_background + _run_crm_sync_batch + crm_sync_all + GET /api/admin/quality-stats (1664 leads, 1528 CRM-eligible) |
 
 ## Research Available
 
@@ -115,9 +117,11 @@ progress:
 | es_city sentinel value reuses selectedRegion state | Avoids new boolean state variable; fits existing region selector flow |
 | Dedicated psycopg2.connect per cache block in sync_lead_to_alexandrequeiroz() | Thread safety for daemon threads — psycopg2 connections not thread-safe (QUAL-04, D-05) |
 | ON CONFLICT (LOWER(email)) DO NOTHING for crm_sent_leads cache writes | Matches UNIQUE index definition — idempotent, no error on duplicate insert |
+| QUAL-06 gate: quality_grade != F OR valid whatsapp applied to all 3 CRM sync paths | Consistent filtering — auto_sync, batch sync, manual endpoint all use same rule |
+| get_db() context manager in quality-stats endpoint | Matches adjacent source-stats pattern — consistent admin route pattern |
 
 ## Last Session
 
-- **Stopped at**: Completed 07-02-PLAN.md — crm_sent_leads cache table + cache READ/WRITE in sync_lead_to_alexandrequeiroz() deployed to VPS
-- **Next action**: Phase 7 Plan 03 (QUAL-06: CRM gate in auto_sync_new_leads_background + _run_crm_sync_batch)
+- **Stopped at**: Completed 07-03-PLAN.md — QUAL-06 gate in all 3 CRM sync paths + GET /api/admin/quality-stats endpoint deployed — Phase 7 COMPLETE
+- **Next action**: Milestone v1.1 COMPLETE — all phases done
 - **Timestamp**: 2026-03-28
