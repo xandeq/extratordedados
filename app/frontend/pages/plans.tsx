@@ -1,4 +1,6 @@
-import { Check, Infinity, Zap, Mail } from 'lucide-react'
+import { useState, useEffect } from 'react'
+import { Check, Zap, Mail, Loader2, AlertCircle } from 'lucide-react'
+import api from '../lib/api'
 
 interface PlanTier {
   name: string
@@ -16,8 +18,8 @@ interface PlanTier {
   credits: string
   features: string[]
   cta: string
-  ctaHref: string
   ctaStyle: string
+  stripeEnabled?: boolean
 }
 
 const PLANS: PlanTier[] = [
@@ -41,7 +43,6 @@ const PLANS: PlanTier[] = [
       '10 reveals/mês',
     ],
     cta: 'Plano atual',
-    ctaHref: '',
     ctaStyle: 'border border-gray-200 dark:border-gray-600 text-gray-500 dark:text-gray-400 cursor-default',
   },
   {
@@ -66,7 +67,6 @@ const PLANS: PlanTier[] = [
       'Suporte prioritário',
     ],
     cta: 'Contratar Pro',
-    ctaHref: 'mailto:contato@extratordedados.com.br?subject=Upgrade%20para%20Pro',
     ctaStyle: 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm',
   },
   {
@@ -92,7 +92,6 @@ const PLANS: PlanTier[] = [
       'Onboarding personalizado',
     ],
     cta: 'Falar com vendas',
-    ctaHref: 'mailto:contato@extratordedados.com.br?subject=Plano%20Enterprise',
     ctaStyle: 'border border-purple-400 text-purple-700 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-900/20',
   },
 ]
@@ -107,8 +106,62 @@ function FeatureRow({ label, value }: { label: string; value: string }) {
 }
 
 export default function Plans() {
+  const [stripeEnabled, setStripeEnabled] = useState(false)
+  const [loading, setLoading] = useState<string | null>(null)
+  const [flashMsg, setFlashMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+
+  useEffect(() => {
+    // Show success/cancel flash based on URL params
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search)
+      if (params.get('success') === '1') {
+        setFlashMsg({ type: 'success', text: '🎉 Pagamento confirmado! Seu plano Pro está ativo.' })
+        window.history.replaceState({}, '', '/plans')
+      } else if (params.get('canceled') === '1') {
+        setFlashMsg({ type: 'error', text: 'Pagamento cancelado. Você pode tentar novamente quando quiser.' })
+        window.history.replaceState({}, '', '/plans')
+      }
+    }
+    // Check if Stripe is configured on the backend
+    api.get('/api/stripe/config')
+      .then(r => setStripeEnabled(r.data?.enabled ?? false))
+      .catch(() => setStripeEnabled(false))
+  }, [])
+
+  const handleProCheckout = async () => {
+    if (stripeEnabled) {
+      setLoading('pro')
+      try {
+        const r = await api.post('/api/stripe/create-checkout-session', { plan: 'pro' })
+        if (r.data?.url) {
+          window.location.href = r.data.url
+        }
+      } catch (err: unknown) {
+        const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Erro ao iniciar checkout'
+        setFlashMsg({ type: 'error', text: msg })
+        setLoading(null)
+      }
+    } else {
+      // Fallback: open email
+      window.location.href = 'mailto:contato@extratordedados.com.br?subject=Upgrade%20para%20Pro'
+    }
+  }
+
   return (
     <div className="space-y-8 animate-fade-in">
+      {/* Flash messages */}
+      {flashMsg && (
+        <div className={`max-w-2xl mx-auto flex items-start gap-3 p-4 rounded-xl border text-sm font-medium
+          ${flashMsg.type === 'success'
+            ? 'bg-emerald-50 border-emerald-200 text-emerald-800 dark:bg-emerald-900/20 dark:border-emerald-800 dark:text-emerald-300'
+            : 'bg-red-50 border-red-200 text-red-800 dark:bg-red-900/20 dark:border-red-800 dark:text-red-300'
+          }`}>
+          <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>{flashMsg.text}</span>
+          <button onClick={() => setFlashMsg(null)} className="ml-auto opacity-60 hover:opacity-100">✕</button>
+        </div>
+      )}
+
       {/* Header */}
       <div className="text-center max-w-xl mx-auto">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 mb-4">
@@ -170,28 +223,55 @@ export default function Plans() {
             </ul>
 
             {/* CTA */}
-            {plan.ctaHref ? (
+            {plan.name === 'free' && (
+              <div className={`flex items-center justify-center w-full py-3 rounded-xl text-sm ${plan.ctaStyle}`}>
+                {plan.cta}
+              </div>
+            )}
+
+            {plan.name === 'pro' && (
+              <button
+                onClick={handleProCheckout}
+                disabled={loading === 'pro'}
+                className={`flex items-center justify-center gap-2 w-full py-3 rounded-xl font-semibold text-sm transition-colors disabled:opacity-60 disabled:cursor-not-allowed ${plan.ctaStyle}`}
+              >
+                {loading === 'pro' ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" /> Aguarde...</>
+                ) : stripeEnabled ? (
+                  <>{plan.cta} →</>
+                ) : (
+                  <><Mail className="w-4 h-4" /> {plan.cta}</>
+                )}
+              </button>
+            )}
+
+            {plan.name === 'enterprise' && (
               <a
-                href={plan.ctaHref}
+                href="mailto:contato@extratordedados.com.br?subject=Plano%20Enterprise"
                 className={`flex items-center justify-center gap-2 w-full py-3 rounded-xl font-semibold text-sm transition-colors ${plan.ctaStyle}`}
               >
                 <Mail className="w-4 h-4" />
                 {plan.cta}
               </a>
-            ) : (
-              <div className={`flex items-center justify-center w-full py-3 rounded-xl text-sm ${plan.ctaStyle}`}>
-                {plan.cta}
-              </div>
             )}
           </div>
         ))}
       </div>
 
-      {/* Footer note */}
-      <p className="text-center text-xs text-gray-400 dark:text-gray-500 max-w-lg mx-auto">
-        Pagamentos por PIX, cartão ou boleto. Cancelamento a qualquer momento.
-        Dúvidas? <a href="mailto:contato@extratordedados.com.br" className="underline hover:text-gray-600">contato@extratordedados.com.br</a>
-      </p>
+      {/* Payment methods note */}
+      <div className="text-center space-y-1">
+        <p className="text-xs text-gray-400 dark:text-gray-500">
+          {stripeEnabled
+            ? 'Pagamento seguro via Stripe — cartão de crédito, débito ou PIX.'
+            : 'Pagamentos por PIX, cartão ou boleto. Entre em contato para contratar.'}
+        </p>
+        <p className="text-xs text-gray-400 dark:text-gray-500">
+          Cancelamento a qualquer momento.{' '}
+          <a href="mailto:contato@extratordedados.com.br" className="underline hover:text-gray-600">
+            contato@extratordedados.com.br
+          </a>
+        </p>
+      </div>
     </div>
   )
 }

@@ -614,6 +614,13 @@ try:
 except ImportError:
     _APSCHEDULER_AVAILABLE = False
 
+try:
+    import stripe as _stripe_sdk
+    _STRIPE_AVAILABLE = True
+except ImportError:
+    _stripe_sdk = None
+    _STRIPE_AVAILABLE = False
+
 CORS(app, resources={r"/api/*": {"origins": [
     "https://extratordedados.com.br",
     "https://www.extratordedados.com.br",
@@ -18453,6 +18460,140 @@ def trigger_saved_search_notifications():
         print(f'[SCHEDULER] saved_search_notifications: {notified} notificações enviadas.')
     except Exception as e:
         print(f'[SCHEDULER] saved_search_notifications: erro geral: {e}')
+
+
+# ============= Stripe Checkout =============
+# Requires env vars: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRO_PRICE_ID
+# Falls back gracefully when keys are not configured.
+
+def _get_stripe_config():
+    """Read Stripe keys from environment. Returns dict with keys or None values."""
+    return {
+        'secret_key':     os.environ.get('STRIPE_SECRET_KEY'),
+        'webhook_secret': os.environ.get('STRIPE_WEBHOOK_SECRET'),
+        'pro_price_id':   os.environ.get('STRIPE_PRO_PRICE_ID'),
+        'publishable_key': os.environ.get('STRIPE_PUBLISHABLE_KEY'),
+    }
+
+
+@app.route('/api/stripe/config', methods=['GET'])
+@limiter.limit("30/minute")
+def stripe_config():
+    """Return publishable key and whether Stripe is configured. Safe to expose."""
+    cfg = _get_stripe_config()
+    return jsonify({
+        'enabled': bool(cfg['secret_key'] and _STRIPE_AVAILABLE),
+        'publishable_key': cfg['publishable_key'] or '',
+    }), 200
+
+
+@app.route('/api/stripe/create-checkout-session', methods=['POST'])
+@limiter.limit("10/minute")
+def stripe_create_checkout():
+    """Create a Stripe Checkout session for plan upgrade.
+    Body: {plan: 'pro'}
+    Returns: {url: 'https://checkout.stripe.com/...'} or {error: ...}
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    if not _STRIPE_AVAILABLE:
+        return jsonify({'error': 'Stripe SDK not installed. pip install stripe'}), 503
+
+    cfg = _get_stripe_config()
+    if not cfg['secret_key']:
+        return jsonify({'error': 'Stripe not configured. Add STRIPE_SECRET_KEY to .deploy.env'}), 503
+
+    body = request.get_json(silent=True) or {}
+    plan = body.get('plan', 'pro')
+
+    if plan != 'pro':
+        return jsonify({'error': 'Only pro plan is available for checkout'}), 400
+
+    price_id = cfg.get('pro_price_id')
+    if not price_id:
+        return jsonify({'error': 'STRIPE_PRO_PRICE_ID not set in .deploy.env'}), 503
+
+    try:
+        _stripe_sdk.api_key = cfg['secret_key']
+
+        # Get user email for pre-fill
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT username FROM users WHERE id=%s', (user_id,))
+            row = c.fetchone()
+            username = row[0] if row else None
+
+        session = _stripe_sdk.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{'price': price_id, 'quantity': 1}],
+            mode='subscription',
+            success_url='https://extratordedados.com.br/plans?success=1',
+            cancel_url='https://extratordedados.com.br/plans?canceled=1',
+            metadata={'user_id': str(user_id), 'plan': plan},
+            customer_email=username if username and '@' in username else None,
+        )
+        return jsonify({'url': session.url}), 200
+    except Exception as e:
+        print(f'[STRIPE] create-checkout-session error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/stripe/webhook', methods=['POST'])
+def stripe_webhook():
+    """Handle Stripe webhook events.
+    Must be configured in Stripe dashboard: checkout.session.completed,
+    customer.subscription.deleted, invoice.payment_failed
+    Set endpoint: https://api.extratordedados.com.br/api/stripe/webhook
+    """
+    cfg = _get_stripe_config()
+    if not _STRIPE_AVAILABLE or not cfg['secret_key']:
+        return jsonify({'error': 'Stripe not configured'}), 503
+
+    _stripe_sdk.api_key = cfg['secret_key']
+    payload   = request.get_data()
+    sig_header = request.headers.get('Stripe-Signature', '')
+    webhook_secret = cfg['webhook_secret']
+
+    try:
+        if webhook_secret:
+            event = _stripe_sdk.Webhook.construct_event(payload, sig_header, webhook_secret)
+        else:
+            event = _stripe_sdk.Event.construct_from(json.loads(payload), cfg['secret_key'])
+    except Exception as e:
+        print(f'[STRIPE] Webhook signature error: {e}')
+        return jsonify({'error': str(e)}), 400
+
+    etype = event['type']
+    print(f'[STRIPE] Event: {etype}')
+
+    try:
+        if etype == 'checkout.session.completed':
+            session   = event['data']['object']
+            user_id   = int(session['metadata'].get('user_id', 0))
+            plan_name = session['metadata'].get('plan', 'pro')
+            if user_id:
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute("UPDATE users SET plan=%s WHERE id=%s", (plan_name, user_id))
+                    conn.commit()
+                print(f'[STRIPE] User {user_id} upgraded to {plan_name}')
+
+        elif etype in ('customer.subscription.deleted', 'customer.subscription.paused'):
+            session = event['data']['object']
+            # Look up user by stripe customer ID (stored in extra_data or separate column if added later)
+            # For now, log and skip — full customer mapping can be added when needed
+            print(f'[STRIPE] Subscription {etype} — manual review may be required')
+
+        elif etype == 'invoice.payment_failed':
+            print(f'[STRIPE] Payment failed — invoice: {event["data"]["object"].get("id")}')
+
+    except Exception as proc_err:
+        print(f'[STRIPE] Event processing error (non-fatal): {proc_err}')
+
+    return jsonify({'received': True}), 200
 
 
 # ============= Scheduler Setup =============
