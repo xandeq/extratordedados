@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Lead Quality Engine
 status: unknown
-last_updated: "2026-03-27T23:32:29.977Z"
+last_updated: "2026-03-28T00:10:06.430Z"
 progress:
   total_phases: 10
   completed_phases: 9
   total_plans: 32
-  completed_plans: 29
+  completed_plans: 30
 ---
 
 # STATE.md — Project Memory
@@ -47,7 +47,7 @@ progress:
 
 | Phase | Name | Requirements | Plans | Status |
 |-------|------|--------------|-------|--------|
-| 7 | Qualidade de Leads Avançada | QUAL-01 to QUAL-06 | 3 | Not started |
+| 7 | Qualidade de Leads Avançada | QUAL-01 to QUAL-06 | 3 | In Progress (1/3) |
 | 8 | Catálogo de Nichos | NICHE-01 to NICHE-04 | 3 | COMPLETE (3/3) |
 | 9 | Expansão Regional ES | REG-01, REG-02 | 3 | COMPLETE (3/3) |
 | 10 | Novas Fontes de Extração | SRC-01 to SRC-04 | 3 | Not started |
@@ -71,6 +71,7 @@ progress:
 | 2026-03-27 | Phase 9 Plan 01: regions table DDL (9 cols + UNIQUE(city,state)) + populate_es_cities.sql (78 cities + IBGE codes) + GET /api/admin/regions + PUT /api/admin/regions/bulk + test stubs |
 | 2026-03-27 | Phase 9 Plan 02: _mark_cities_used() helper + get_pipeline_config() cities query (round-robin) + trigger_daily_pipeline() DB-driven city path with SEARCH_REGIONS fallback |
 | 2026-03-27 | Phase 9 Plan 03: pipeline-config city coverage badges (green/gray, GET /api/admin/regions) + massive-search ES city selector (es_city mode, {city, state: 'ES'} POST routing) + frontend deployed to HostGator |
+| 2026-03-27 | Phase 7 Plan 01: _is_foreign_tld() + _is_slogan_email() helpers + QUAL-02/03/05 guards in save_lead_to_db() + 10-test Wave 0 scaffold + backend deployed, smoke test PASSED |
 
 ## Research Available
 
@@ -92,6 +93,9 @@ progress:
 | APScheduler 3.x (keep) | 4.x is pre-release/not production-ready |
 | pipeline_config table (not hardcoded) | Enables admin UI config without code changes |
 | save_lead_to_db is canonical INSERT | quality_grade written on every INSERT |
+| AST snippet extraction for test helpers | Avoids Flask app import hang on Windows (no local DB) — exec() isolated snippet with only re stdlib |
+| QUAL-05 nulls whatsapp, does not reject lead | Per D-15: invalid phone number clears the field but the lead itself is saved |
+| _FOREIGN_TLD_BLOCKLIST sorted by length desc | Ensures .com.ar is checked before .ar — prevents false positive on .com.ar vs .ar (Pitfall 1) |
 | _build_portal_filter_query shared helper | Used by search + notification scheduler |
 | bulk route before <int:niche_id> | Flask routing: 'bulk' would match as integer ID otherwise |
 | regions table mirrors niches table exactly | Same pattern from Phase 8 — zero learning curve, proven in codebase |
@@ -111,6 +115,6 @@ progress:
 
 ## Last Session
 
-- **Stopped at**: Completed 09-03-PLAN.md — Phase 9 COMPLETE (all 3 plans done, frontend deployed)
-- **Next action**: Phase 7 (Qualidade Avançada) or Phase 10 (Novas Fontes) — VPS SSH still pending (unreachable, run `python deploy.py backend` + populate SQL when VPS is accessible)
+- **Stopped at**: Completed 07-01-PLAN.md — QUAL-02/03/05 guards in save_lead_to_db() deployed and smoke tested
+- **Next action**: Phase 7 Plan 02 (QUAL-04: crm_sent_leads cache) or Phase 7 Plan 03 (QUAL-06: CRM gate)
 - **Timestamp**: 2026-03-27
