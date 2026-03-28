@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: — Lead Quality Engine
 status: unknown
-last_updated: "2026-03-28T00:10:06.430Z"
+last_updated: "2026-03-28T00:33:58.175Z"
 progress:
   total_phases: 10
   completed_phases: 9
   total_plans: 32
-  completed_plans: 30
+  completed_plans: 31
 ---
 
 # STATE.md — Project Memory
@@ -47,7 +47,7 @@ progress:
 
 | Phase | Name | Requirements | Plans | Status |
 |-------|------|--------------|-------|--------|
-| 7 | Qualidade de Leads Avançada | QUAL-01 to QUAL-06 | 3 | In Progress (1/3) |
+| 7 | Qualidade de Leads Avançada | QUAL-01 to QUAL-06 | 3 | In Progress (2/3) |
 | 8 | Catálogo de Nichos | NICHE-01 to NICHE-04 | 3 | COMPLETE (3/3) |
 | 9 | Expansão Regional ES | REG-01, REG-02 | 3 | COMPLETE (3/3) |
 | 10 | Novas Fontes de Extração | SRC-01 to SRC-04 | 3 | Not started |
@@ -72,6 +72,7 @@ progress:
 | 2026-03-27 | Phase 9 Plan 02: _mark_cities_used() helper + get_pipeline_config() cities query (round-robin) + trigger_daily_pipeline() DB-driven city path with SEARCH_REGIONS fallback |
 | 2026-03-27 | Phase 9 Plan 03: pipeline-config city coverage badges (green/gray, GET /api/admin/regions) + massive-search ES city selector (es_city mode, {city, state: 'ES'} POST routing) + frontend deployed to HostGator |
 | 2026-03-27 | Phase 7 Plan 01: _is_foreign_tld() + _is_slogan_email() helpers + QUAL-02/03/05 guards in save_lead_to_db() + 10-test Wave 0 scaffold + backend deployed, smoke test PASSED |
+| 2026-03-28 | Phase 7 Plan 02: crm_sent_leads table (UNIQUE LOWER(email) index) + cache READ/WRITE in sync_lead_to_alexandrequeiroz() + DB migration on VPS + backend deployed |
 
 ## Research Available
 
@@ -112,9 +113,11 @@ progress:
 | 50-niche cap warning client-side only | UX guard in massive-search; backend enforces actual limit independently |
 | coverage section below Região dropdown (not inside) | Keeps region selector unchanged; coverage is read-only info |
 | es_city sentinel value reuses selectedRegion state | Avoids new boolean state variable; fits existing region selector flow |
+| Dedicated psycopg2.connect per cache block in sync_lead_to_alexandrequeiroz() | Thread safety for daemon threads — psycopg2 connections not thread-safe (QUAL-04, D-05) |
+| ON CONFLICT (LOWER(email)) DO NOTHING for crm_sent_leads cache writes | Matches UNIQUE index definition — idempotent, no error on duplicate insert |
 
 ## Last Session
 
-- **Stopped at**: Completed 07-01-PLAN.md — QUAL-02/03/05 guards in save_lead_to_db() deployed and smoke tested
-- **Next action**: Phase 7 Plan 02 (QUAL-04: crm_sent_leads cache) or Phase 7 Plan 03 (QUAL-06: CRM gate)
-- **Timestamp**: 2026-03-27
+- **Stopped at**: Completed 07-02-PLAN.md — crm_sent_leads cache table + cache READ/WRITE in sync_lead_to_alexandrequeiroz() deployed to VPS
+- **Next action**: Phase 7 Plan 03 (QUAL-06: CRM gate in auto_sync_new_leads_background + _run_crm_sync_batch)
+- **Timestamp**: 2026-03-28

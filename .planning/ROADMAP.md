@@ -223,7 +223,7 @@ Plans:
 
 Plans:
 - [x] 07-01-PLAN.md — Wave 1: _is_foreign_tld() + _is_slogan_email() + save_lead_to_db() guards (QUAL-01/02/03/05) + test scaffold
-- [ ] 07-02-PLAN.md — Wave 2: crm_sent_leads table + cache READ/WRITE in sync_lead_to_alexandrequeiroz() (QUAL-04)
+- [x] 07-02-PLAN.md — Wave 2: crm_sent_leads table + cache READ/WRITE in sync_lead_to_alexandrequeiroz() (QUAL-04)
 - [ ] 07-03-PLAN.md — Wave 3: QUAL-06 gate in 3 sync functions + GET /api/admin/quality-stats endpoint
 
 ---

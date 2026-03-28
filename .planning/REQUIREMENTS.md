@@ -194,7 +194,7 @@
 - [x] **QUAL-01**: Expandir `validate_email_free()` — rejeitar emails bounceáveis conhecidos (disposable + domínios de baixa reputação), integrar lista de bounce domains atualizada
 - [x] **QUAL-02**: Filtro de TLD estrangeiro em `save_lead_to_db()` — rejeitar `.es`, `.pt`, `.pl`, `.com.ar`, `.mx`, `.co`, `.uk`, `.de`, `.fr`, `.it` e outros TLDs não-BR
 - [x] **QUAL-03**: Detector de email-slogan — regex + heurística: email com 4+ palavras, contém verbos, frases (ex: `contato@faleconoscoagora.com.br` OK, `venhaserfeliz@empresa.com` → rejeitar)
-- [ ] **QUAL-04**: Dedup contra CRM — antes do CRM sync, verificar se email/telefone já existe via `GET /api/crm/check` ou lookup local em cache; não re-enviar leads já no CRM
+- [x] **QUAL-04**: Dedup contra CRM — antes do CRM sync, verificar se email/telefone já existe via `GET /api/crm/check` ou lookup local em cache; não re-enviar leads já no CRM
 - [x] **QUAL-05**: Validar WhatsApp com `phonenumbers` — verificar DDD válido BR (11-99 para celular), formato correto, comprimento mínimo; rejeitar números claramente inválidos
 - [ ] **QUAL-06**: Gate CRM — `auto_sync_new_leads_background()` só envia leads que têm email válido (quality_grade != 'F' no campo email) OR whatsapp não-nulo e válido
 - [ ] Novo campo `rejection_reason` (varchar) em `leads` — registra motivo de rejeição quando lead é descartado
