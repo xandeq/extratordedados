@@ -2300,12 +2300,14 @@ def init_db():
         )''')
         c.execute('''
             INSERT INTO pipeline_config (key, value) VALUES
-              ('daily_niches',    %s),
-              ('daily_region',    %s),
-              ('daily_hour',      %s),
-              ('daily_minute',    '0'),
-              ('notify_email',    'null'),
-              ('healthcheck_url', 'null')
+              ('daily_niches',         %s),
+              ('daily_region',         %s),
+              ('daily_hour',           %s),
+              ('daily_minute',         '0'),
+              ('notify_email',         'null'),
+              ('healthcheck_url',      'null'),
+              ('daily_niches_per_run', '10'),
+              ('daily_cities_per_run', '7')
             ON CONFLICT (key) DO NOTHING
         ''', (
             json.dumps(DAILY_JOB_NICHES),
@@ -2397,6 +2399,101 @@ def init_db():
             SELECT name, 'Outros', created_at FROM custom_niches
             ON CONFLICT (name) DO NOTHING
         ''')
+
+        # Seed comprehensive niche catalog — 60+ niches, idempotent (ON CONFLICT DO NOTHING)
+        # 10 categories × 6-10 niches = ~6-day rotation when daily_niches_per_run = 10
+        _niche_catalog = [
+            # Saúde (prioridade alta)
+            ('clinica medica',          'Saude',        10),
+            ('dentista',                'Saude',        10),
+            ('clinica odontologica',    'Saude',        10),
+            ('clinica veterinaria',     'Saude',        10),
+            ('farmacia',                'Saude',        10),
+            ('fisioterapia',            'Saude',        10),
+            ('psicologo',               'Saude',        10),
+            ('nutricao',                'Saude',        10),
+            ('oftalmologia',            'Saude',        15),
+            ('dermatologia',            'Saude',        15),
+            ('ortopedia',               'Saude',        15),
+            # Beleza
+            ('salao de beleza',         'Beleza',       20),
+            ('barbearia',               'Beleza',       20),
+            ('estetica',                'Beleza',       20),
+            ('manicure pedicure',       'Beleza',       20),
+            ('spa',                     'Beleza',       25),
+            ('studio de beleza',        'Beleza',       25),
+            ('micropigmentacao',        'Beleza',       30),
+            # Alimentação
+            ('restaurante',             'Alimentacao',  30),
+            ('pizzaria',                'Alimentacao',  30),
+            ('hamburgueria',            'Alimentacao',  30),
+            ('padaria',                 'Alimentacao',  30),
+            ('sorveteria',              'Alimentacao',  35),
+            ('cafeteria',               'Alimentacao',  35),
+            ('lanchonete',              'Alimentacao',  35),
+            ('churrascaria',            'Alimentacao',  35),
+            ('sushi',                   'Alimentacao',  40),
+            ('doceria',                 'Alimentacao',  40),
+            # Automotivo
+            ('mecanica',                'Automotivo',   40),
+            ('auto pecas',              'Automotivo',   40),
+            ('lava rapido',             'Automotivo',   45),
+            ('funilaria',               'Automotivo',   45),
+            ('vidros automotivos',      'Automotivo',   45),
+            ('som automotivo',          'Automotivo',   50),
+            # Serviços Gerais
+            ('eletricista',             'Servicos',     50),
+            ('encanador',               'Servicos',     50),
+            ('ar condicionado',         'Servicos',     50),
+            ('informatica',             'Servicos',     50),
+            ('conserto celular',        'Servicos',     55),
+            ('chaveiro',                'Servicos',     55),
+            ('seguranca eletronica',    'Servicos',     55),
+            ('dedetizacao',             'Servicos',     55),
+            # Educação
+            ('escola',                  'Educacao',     60),
+            ('creche',                  'Educacao',     60),
+            ('curso de ingles',         'Educacao',     60),
+            ('auto escola',             'Educacao',     60),
+            ('academia de musica',      'Educacao',     65),
+            ('reforco escolar',         'Educacao',     65),
+            # Imóveis e Construção
+            ('imobiliaria',             'Imoveis',      70),
+            ('construtora',             'Imoveis',      70),
+            ('arquitetura',             'Imoveis',      70),
+            ('reforma',                 'Imoveis',      75),
+            ('marcenaria',              'Imoveis',      75),
+            ('material de construcao',  'Imoveis',      75),
+            # Pet
+            ('pet shop',                'Pet',          80),
+            ('banho e tosa',            'Pet',          80),
+            # Fitness e Bem-Estar
+            ('academia',                'Fitness',      85),
+            ('crossfit',                'Fitness',      85),
+            ('pilates',                 'Fitness',      85),
+            ('yoga',                    'Fitness',      90),
+            ('natacao',                 'Fitness',      90),
+            # Jurídico e Financeiro
+            ('advocacia',               'Juridico',     90),
+            ('contabilidade',           'Juridico',     90),
+            ('consultoria financeira',  'Juridico',     95),
+            ('corretora de seguros',    'Juridico',     95),
+            # Moda e Varejo
+            ('loja de roupas',          'Varejo',      100),
+            ('calcados',                'Varejo',      100),
+            ('joalheria',               'Varejo',      100),
+            ('otica',                   'Varejo',      100),
+            ('perfumaria',              'Varejo',      100),
+            # Hospedagem e Turismo
+            ('hotel',                   'Turismo',     100),
+            ('pousada',                 'Turismo',     100),
+            ('agencia de viagens',      'Turismo',     100),
+        ]
+        c.executemany(
+            "INSERT INTO niches (name, category, priority) VALUES (%s, %s, %s) ON CONFLICT (name) DO NOTHING",
+            _niche_catalog
+        )
+        print(f"[INIT] Niche catalog seeded: {len(_niche_catalog)} entries (idempotent)")
 
         # enrichment_source column on search_jobs
         c.execute("ALTER TABLE search_jobs ADD COLUMN IF NOT EXISTS enrichment_source VARCHAR(30) DEFAULT 'scraping'")
@@ -15285,6 +15382,17 @@ def run_daily_pipeline(daily_job_id, niches, region_id, cities_to_search):
 
         c.execute('UPDATE daily_jobs SET leads_sanitized=%s WHERE id=%s', (sanitized_count, daily_job_id))
         print(f"[DAILY] Sanitização: {sanitized_count} atualizados, {len(ids_to_delete)} removidos")
+
+        # ── 5.5. Remover leads de baixa qualidade (score < 40, grade D/F) ─
+        try:
+            c.execute(
+                "DELETE FROM leads WHERE batch_id=%s AND (quality_score IS NULL OR quality_score < 40)",
+                (batch_id,)
+            )
+            low_quality_removed = c.rowcount
+            print(f"[DAILY] Qualidade: {low_quality_removed} leads grade D/F removidos (score<40)")
+        except Exception as _qe:
+            print(f"[DAILY] Erro ao remover leads baixa qualidade (non-fatal): {_qe}")
 
         # ── 6. Sync para CRM ──────────────────────────────────────────────
         c.execute('''
