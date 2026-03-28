@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Como triplicamos os contatos em 3 semanas — Alexandre Queiroz</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#0f0f13; font-family:'Inter',Arial,sans-serif; -webkit-text-size-adjust:100%; }
+    a { color:inherit; }
+
+    /* ── Layout ── */
+    .wrap   { background:#0f0f13; padding:32px 16px 48px; }
+    .card   { max-width:600px; margin:0 auto; background:#ffffff; border-radius:16px; overflow:hidden; box-shadow:0 20px 60px rgba(0,0,0,0.4); }
+
+    /* ── Hero ── */
+    .hero { background:linear-gradient(135deg,#0f2027,#203a43,#2c5364); padding:48px 40px 40px; text-align:center; position:relative; overflow:hidden; }
+    .hero::before { content:''; position:absolute; top:-60px; right:-60px; width:220px; height:220px; background:radial-gradient(circle,rgba(16,185,129,0.25),transparent 70%); border-radius:50%; }
+    .hero::after  { content:''; position:absolute; bottom:-40px; left:-40px; width:180px; height:180px; background:radial-gradient(circle,rgba(99,102,241,0.2),transparent 70%); border-radius:50%; }
+    .hero-badge { display:inline-block; background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.35); color:#6ee7b7; font-size:11px; font-weight:700; letter-spacing:2px; text-transform:uppercase; padding:6px 16px; border-radius:20px; margin-bottom:20px; }
+    .hero h1 { color:#fff; font-size:26px; font-weight:800; line-height:1.3; margin-bottom:12px; }
+    .hero h1 em { color:#34d399; font-style:normal; }
+    .hero p  { color:#94a3b8; font-size:15px; line-height:1.7; max-width:460px; margin:0 auto; }
+
+    /* ── Stats bar ── */
+    .stats { display:flex; background:#064e3b; }
+    .stat  { flex:1; text-align:center; padding:16px 10px; border-right:1px solid rgba(255,255,255,0.08); }
+    .stat:last-child { border-right:none; }
+    .stat-num  { display:block; font-size:20px; font-weight:800; color:#6ee7b7; }
+    .stat-text { display:block; font-size:10px; color:#6b7280; text-transform:uppercase; letter-spacing:1px; margin-top:2px; }
+
+    /* ── Body ── */
+    .body { padding:40px 40px 32px; background:#fff; }
+    .greeting { font-size:17px; color:#111827; font-weight:700; margin-bottom:20px; }
+    .greeting .co { color:#059669; }
+    p { font-size:15px; color:#4b5563; line-height:1.75; margin-bottom:16px; }
+    strong { color:#111827; }
+
+    /* ── Case study box ── */
+    .case { background:#f0fdf4; border:1px solid #bbf7d0; border-radius:12px; padding:20px 24px; margin:24px 0; }
+    .case-title { font-size:12px; font-weight:700; color:#065f46; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:14px; }
+    .case-step { display:flex; gap:12px; align-items:flex-start; margin-bottom:12px; }
+    .case-step:last-child { margin-bottom:0; }
+    .step-dot { width:24px; height:24px; background:#059669; border-radius:50%; display:flex; align-items:center; justify-content:center; color:#fff; font-size:11px; font-weight:800; flex-shrink:0; margin-top:1px; }
+    .step-text { font-size:14px; color:#1f2937; line-height:1.5; }
+    .step-text strong { color:#064e3b; }
+
+    /* ── Result highlight ── */
+    .result { background:linear-gradient(135deg,#ecfdf5,#d1fae5); border-radius:10px; padding:16px 20px; margin:20px 0; text-align:center; }
+    .result-num { font-size:36px; font-weight:800; color:#059669; line-height:1; }
+    .result-label { font-size:13px; color:#065f46; font-weight:600; margin-top:4px; }
+
+    /* ── Services ── */
+    .services-title { font-size:12px; font-weight:700; color:#9ca3af; text-transform:uppercase; letter-spacing:1.5px; margin:28px 0 16px; }
+    .service { display:flex; gap:14px; align-items:flex-start; margin-bottom:12px; background:#f9fafb; border:1px solid #f3f4f6; border-radius:10px; padding:14px 16px; text-decoration:none; }
+    .s-icon { width:40px; height:40px; border-radius:8px; display:flex; align-items:center; justify-content:center; font-size:18px; flex-shrink:0; }
+    .s-body strong { display:block; font-size:14px; color:#111827; font-weight:700; margin-bottom:2px; }
+    .s-body span   { font-size:13px; color:#6b7280; line-height:1.4; }
+
+    /* ── CTA ── */
+    .cta-block { text-align:center; margin:36px 0 8px; }
+    .btn-main { display:inline-block; background:linear-gradient(135deg,#25d366,#128c7e); color:#fff !important; text-decoration:none; font-size:16px; font-weight:700; padding:17px 38px; border-radius:50px; letter-spacing:0.3px; box-shadow:0 6px 20px rgba(37,211,102,0.4); }
+    .cta-note { margin-top:10px; font-size:12px; color:#9ca3af; }
+
+    /* ── Signature ── */
+    .sig { margin-top:28px; padding-top:20px; border-top:1px solid #f3f4f6; }
+    .sig strong { font-size:15px; color:#111827; display:block; }
+    .sig span   { font-size:13px; color:#6b7280; }
+
+    /* ── Footer ── */
+    .footer { background:#f9fafb; border-top:1px solid #e5e7eb; padding:22px 40px; text-align:center; }
+    .footer p { font-size:12px; color:#9ca3af; line-height:1.7; margin-bottom:4px; }
+    .footer a { color:#059669; text-decoration:underline; }
+
+    @media (max-width:580px) {
+      .hero { padding:36px 24px 32px; }
+      .hero h1 { font-size:21px; }
+      .body { padding:28px 24px; }
+      .stats { flex-wrap:wrap; }
+      .stat { min-width:50%; border-bottom:1px solid rgba(255,255,255,0.06); }
+      .footer { padding:20px 24px; }
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+<div class="card">
+
+  <!-- HERO -->
+  <div class="hero">
+    <div class="hero-badge">Caso Real · Grande Vitória-ES</div>
+    <h1>Como uma imobiliária<br><em>triplicou os contatos</em><br>em 3 semanas</h1>
+    <p>Um resultado real, aqui no Espírito Santo, com exatamente o que posso fazer para a {{contact.EMPRESA}}.</p>
+  </div>
+
+  <!-- STATS BAR -->
+  <div class="stats">
+    <div class="stat">
+      <span class="stat-num">3×</span>
+      <span class="stat-text">mais contatos</span>
+    </div>
+    <div class="stat">
+      <span class="stat-num">3 sem</span>
+      <span class="stat-text">para entregar</span>
+    </div>
+    <div class="stat">
+      <span class="stat-num">pág. 1</span>
+      <span class="stat-text">no Google</span>
+    </div>
+    <div class="stat">
+      <span class="stat-num">R$997</span>
+      <span class="stat-text">investimento</span>
+    </div>
+  </div>
+
+  <!-- BODY -->
+  <div class="body">
+
+    <p class="greeting">Olá, <span class="co">{{contact.EMPRESA}}</span> 👋</p>
+
+    <p>Semana passada te mandei um email sobre presença digital. Hoje quero mostrar algo mais concreto — um resultado real de um cliente aqui da Grande Vitória.</p>
+
+    <!-- CASE STUDY -->
+    <div class="case">
+      <div class="case-title">📋 O Caso — Imobiliária · Serra, ES</div>
+
+      <div class="case-step">
+        <div class="step-dot">1</div>
+        <div class="step-text"><strong>O problema:</strong> Site antigo, não aparecia no Google, não funcionava no celular. Clientes chegavam só pelo boca a boca.</div>
+      </div>
+
+      <div class="case-step">
+        <div class="step-dot">2</div>
+        <div class="step-text"><strong>O que fizemos:</strong> Novo site profissional e responsivo + configuração no Google Meu Negócio + landing page com formulário de captação.</div>
+      </div>
+
+      <div class="case-step">
+        <div class="step-dot">3</div>
+        <div class="step-text"><strong>Em 3 semanas:</strong> Primeira página do Google + contatos pelo site triplicaram. Hoje o Google gera leads automaticamente.</div>
+      </div>
+    </div>
+
+    <!-- RESULT -->
+    <div class="result">
+      <div class="result-num">3×</div>
+      <div class="result-label">mais contatos mensais — sem pagar anúncio</div>
+    </div>
+
+    <p>Sites e landing pages são o começo. Para empresas que precisam de mais, também desenvolvo:</p>
+
+    <!-- SERVICES -->
+    <div class="services-title">Outros serviços disponíveis</div>
+
+    <div class="service">
+      <div class="s-icon" style="background:#fef3c7;">⚙️</div>
+      <div class="s-body">
+        <strong>Sistemas Personalizados</strong>
+        <span>CRM, agendamento, controle interno — sem limitação, sem mensalidade de SaaS. Do jeito que sua empresa funciona.</span>
+      </div>
+    </div>
+
+    <div class="service">
+      <div class="s-icon" style="background:#fce7f3;">📱</div>
+      <div class="s-body">
+        <strong>Aplicativo Mobile</strong>
+        <span>Android e iOS — delivery, agendamento, fidelização. App próprio posiciona sua empresa acima da concorrência.</span>
+      </div>
+    </div>
+
+    <p>Posso fazer uma <strong>análise gratuita</strong> da {{contact.EMPRESA}} e mostrar o que faz sentido para o seu negócio.</p>
+
+    <!-- CTA PRINCIPAL -->
+    <div class="cta-block">
+      <a href="https://wa.me/5527999999999?text=Olá+Alexandre%2C+recebi+seu+email+sobre+a+imobiliária+e+quero+saber+mais" class="btn-main">
+        💬 Me manda um "Oi" no WhatsApp
+      </a>
+      <div class="cta-note">Sem compromisso · Respondo em até 1h em dias úteis</div>
+    </div>
+
+    <!-- ASSINATURA -->
+    <div class="sig">
+      <strong>Alexandre Queiroz</strong>
+      <span>Marketing Digital · Desenvolvimento Web, Sistemas & Apps</span><br>
+      <span>📍 Vila Velha, ES &nbsp;·&nbsp; 📱 (27) 99999-9999</span>
+    </div>
+
+  </div>
+
+  <!-- FOOTER -->
+  <div class="footer">
+    <p>
+      Alexandre Queiroz Marketing Digital · Vila Velha, ES<br>
+      Você recebeu este email pois sua empresa foi encontrada em pesquisas sobre negócios na Grande Vitória-ES.
+    </p>
+    <p><a href="{{unsubscribeLink}}">Cancelar recebimento</a></p>
+  </div>
+
+</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Última mensagem — Alexandre Queiroz</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#0f0f13; font-family:'Inter',Arial,sans-serif; -webkit-text-size-adjust:100%; }
+    a { color:inherit; }
+
+    /* ── Layout ── */
+    .wrap   { background:#0f0f13; padding:32px 16px 48px; }
+    .card   { max-width:600px; margin:0 auto; background:#ffffff; border-radius:16px; overflow:hidden; box-shadow:0 20px 60px rgba(0,0,0,0.4); }
+
+    /* ── Hero — mais simples, tom pessoal ── */
+    .hero { background:linear-gradient(135deg,#1a1a2e,#16213e,#0f3460); padding:44px 40px 36px; text-align:center; position:relative; overflow:hidden; }
+    .hero::before { content:''; position:absolute; top:-50px; right:-50px; width:200px; height:200px; background:radial-gradient(circle,rgba(245,158,11,0.2),transparent 70%); border-radius:50%; }
+    .hero-badge { display:inline-block; background:rgba(245,158,11,0.15); border:1px solid rgba(245,158,11,0.35); color:#fcd34d; font-size:11px; font-weight:700; letter-spacing:2px; text-transform:uppercase; padding:6px 16px; border-radius:20px; margin-bottom:20px; }
+    .hero h1 { color:#fff; font-size:24px; font-weight:700; line-height:1.35; margin-bottom:12px; }
+    .hero h1 em { color:#fbbf24; font-style:normal; }
+    .hero p  { color:#94a3b8; font-size:14px; line-height:1.7; max-width:440px; margin:0 auto; }
+
+    /* ── Body ── */
+    .body { padding:40px 40px 32px; background:#fff; }
+    .greeting { font-size:17px; color:#111827; font-weight:700; margin-bottom:20px; }
+    p { font-size:15px; color:#4b5563; line-height:1.75; margin-bottom:16px; }
+    strong { color:#111827; }
+
+    /* ── Checklist ── */
+    .checklist { margin:24px 0; background:#fafafa; border:1px solid #e5e7eb; border-radius:12px; padding:20px 24px; }
+    .check-item { display:flex; gap:12px; align-items:flex-start; margin-bottom:12px; }
+    .check-item:last-child { margin-bottom:0; }
+    .check-icon { width:22px; height:22px; background:#059669; border-radius:50%; display:flex; align-items:center; justify-content:center; color:#fff; font-size:12px; font-weight:800; flex-shrink:0; margin-top:1px; }
+    .check-text { font-size:14px; color:#374151; line-height:1.5; }
+    .check-text strong { color:#111827; }
+
+    /* ── Highlight box ── */
+    .highlight { background:linear-gradient(135deg,#fffbeb,#fef3c7); border:1px solid #fcd34d; border-radius:10px; padding:16px 20px; margin:24px 0; }
+    .highlight p { margin:0; font-size:14px; color:#92400e; font-weight:600; line-height:1.6; }
+
+    /* ── CTA ── */
+    .cta-block { text-align:center; margin:36px 0 8px; }
+    .btn-main { display:inline-block; background:linear-gradient(135deg,#25d366,#128c7e); color:#fff !important; text-decoration:none; font-size:16px; font-weight:700; padding:17px 38px; border-radius:50px; letter-spacing:0.3px; box-shadow:0 6px 20px rgba(37,211,102,0.4); }
+    .btn-secondary { display:inline-block; margin-top:14px; color:#6b7280 !important; text-decoration:none; font-size:13px; font-weight:500; }
+    .cta-note { margin-top:8px; font-size:12px; color:#9ca3af; }
+
+    /* ── Signature ── */
+    .sig { margin-top:28px; padding-top:20px; border-top:1px solid #f3f4f6; }
+    .sig strong { font-size:15px; color:#111827; display:block; }
+    .sig span   { font-size:13px; color:#6b7280; }
+
+    /* ── Footer ── */
+    .footer { background:#f9fafb; border-top:1px solid #e5e7eb; padding:22px 40px; text-align:center; }
+    .footer p { font-size:12px; color:#9ca3af; line-height:1.7; margin-bottom:4px; }
+    .footer a { color:#6b7280; text-decoration:underline; }
+
+    @media (max-width:580px) {
+      .hero { padding:36px 24px 30px; }
+      .hero h1 { font-size:20px; }
+      .body { padding:28px 24px; }
+      .footer { padding:20px 24px; }
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+<div class="card">
+
+  <!-- HERO -->
+  <div class="hero">
+    <div class="hero-badge">Última mensagem</div>
+    <h1>Só queria deixar<br>uma coisa registrada,<br><em>{{contact.EMPRESA}}</em></h1>
+    <p>Promessa: esse é o último email. Mas o que vou deixar aqui pode ser útil quando chegar o momento certo.</p>
+  </div>
+
+  <!-- BODY -->
+  <div class="body">
+
+    <p class="greeting">Olá, {{contact.EMPRESA}},</p>
+
+    <p>Mandei dois emails nas últimas semanas. Sei que a caixa de entrada enche rápido — sem ressentimento.</p>
+
+    <p>Só queria deixar registrado: quando vocês precisarem de qualquer um desses itens, eu estou aqui:</p>
+
+    <!-- CHECKLIST -->
+    <div class="checklist">
+      <div class="check-item">
+        <div class="check-icon">✓</div>
+        <div class="check-text"><strong>Site novo ou reformulado</strong> — moderno, rápido, indexado no Google. Pronto em até 7 dias.</div>
+      </div>
+      <div class="check-item">
+        <div class="check-icon">✓</div>
+        <div class="check-text"><strong>Landing page</strong> — para capturar leads, agendamentos ou pedidos pelo WhatsApp.</div>
+      </div>
+      <div class="check-item">
+        <div class="check-icon">✓</div>
+        <div class="check-text"><strong>Sistema personalizado</strong> — CRM, agendamento, controle interno, gestão de clientes.</div>
+      </div>
+      <div class="check-item">
+        <div class="check-icon">✓</div>
+        <div class="check-text"><strong>Aplicativo mobile</strong> — Android e iOS para fidelizar clientes ou digitalizar processos.</div>
+      </div>
+    </div>
+
+    <!-- HIGHLIGHT -->
+    <div class="highlight">
+      <p>⏱️ <strong>Uma conversa de 15 minutos no WhatsApp</strong> já é suficiente para eu entender o que vocês precisam e dar um orçamento sem compromisso.</p>
+    </div>
+
+    <p>Atendo empresas da <strong>Grande Vitória-ES</strong> com prazo rápido, preço direto — sem intermediários, sem agência inflada.</p>
+
+    <p>Se não for o momento agora, tudo bem. <strong>Guarda meu contato para quando precisar.</strong></p>
+
+    <!-- CTA PRINCIPAL -->
+    <div class="cta-block">
+      <a href="https://wa.me/5527999999999?text=Olá+Alexandre%2C+quero+um+orçamento" class="btn-main">
+        💬 Conversar no WhatsApp →
+      </a>
+      <br>
+      <a href="https://alexandrequeiroz.com.br?utm_source=email&utm_campaign=gv-cold-03&utm_content=site-link" class="btn-secondary">
+        Ou acesse: alexandrequeiroz.com.br
+      </a>
+      <div class="cta-note">Obrigado pela atenção — mesmo sem resposta 🙏</div>
+    </div>
+
+    <!-- ASSINATURA -->
+    <div class="sig">
+      <strong>Alexandre Queiroz</strong>
+      <span>Marketing Digital · Desenvolvimento Web, Sistemas & Apps</span><br>
+      <span>📧 contato@alexandrequeiroz.com.br</span><br>
+      <span>📱 (27) 99999-9999 &nbsp;·&nbsp; 📍 Vila Velha, ES</span>
+    </div>
+
+  </div>
+
+  <!-- FOOTER -->
+  <div class="footer">
+    <p>
+      Alexandre Queiroz Marketing Digital · Vila Velha, ES<br>
+      Você recebeu este email pois sua empresa foi encontrada em pesquisas sobre negócios na Grande Vitória-ES.
+    </p>
+    <p><a href="{{unsubscribeLink}}">Sair da lista — não receber mais emails</a></p>
+  </div>
+
+</div>
+</div>
+</body>
+</html>
