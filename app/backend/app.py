@@ -14682,18 +14682,22 @@ def auto_sync_new_leads_background(batch_id):
             time.sleep(10)
             elapsed += 10
 
-        # Get all leads from this batch
+        # QUAL-06: Only sync leads with valid email (grade != F) OR valid whatsapp
         c.execute(
             '''SELECT company_name, email, phone, website, city, state, source
                FROM leads
-               WHERE batch_id = %s AND email IS NOT NULL AND email != \'\'
+               WHERE batch_id = %s AND (
+                   (email IS NOT NULL AND email != \'\' AND quality_grade != \'F\') -- QUAL-06
+                   OR
+                   (whatsapp IS NOT NULL AND whatsapp != \'\')
+               )
                ORDER BY extracted_at DESC''',
             (batch_id,)
         )
         rows = c.fetchall()
 
         if not rows:
-            print(f"[SYNC] No leads with email found for batch {batch_id}")
+            print(f"[SYNC] No CRM-eligible leads found for batch {batch_id} (QUAL-06 gate)")
             return
 
         leads_to_sync = []
@@ -14747,18 +14751,24 @@ def crm_sync_all():
     c = conn.cursor()
 
     try:
-        # Count total leads with email
-        c.execute("SELECT COUNT(*) FROM leads WHERE email IS NOT NULL AND email != ''")
+        # QUAL-06: Consistent gate — same as auto_sync and batch sync
+        c.execute("""SELECT COUNT(*) FROM leads WHERE (
+            (email IS NOT NULL AND email != '' AND quality_grade != 'F') -- QUAL-06
+            OR (whatsapp IS NOT NULL AND whatsapp != '')
+        )""")
         total = c.fetchone()[0]
 
         if total == 0:
-            return jsonify({'message': 'No leads with email found', 'total': 0}), 200
+            return jsonify({'message': 'No CRM-eligible leads found (QUAL-06 gate)', 'total': 0}), 200
 
-        # Fetch all leads with email
+        # QUAL-06: Only sync leads with valid email (grade != F) OR valid whatsapp
         c.execute(
             '''SELECT company_name, email, phone, website, city, state, source
                FROM leads
-               WHERE email IS NOT NULL AND email != ''
+               WHERE (
+                   (email IS NOT NULL AND email != \'\' AND quality_grade != \'F\') -- QUAL-06
+                   OR (whatsapp IS NOT NULL AND whatsapp != \'\')
+               )
                ORDER BY extracted_at DESC'''
         )
         rows = c.fetchall()
@@ -15363,12 +15373,16 @@ def _run_crm_sync_batch(sync_job_id):
     c = conn.cursor()
 
     try:
-        # Fetch all leads with email from shared base
+        # QUAL-06: Gate — only leads with valid email OR valid whatsapp sent to CRM
         c.execute(
             '''SELECT id, company_name, email, phone, website, city, state, contact_name, tags, notes, whatsapp
                FROM leads l
                JOIN batches b ON l.batch_id = b.id
-               WHERE l.email IS NOT NULL AND l.email != '' AND b.is_shared = TRUE
+               WHERE b.is_shared = TRUE AND (
+                   (l.email IS NOT NULL AND l.email != \'\' AND l.quality_grade != \'F\') -- QUAL-06
+                   OR
+                   (l.whatsapp IS NOT NULL AND l.whatsapp != \'\')
+               )
                ORDER BY l.extracted_at DESC LIMIT 5000'''
         )
         rows = c.fetchall()
@@ -18145,6 +18159,96 @@ def api_admin_source_stats():
         ''')
         rows = c.fetchall()
     return jsonify([{'source': r[0], 'count': r[1]} for r in rows])
+
+
+@app.route('/api/admin/quality-stats', methods=['GET'])
+def get_quality_stats():
+    """QUAL-06/Phase 7: Returns quality filter metrics for admin dashboard.
+    Counts leads by quality_grade, whatsapp presence, and CRM eligibility.
+    """
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as _chk:
+        _cur = _chk.cursor()
+        _cur.execute('SELECT is_admin FROM users WHERE id=%s', (user_id,))
+        _row = _cur.fetchone()
+        if not _row or not _row[0]:
+            return jsonify({'error': 'Admin only'}), 403
+
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+
+            # Total leads in DB
+            c.execute("SELECT COUNT(*) FROM leads")
+            total_leads = c.fetchone()[0]
+
+            # Leads by quality grade
+            c.execute("""
+                SELECT quality_grade, COUNT(*) as count
+                FROM leads
+                WHERE quality_grade IS NOT NULL
+                GROUP BY quality_grade
+                ORDER BY quality_grade
+            """)
+            grade_counts = {row[0]: row[1] for row in c.fetchall()}
+
+            # Leads with valid email (grade != F and email not null)
+            c.execute("""
+                SELECT COUNT(*) FROM leads
+                WHERE email IS NOT NULL AND email != ''
+                  AND quality_grade IS NOT NULL AND quality_grade != 'F'
+            """)
+            leads_with_valid_email = c.fetchone()[0]
+
+            # Leads with valid whatsapp (non-null, non-empty after QUAL-05 normalization)
+            c.execute("""
+                SELECT COUNT(*) FROM leads
+                WHERE whatsapp IS NOT NULL AND whatsapp != ''
+            """)
+            leads_with_valid_whatsapp = c.fetchone()[0]
+
+            # Leads eligible for CRM (valid email OR valid whatsapp) -- QUAL-06
+            c.execute("""
+                SELECT COUNT(*) FROM leads
+                WHERE (email IS NOT NULL AND email != '' AND quality_grade != 'F')
+                   OR (whatsapp IS NOT NULL AND whatsapp != '')
+            """)
+            leads_eligible_for_crm = c.fetchone()[0]
+
+            # Leads NOT eligible for CRM (no valid email AND no valid whatsapp)
+            leads_blocked_from_crm = total_leads - leads_eligible_for_crm
+
+            # Leads already sent to CRM (from cache table)
+            try:
+                c.execute("SELECT COUNT(*) FROM crm_sent_leads")
+                leads_sent_to_crm = c.fetchone()[0]
+            except Exception:
+                leads_sent_to_crm = None  # Table may not exist in all environments
+
+            # Leads added in last 24h
+            c.execute("""
+                SELECT COUNT(*) FROM leads
+                WHERE extracted_at >= NOW() - INTERVAL '24 hours'
+            """)
+            leads_last_24h = c.fetchone()[0]
+
+        return jsonify({
+            'total_leads': total_leads,
+            'grade_distribution': grade_counts,
+            'leads_with_valid_email': leads_with_valid_email,
+            'leads_with_valid_whatsapp': leads_with_valid_whatsapp,
+            'leads_eligible_for_crm': leads_eligible_for_crm,
+            'leads_blocked_from_crm': leads_blocked_from_crm,
+            'leads_sent_to_crm': leads_sent_to_crm,
+            'leads_last_24h': leads_last_24h,
+            'crm_gate_rule': 'valid_email (grade!=F) OR valid_whatsapp',
+        }), 200
+
+    except Exception as e:
+        print(f"[quality-stats] Error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 def trigger_saved_search_notifications():
