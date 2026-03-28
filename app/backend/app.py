@@ -14274,6 +14274,26 @@ def sync_lead_to_alexandrequeiroz(lead_data):
     if not email or '@' not in email:
         return False, "Email inválido após sanitização", None
 
+    # QUAL-04: Check local cache before hitting CRM API
+    _email_normalized = email.strip().lower()
+    if _email_normalized:
+        try:
+            _cache_conn = psycopg2.connect(**DB_CONFIG)
+            _cache_c = _cache_conn.cursor()
+            _cache_c.execute(
+                "SELECT id FROM crm_sent_leads WHERE LOWER(email) = LOWER(%s)",
+                (_email_normalized,)
+            )
+            _cached = _cache_c.fetchone()
+            _cache_c.close()
+            _cache_conn.close()
+            if _cached:
+                print(f"[QUAL-04] Cache hit — skipping CRM sync for: {_email_normalized}")
+                return True, "Lead already in CRM cache (skipped)", None
+        except Exception as _cache_err:
+            print(f"[QUAL-04] Cache read error (non-fatal, continuing): {_cache_err}")
+            # Fall through to API check
+
     company_name = lead_data.get('company_name') or lead_data.get('name') or 'Lead sem nome'
     phone = lead_data.get('phone') or None
     website = lead_data.get('website') or None
@@ -14340,6 +14360,26 @@ def sync_lead_to_alexandrequeiroz(lead_data):
             result = create_response.json()
             customer_id = result.get('id')
             print(f"[SYNC] ✅ Created lead: {email} -> ID: {customer_id}")
+            # QUAL-04: Record in local cache after successful CRM sync
+            try:
+                _write_conn = psycopg2.connect(**DB_CONFIG)
+                _write_c = _write_conn.cursor()
+                _write_c.execute(
+                    """INSERT INTO crm_sent_leads (email, phone, whatsapp, crm_id)
+                       VALUES (LOWER(%s), %s, %s, %s)
+                       ON CONFLICT (LOWER(email)) DO NOTHING""",
+                    (
+                        _email_normalized,
+                        (lead_data.get('phone') or '')[:50] or None,
+                        (lead_data.get('whatsapp') or '')[:50] or None,
+                        str(customer_id) if customer_id else None,
+                    )
+                )
+                _write_conn.commit()
+                _write_c.close()
+                _write_conn.close()
+            except Exception as _write_err:
+                print(f"[QUAL-04] Cache write error (non-fatal): {_write_err}")
             return True, "Lead created successfully", customer_id
         elif create_response.status_code == 409:
             # Conflict - lead already exists

@@ -152,3 +152,24 @@ print '  - Company Info: legal_name, employee_count, founded_year, description, 
 print '  - Business: business_hours (JSONB), social_instagram_followers';
 print '  - Dedup: company_slug (UNIQUE)';
 print '  - Timestamps: first_scraped_at, last_verified_at';
+
+-- ── Phase 7 QUAL-04: CRM dedup cache ────────────────────────────────────────
+-- Cache table to track leads already sent to the external CRM.
+-- Prevents re-sending the same lead across multiple sync runs.
+-- Email comparison is case-insensitive (LOWER index).
+-- No FK to leads table — cache is global, not per-batch.
+CREATE TABLE IF NOT EXISTS crm_sent_leads (
+    id          BIGSERIAL PRIMARY KEY,
+    email       TEXT NOT NULL,
+    phone       TEXT,
+    whatsapp    TEXT,
+    crm_id      TEXT,
+    sent_at     TIMESTAMP DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_sent_leads_email
+    ON crm_sent_leads (LOWER(email));
+
+CREATE INDEX IF NOT EXISTS idx_crm_sent_leads_sent_at
+    ON crm_sent_leads (sent_at DESC);
+-- ── End Phase 7 QUAL-04 ──────────────────────────────────────────────────────
