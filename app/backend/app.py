@@ -1205,6 +1205,60 @@ def has_valid_mx(domain):
     return result
 
 
+# ── QUAL-02: Foreign TLD blocklist ────────────────────────────────────────────
+_FOREIGN_TLD_BLOCKLIST = {
+    '.com.ar', '.com.mx', '.com.co', '.co.uk', '.com.de',
+    '.com.fr', '.com.it', '.com.jp', '.com.cn',
+    '.es', '.pt', '.pl', '.ru', '.de', '.fr', '.it',
+    '.nl', '.se', '.no', '.dk', '.fi', '.cz', '.hu', '.ro',
+}
+
+def _is_foreign_tld(domain: str) -> bool:
+    """Returns True if domain ends with a foreign (non-BR, non-generic) TLD.
+    Checks multi-part TLDs (e.g. .com.ar) before single TLDs to avoid false matches.
+    Never blocks .com.br, .br, .io, .co, .net, .org, .app, .dev, .tech, .digital.
+    QUAL-02 per Phase 7.
+    """
+    d = domain.lower().strip()
+    # Multi-part TLDs must be checked first (e.g. .com.ar before .ar)
+    for tld in sorted(_FOREIGN_TLD_BLOCKLIST, key=len, reverse=True):
+        if d.endswith(tld):
+            return True
+    return False
+
+# ── QUAL-03: Email slogan detector ───────────────────────────────────────────
+_SLOGAN_VERBS = {
+    'venha', 'fale', 'entre', 'contate', 'acesse',
+    'clique', 'seja', 'descubra', 'aproveite', 'conheca', 'conhea',
+}
+_SAFE_EMAIL_PREFIXES = {
+    'contato', 'atendimento', 'comercial', 'financeiro', 'suporte',
+    'info', 'sac', 'vendas', 'marketing', 'rh', 'administrativo',
+    'recepcao', 'secretaria', 'faleconosco', 'ouvidoria',
+}
+
+def _is_slogan_email(email: str) -> bool:
+    """Conservative slogan email detector. Returns True ONLY for obvious slogans.
+    Never rejects known generic prefixes (D-12). Threshold: conservative (D-10).
+    QUAL-03 per Phase 7.
+    """
+    if '@' not in email:
+        return False
+    local = email.split('@')[0].lower().strip()
+    # D-12: Always accept known generic/safe prefixes
+    if local in _SAFE_EMAIL_PREFIXES:
+        return False
+    # D-11: Reject single action verb as the ENTIRE local part
+    if local in _SLOGAN_VERBS:
+        return True
+    # D-10: Reject if 4+ words separated by hyphens/underscores AND contains action verb
+    parts = re.split(r'[-_]', local)
+    if len(parts) >= 4:
+        for part in parts:
+            if part in _SLOGAN_VERBS:
+                return True
+    return False
+
 # ============= Phase 2: Lead Quality Functions =============
 
 def validate_email_free(email: str) -> dict:
@@ -1431,6 +1485,34 @@ def save_lead_to_db(conn, lead_data: dict) -> bool:
     apify, instagram, linkedin, local_business_data) MUST call this function.
     Returns True if the lead was inserted, False if skipped (duplicate or error).
     """
+    # ── Phase 7 quality guards ────────────────────────────────────────────────
+    _email = (lead_data.get('email') or '').strip().lower()
+    if _email and '@' in _email:
+        _domain = _email.split('@')[-1]
+        # QUAL-02: Reject foreign TLD emails
+        if _is_foreign_tld(_domain):
+            print(f"[QUAL-02] Rejecting foreign TLD: {_domain}")
+            return False
+        # QUAL-03: Reject slogan emails
+        if _is_slogan_email(_email):
+            print(f"[QUAL-03] Rejecting slogan email: {_email}")
+            return False
+
+    # QUAL-05: Normalize/null whatsapp field — invalid => None (lead still saved)
+    _wa = (lead_data.get('whatsapp') or '').strip()
+    if _wa:
+        try:
+            _wa_result = normalize_phone_br(_wa)
+            if _wa_result.get('valid') and _wa_result.get('type') == 'mobile':
+                lead_data['whatsapp'] = _wa_result.get('e164') or _wa_result.get('national') or _wa
+            else:
+                print(f"[QUAL-05] Nulling invalid whatsapp: {_wa}")
+                lead_data['whatsapp'] = None
+        except Exception as _wa_err:
+            print(f"[QUAL-05] WhatsApp validation error (non-fatal): {_wa_err}")
+            lead_data['whatsapp'] = None
+    # ── End Phase 7 guards ────────────────────────────────────────────────────
+
     qs = compute_lead_quality_score(lead_data)
 
     # Merge scoring into lead_data for INSERT

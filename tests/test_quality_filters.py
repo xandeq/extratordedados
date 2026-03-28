@@ -10,15 +10,45 @@ import os
 import requests
 
 # --- Unit tests for pure helper functions (no API needed) ---
-# These are imported directly from app.py after Task 2 adds the functions.
-# If import fails (functions not yet added), tests are skipped gracefully.
+# Extract the pure functions by parsing them from app.py with AST to avoid triggering
+# the full Flask app initialization (which tries to connect to remote DB/APScheduler).
+
+import re as _re_module
+import ast as _ast_module
 
 def _try_import_helpers():
+    """
+    Extracts _is_foreign_tld and _is_slogan_email from app.py using exec() on parsed source.
+    This avoids triggering the full Flask app initialization (which hangs on remote DB).
+    Returns (fn, fn) or (None, None) if functions not yet defined in app.py.
+    """
+    app_path = os.path.join(os.path.dirname(__file__), '..', 'app', 'backend', 'app.py')
+    if not os.path.exists(app_path):
+        return None, None
     try:
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'app', 'backend'))
-        from app import _is_foreign_tld, _is_slogan_email
+        with open(app_path, encoding='utf-8') as f:
+            source = f.read()
+        # Check if functions exist at all
+        if '_is_foreign_tld' not in source or '_is_slogan_email' not in source:
+            return None, None
+        # Extract just the constants + functions we need using string slicing
+        # Find the QUAL-02 block start and the Phase 2 section end as boundary
+        start_marker = '# \u2500\u2500 QUAL-02: Foreign TLD blocklist'
+        end_marker = '# ============= Phase 2: Lead Quality Functions'
+        start_idx = source.find(start_marker)
+        end_idx = source.find(end_marker)
+        if start_idx == -1 or end_idx == -1:
+            return None, None
+        snippet = source[start_idx:end_idx]
+        # Execute snippet in a fresh namespace with only stdlib dependencies
+        ns = {'re': _re_module}
+        exec(snippet, ns)  # noqa: S102 — controlled source from own codebase
+        _is_foreign_tld = ns.get('_is_foreign_tld')
+        _is_slogan_email = ns.get('_is_slogan_email')
+        if _is_foreign_tld is None or _is_slogan_email is None:
+            return None, None
         return _is_foreign_tld, _is_slogan_email
-    except ImportError:
+    except Exception:
         return None, None
 
 
