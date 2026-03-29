@@ -61,8 +61,14 @@ def _db_log_writer():
                 )
                 conn.commit()
                 conn.close()
-            except Exception:
-                pass  # never crash the writer
+            except Exception as _db_err:
+                # DB write failed — emit to stderr so Gunicorn captures it
+                import sys as _sys
+                print(
+                    f'[DB_LOG_WRITER_ERROR] failed to persist log: {_db_err!r} '
+                    f'| level={level} provider={provider} msg={str(message)[:200]}',
+                    file=_sys.stderr, flush=True
+                )
         except queue.Empty:
             continue
         except Exception:
@@ -377,7 +383,11 @@ def scraper_log(level, provider, query, msg, exc=None, **kwargs):
         try:
             _log_queue.put_nowait((level.upper(), provider, query, str(msg), exc_text, fix_prompt, error_type, extra_json))
         except queue.Full:
-            pass
+            # Fallback: write directly to file logger so the error is never lost
+            import logging as _logging
+            _fb = _logging.getLogger('extrator')
+            _fb.error('[QUEUE_FULL_FALLBACK] provider=%s query=%s msg=%s exc=%s',
+                      provider, query, str(msg)[:200], exc_text[:200] if exc_text else '')
 
 
 def persist_system_log(level, provider, query, message, exception_text=None, **kwargs):
@@ -399,7 +409,12 @@ def persist_system_log(level, provider, query, message, exception_text=None, **k
             extra_json,
         ))
     except queue.Full:
-        pass
+        # Fallback: write directly to rotating file log — never discard an ERROR
+        import logging as _logging
+        _fb = _logging.getLogger('extrator')
+        _lvl = getattr(_logging, level.upper(), _logging.ERROR)
+        _fb.log(_lvl, '[QUEUE_FULL_FALLBACK][%s] provider=%s query=%s msg=%s',
+                error_type or 'unknown', provider, query, str(message)[:400])
 
 
 def _stack_trace_text(exc=None):
@@ -7107,10 +7122,17 @@ SHARED_LEADS_SELECT = '''SELECT l.id, l.company_name, l.email, l.phone, l.websit
                          FROM leads l JOIN batches b ON l.batch_id = b.id
                          WHERE b.is_shared = TRUE'''
 
+def _mask_dedup_email(email):
+    """Return None for internal dedup placeholder emails (.local domains) — keep real emails."""
+    if email and email.endswith('.local'):
+        return None
+    return email
+
+
 def lead_row_to_dict(row):
     """Convert a lead row tuple to dict."""
     return {
-        'id': row[0], 'company_name': row[1], 'email': row[2], 'phone': row[3],
+        'id': row[0], 'company_name': row[1], 'email': _mask_dedup_email(row[2]), 'phone': row[3],
         'website': row[4], 'source_url': row[5], 'city': row[6], 'state': row[7],
         'category': row[8], 'extracted_at': row[9].isoformat() if row[9] else None,
         'instagram': row[10], 'facebook': row[11], 'linkedin': row[12],
@@ -8376,6 +8398,8 @@ def sanitize_leads():
 
     data = request.get_json() or {}
     lead_ids = data.get('lead_ids', [])  # empty = all leads
+    if lead_ids and len(lead_ids) > 1000:
+        return jsonify({'error': 'Máximo de 1000 leads por sanitização'}), 400
 
     with get_db() as conn:
         c = conn.cursor()
@@ -8542,6 +8566,135 @@ def sanitize_leads():
             'quality_updated': quality_updated,
             'ids_deleted': len(ids_to_delete),
         }
+    })
+
+
+# ============= Segment Leads =============
+# Classifies leads into segments based on tags, category keywords in company_name,
+# CNPJ activity, and source. Updates leads.tags in-place.
+# POST /api/leads/segment  { lead_ids?: [...], filters?: {...} }
+
+_SEGMENT_KEYWORDS: list[tuple[str, list[str]]] = [
+    ('saude',       ['clínica', 'clinica', 'médico', 'medico', 'odonto', 'dentist', 'farmácia', 'farmacia', 'hospital', 'saúde', 'saude', 'nutrição', 'nutricao', 'fisio']),
+    ('beleza',      ['salão', 'salao', 'estética', 'estetica', 'barbearia', 'cabeleire', 'manicure', 'spa', 'beleza', 'depilação']),
+    ('educacao',    ['escola', 'colégio', 'colegio', 'curso', 'faculdade', 'universi', 'educação', 'educacao', 'ensino', 'treinamento']),
+    ('alimentacao', ['restaurante', 'lanchonete', 'padaria', 'buffet', 'delivery', 'alimento', 'food', 'marmita', 'snack']),
+    ('construcao',  ['construção', 'construcao', 'construtora', 'engenharia', 'reforma', 'arquiteto', 'imobiliária', 'imobiliaria', 'imóvel', 'imovel']),
+    ('tecnologia',  ['tech', 'software', 'sistemas', 'ti ', 'tecnologia', 'digital', 'consultoria ti', 'desenvolvimento', 'startup']),
+    ('varejo',      ['loja', 'comércio', 'comercio', 'varejo', 'boutique', 'mercado', 'supermercado', 'atacado']),
+    ('servicos',    ['assessoria', 'consultoria', 'contabilidade', 'contábil', 'advocacia', 'advocado', 'advogado', 'juridico', 'jurídico', 'seguro', 'financeiro']),
+    ('industria',   ['indústria', 'industria', 'fabricação', 'fabricacao', 'manufatura', 'fábrica', 'fabrica', 'distribuidora', 'atacadista']),
+    ('logistica',   ['logística', 'logistica', 'transporte', 'frete', 'entrega', 'armazém', 'armazem', 'estoque']),
+]
+
+
+def _classify_segment(company_name: str, existing_tags: str) -> list[str]:
+    """Return list of segment tags for a lead based on company_name."""
+    cn_lower = (company_name or '').lower()
+    assigned: list[str] = []
+    for seg, keywords in _SEGMENT_KEYWORDS:
+        if any(kw in cn_lower for kw in keywords):
+            assigned.append(seg)
+    return assigned
+
+
+@app.route('/api/leads/segment', methods=['POST'])
+@limiter.limit("5/minute")
+def segment_leads():
+    """
+    Auto-classify leads into segments (tags) based on company_name keywords.
+    Updates leads.tags in the database for selected or all user leads.
+    Returns: { success, segmented, unchanged, breakdown: {seg: count} }
+    """
+    token = get_auth_header()
+    user_id = verify_token(token)
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+    lead_ids = data.get('lead_ids', [])
+    overwrite = bool(data.get('overwrite', False))  # if True, replace existing tags; else append
+
+    with get_db() as conn:
+        c = conn.cursor()
+
+        if lead_ids:
+            valid_ids = [int(x) for x in lead_ids if isinstance(x, (int, str)) and str(x).isdigit()]
+            if not valid_ids:
+                return jsonify({'success': False, 'error': 'No valid lead_ids provided'}), 400
+            placeholders = ','.join(['%s'] * len(valid_ids))
+            c.execute(
+                f'''SELECT l.id, l.company_name, l.tags
+                    FROM leads l
+                    JOIN batches b ON b.id = l.batch_id
+                    WHERE l.id IN ({placeholders}) AND b.user_id = %s''',
+                valid_ids + [user_id]
+            )
+        else:
+            c.execute(
+                '''SELECT l.id, l.company_name, l.tags
+                   FROM leads l
+                   JOIN batches b ON b.id = l.batch_id
+                   WHERE b.user_id = %s
+                   ORDER BY l.id''',
+                (user_id,)
+            )
+
+        rows = c.fetchall()
+
+        if not rows:
+            return jsonify({'success': False, 'error': 'No leads found'}), 404
+
+        segmented = 0
+        unchanged = 0
+        breakdown: dict[str, int] = {}
+        updates: list[tuple[str, int]] = []
+
+        for lead_id, company_name, existing_tags in rows:
+            new_segs = _classify_segment(company_name, existing_tags)
+            if not new_segs:
+                unchanged += 1
+                continue
+
+            # Merge or overwrite tags
+            current = set(t.strip() for t in (existing_tags or '').split(',') if t.strip())
+            if overwrite:
+                merged = set(new_segs)
+            else:
+                merged = current | set(new_segs)
+
+            new_tags_str = ','.join(sorted(merged))
+            if new_tags_str == ','.join(sorted(current)):
+                unchanged += 1
+                continue
+
+            updates.append((new_tags_str, lead_id))
+            segmented += 1
+            for seg in new_segs:
+                breakdown[seg] = breakdown.get(seg, 0) + 1
+
+        if updates:
+            from psycopg2.extras import execute_batch
+            execute_batch(
+                c,
+                'UPDATE leads SET tags = %s WHERE id = %s',
+                updates,
+                page_size=200
+            )
+            conn.commit()
+
+    persist_system_log(
+        'INFO', 'segment_leads', 'segment_leads',
+        f'Segmented {segmented} leads for user {user_id}. Unchanged: {unchanged}',
+        user_id=user_id, breakdown=breakdown
+    )
+
+    return jsonify({
+        'success': True,
+        'segmented': segmented,
+        'unchanged': unchanged,
+        'breakdown': breakdown,
+        'message': f'{segmented} leads segmentados automaticamente'
     })
 
 
@@ -11335,7 +11488,7 @@ def export_leads():
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(['Email Address', 'First Name', 'Last Name', 'Phone Number', 'Company', 'Tags'])
-        for l in leads:
+        for l in [x for x in leads if x.get('email')]:
             name = l.get('contact_name', '') or l.get('company_name', '') or ''
             parts = name.split(' ', 1)
             first_name = parts[0] if parts else ''
@@ -11590,14 +11743,28 @@ def send_leads_to_crm():
 
     leads = [lead_row_to_dict(row) for row in rows]
 
-    # Deduplicate by email
+    # Deduplicate by email + validate quality (reject malformed/low-score emails)
     seen_emails = {}
     unique_leads = []
+    skipped_invalid = 0
     for lead in leads:
-        email = (lead.get('email') or '').strip().lower()
-        if email and email not in seen_emails:
-            seen_emails[email] = True
-            unique_leads.append(lead)
+        raw_email = (lead.get('email') or '').strip()
+        if not raw_email:
+            skipped_invalid += 1
+            continue
+        # Run through normalize_email() — rejects disposable, aggregator, low-score, malformed
+        clean_email = normalize_email(raw_email)
+        if not clean_email:
+            skipped_invalid += 1
+            logger.warning('[send_to_crm] Rejecting lead id=%s — invalid/low-quality email: %s',
+                           lead.get('id', '?'), raw_email)
+            continue
+        if clean_email in seen_emails:
+            skipped_invalid += 1
+            continue
+        seen_emails[clean_email] = True
+        lead['email'] = clean_email  # use normalised version
+        unique_leads.append(lead)
 
     if not unique_leads:
         _log_send_to_crm_failure(
@@ -11605,7 +11772,7 @@ def send_leads_to_crm():
             filters=filters,
             lead_ids=lead_ids,
             crm_api_url=crm_api_url,
-            error_message='No leads with valid emails found',
+            error_message='No leads with valid emails found after quality filtering',
             status_code=404,
             stage='prepare_payload',
             total_leads=len(leads),
@@ -11613,19 +11780,44 @@ def send_leads_to_crm():
         )
         return jsonify({
             'success': False,
-            'error': 'No leads with valid emails found',
+            'error': f'Nenhum lead com email válido encontrado. {skipped_invalid} lead(s) rejeitados por email inválido ou baixa qualidade.',
             'sent_count': 0,
-            'failed_count': 0
+            'failed_count': 0,
+            'skipped_invalid': skipped_invalid,
         }), 404
 
-    # Format leads for CRM API
+    # Format leads for CRM API — sanitize names before sending
+    _GARBAGE_NAME_RE = re.compile(
+        r'^(lead|n/?a|empresa|company|test|teste|client|cliente|desconhecido|sem nome|unknown|null|none|—|-)$',
+        re.I
+    )
+
+    def _clean_crm_name(raw: str, fallback: str = '') -> str:
+        """Strip encoding artifacts, collapse whitespace, title-case, reject garbage."""
+        if not raw:
+            return fallback
+        name = raw.strip()
+        # Fix common mojibake
+        try:
+            name = name.encode('latin-1').decode('utf-8')
+        except Exception:
+            pass
+        # Collapse whitespace
+        name = re.sub(r'\s+', ' ', name).strip()
+        # Reject single-char or obvious garbage
+        if len(name) < 2 or _GARBAGE_NAME_RE.match(name):
+            return fallback
+        return name[:100]
+
     customers = []
     for lead in unique_leads:
-        contact_name = lead.get('contact_name') or lead.get('company_name') or 'Lead'
+        raw_contact = (lead.get('contact_name') or '').strip()
+        raw_company = (lead.get('company_name') or '').strip()
+        contact_name = _clean_crm_name(raw_contact) or _clean_crm_name(raw_company) or 'Lead'
+        company_name = _clean_crm_name(raw_company) or 'N/A'
         email = (lead.get('email') or '').strip()
         phone = lead.get('phone') or None
         whatsapp = lead.get('whatsapp') or None
-        company_name = lead.get('company_name') or 'N/A'
         tags = lead.get('tags') or ''
         notes = lead.get('notes') or ''
 
@@ -11633,11 +11825,11 @@ def send_leads_to_crm():
         combined_notes = f"{notes}{',' if notes and tags else ''}{tags}"
 
         customer = {
-            'name': contact_name[:100],  # Limit to 100 chars
+            'name': contact_name,
             'email': email,
             'phone': phone,
             'whatsApp': whatsapp,
-            'companyName': company_name[:100],
+            'companyName': company_name,
             'notes': combined_notes[:500] if combined_notes else '',
             'tags': tags
         }
@@ -11668,7 +11860,11 @@ def send_leads_to_crm():
         )
 
         if response.status_code in [200, 201, 202]:
-            result = response.json()
+            try:
+                result = response.json()
+            except Exception:
+                # CRM returned 2xx but body is not valid JSON — treat as full success
+                result = {}
             sent_count = result.get('created', len(customers))
             failed_count = result.get('failed', 0)
             return jsonify({
@@ -11676,7 +11872,9 @@ def send_leads_to_crm():
                 'sent_count': sent_count,
                 'failed_count': failed_count,
                 'total_leads': len(unique_leads),
+                'skipped_invalid': skipped_invalid,
                 'message': f'Successfully sent {sent_count} leads to CRM'
+                           + (f' ({skipped_invalid} skipped — invalid email)' if skipped_invalid else '')
             }), 200
         else:
             error_msg = response.text[:200] if response.text else f'HTTP {response.status_code}'
@@ -14377,6 +14575,8 @@ def sync_lead_to_alexandrequeiroz(lead_data):
     email = (lead_data.get('email') or '').strip()
     if not email or '@' not in email:
         return False, "Email inválido após sanitização", None
+    if email.endswith('.local'):
+        return False, "Email interno (dedup placeholder) — não enviado ao CRM", None
 
     # QUAL-04: Check local cache before hitting CRM API
     _email_normalized = email.strip().lower()
@@ -14548,14 +14748,16 @@ def _monitor_batch_completion(batch_id):
             )
             row = c.fetchone()
             if row and row[0] == 0:
-                # All jobs done → mark batch completed
+                # All jobs done → count real leads and mark batch completed
                 try:
+                    c.execute("SELECT COUNT(*) FROM leads WHERE batch_id=%s", (batch_id,))
+                    real_count = c.fetchone()[0]
                     c.execute(
-                        "UPDATE batches SET status='completed' WHERE id=%s AND status='processing'",
-                        (batch_id,)
+                        "UPDATE batches SET status='completed', total_leads=%s WHERE id=%s AND status='processing'",
+                        (real_count, batch_id)
                     )
                     conn.commit()
-                    print(f"[MONITOR] Batch {batch_id} marked as completed")
+                    print(f"[MONITOR] Batch {batch_id} marked as completed — {real_count} leads")
                 except Exception as e:
                     print(f"[MONITOR] Error marking batch completed: {e}")
                     try:
@@ -14565,9 +14767,11 @@ def _monitor_batch_completion(batch_id):
                 return
         print(f"[MONITOR] Timeout waiting for batch {batch_id} — marking completed anyway")
         try:
+            c.execute("SELECT COUNT(*) FROM leads WHERE batch_id=%s", (batch_id,))
+            real_count = c.fetchone()[0]
             c.execute(
-                "UPDATE batches SET status='completed' WHERE id=%s AND status='processing'",
-                (batch_id,)
+                "UPDATE batches SET status='completed', total_leads=%s WHERE id=%s AND status='processing'",
+                (real_count, batch_id)
             )
             conn.commit()
         except Exception as e:
