@@ -5,7 +5,7 @@ import api from '../lib/api'
 
 export default function Login() {
   const router = useRouter()
-  const [username, setUsername] = useState('')
+  const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
@@ -17,12 +17,12 @@ export default function Login() {
     setLoading(true)
 
     try {
-      const { data } = await api.post('/api/login', { username, password })
+      const { data } = await api.post('/api/login', { email, password })
       localStorage.setItem('token', data.token)
       localStorage.setItem('user_id', data.user_id)
       router.push('/dashboard')
     } catch (err: any) {
-      setError(err.response?.data?.error || 'Erro ao fazer login')
+      setError(err.response?.data?.error || 'Email ou senha incorretos')
     } finally {
       setLoading(false)
     }
@@ -57,15 +57,15 @@ export default function Login() {
 
           <form onSubmit={handleSubmit} className="space-y-5">
             <div>
-              <label htmlFor="username" className="block text-sm font-medium text-slate-300 mb-2">
-                Usuario
+              <label htmlFor="email" className="block text-sm font-medium text-slate-300 mb-2">
+                Email
               </label>
               <input
-                id="username"
-                type="text"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="Digite seu usuario"
+                id="email"
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="Digite seu email"
                 required
                 className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-primary-500/40 focus:border-primary-500/40 transition-all text-sm"
               />

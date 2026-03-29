@@ -1993,6 +1993,9 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )''')
 
+        # Add email column if not exists (migration for existing DBs)
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(320) UNIQUE")
+
         c.execute('''CREATE TABLE IF NOT EXISTS sessions (
             id SERIAL PRIMARY KEY,
             user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -2710,11 +2713,19 @@ def init_db():
         c = conn.cursor()
 
         # Insert admin user if not exists
+        ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'xandeq@gmail.com')
         c.execute('SELECT id FROM users WHERE username = %s', (ADMIN_USERNAME,))
-        if not c.fetchone():
+        existing_admin = c.fetchone()
+        if not existing_admin:
             c.execute(
-                'INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (%s, %s, %s, %s)',
-                (ADMIN_USERNAME, ADMIN_PASSWORD_HASH, True, datetime.now())
+                'INSERT INTO users (username, email, password_hash, is_admin, created_at) VALUES (%s, %s, %s, %s, %s)',
+                (ADMIN_USERNAME, ADMIN_EMAIL, ADMIN_PASSWORD_HASH, True, datetime.now())
+            )
+        else:
+            # Ensure admin has the email set (migration for existing admins)
+            c.execute(
+                'UPDATE users SET email = %s WHERE username = %s AND email IS NULL',
+                (ADMIN_EMAIL, ADMIN_USERNAME)
             )
 
 # ============= Auth =============
@@ -5982,28 +5993,33 @@ def health():
 @app.route('/api/login', methods=['POST'])
 @limiter.limit("5/minute")
 def login():
-    """Login endpoint"""
+    """Login endpoint — accepts email or username"""
     data = request.get_json()
     if not data:
         return jsonify({'error': 'JSON body required'}), 400
 
-    username = data.get('username')
+    # Accept 'email', 'username', or generic 'login' field
+    login_field = data.get('email') or data.get('username') or data.get('login')
     password = data.get('password')
 
-    if not username or not password:
-        return jsonify({'error': 'Username and password required'}), 400
+    if not login_field or not password:
+        return jsonify({'error': 'Email/username and password required'}), 400
 
     with get_db() as conn:
         c = conn.cursor()
-        c.execute('SELECT id, password_hash, is_admin FROM users WHERE username = %s', (username,))
+        # Try by email first, then by username (case-insensitive)
+        c.execute(
+            'SELECT id, password_hash, is_admin FROM users WHERE LOWER(email) = LOWER(%s) OR LOWER(username) = LOWER(%s)',
+            (login_field, login_field)
+        )
         user = c.fetchone()
 
     if not user:
-        return jsonify({'error': 'Invalid credentials'}), 401
+        return jsonify({'error': 'Email ou senha incorretos'}), 401
 
     valid, new_hash = _check_password(password, user[1])
     if not valid:
-        return jsonify({'error': 'Invalid credentials'}), 401
+        return jsonify({'error': 'Email ou senha incorretos'}), 401
 
     # Migrate legacy SHA-256 hash to bcrypt transparently
     if new_hash:
@@ -11173,7 +11189,7 @@ def import_leads():
                     skipped += 1
 
             # Update batch count
-            cur.execute("UPDATE batches SET total_urls = %s WHERE id = %s", (imported, batch_id))
+            cur.execute("UPDATE batches SET total_urls = %s, total_leads = %s WHERE id = %s", (imported, imported, batch_id))
             conn.commit()
 
             # AUTO-SANITIZE + SYNC: sanitiza leads ao completar, depois sincroniza com CRM
