@@ -8,6 +8,21 @@ import api from '../lib/api'
 import { useToast } from './Toast'
 import StatusBadge from './StatusBadge'
 
+function TierBadge({ tier }: { tier: string | null | undefined }) {
+  if (!tier) return null
+  const map: Record<string, { label: string; cls: string }> = {
+    premium: { label: '⭐ Premium', cls: 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' },
+    medio:   { label: '🔵 Médio',   cls: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' },
+    basico:  { label: '⚪ Básico',  cls: 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400' },
+  }
+  const entry = map[tier] ?? { label: tier, cls: 'bg-gray-100 text-gray-500' }
+  return (
+    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold ${entry.cls}`}>
+      {entry.label}
+    </span>
+  )
+}
+
 function GradeBadge({ grade }: { grade: string | null }) {
   const colorMap: Record<string, string> = {
     A: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
@@ -78,6 +93,7 @@ interface Lead {
   batch_id: number
   lead_score?: number
   quality_grade?: string | null
+  quality_score?: string | null
   captured_at?: string | null
 }
 
@@ -149,13 +165,27 @@ export default function LeadDrawer({ lead, onClose, onUpdate, onVerifyEmail }: L
             <div className="min-w-0">
               <h2 className="text-base font-bold text-gray-900 truncate">{lead.company_name || 'Sem nome'}</h2>
               <p className="text-xs text-gray-400 truncate">{lead.email}</p>
-              <div className="flex items-center gap-2 mt-1">
+              <div className="flex items-center gap-2 mt-1 flex-wrap">
                 <GradeBadge grade={lead.quality_grade ?? null} />
+                <TierBadge tier={lead.quality_score} />
                 <FreshnessIndicator capturedAt={lead.captured_at ?? null} />
-                {lead.lead_score != null && (
-                  <span className="text-xs text-gray-400">Score: {lead.lead_score}</span>
-                )}
               </div>
+              {lead.lead_score != null && (
+                <div className="mt-1.5 space-y-0.5">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-gray-400">Score:</span>
+                    <span className={`text-xs font-bold ${lead.lead_score >= 70 ? 'text-green-600' : lead.lead_score >= 40 ? 'text-yellow-600' : 'text-red-600'}`}>
+                      {lead.lead_score}/100
+                    </span>
+                  </div>
+                  <div className="w-full h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full rounded-full ${lead.lead_score >= 70 ? 'bg-green-500' : lead.lead_score >= 40 ? 'bg-yellow-400' : 'bg-red-500'}`}
+                      style={{ width: `${lead.lead_score}%` }}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           </div>
           <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-lg transition-colors">

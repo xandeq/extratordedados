@@ -1044,6 +1044,7 @@ IRRELEVANT_EMAIL_DOMAINS = {
     'businessinsider.com', 'morningstar.com', 'bloomberg.com', 'reuters.com',
     'ifes.edu.br', 'instagram.local', 'linkedin.local', 'facebook.local',
     'noticiasdealava.eus', 'legacyschool.com.br',
+    'generalblue.com', 'almanac.com', 'yankeepub.com', 'nber.org', 'nitrd.gov', 'stanford.edu', 'harvard.edu', 'mit.edu', 'lpl.com', 'trabajo.org',
 }
 
 # DDDs válidos no Brasil (ANATEL)
@@ -2722,9 +2723,9 @@ def init_db():
                 (ADMIN_USERNAME, ADMIN_EMAIL, ADMIN_PASSWORD_HASH, True, datetime.now())
             )
         else:
-            # Ensure admin has the email set (migration for existing admins)
+            # Always sync admin email to ADMIN_EMAIL (idempotent migration)
             c.execute(
-                'UPDATE users SET email = %s WHERE username = %s AND email IS NULL',
+                'UPDATE users SET email = %s WHERE username = %s',
                 (ADMIN_EMAIL, ADMIN_USERNAME)
             )
 
@@ -5266,6 +5267,13 @@ def is_irrelevant_email_domain(email):
     if not email or '@' not in email:
         return False
     domain = email.split('@')[-1].lower().strip()
+    parts = domain.split('.')
+    tld = parts[-1] if parts else ''
+    if tld in ('edu', 'gov', 'mil') and not domain.endswith('.br'):
+        return True
+    tld = domain.split(".")[-1]
+    if tld in ("edu", "gov", "mil") and not domain.endswith(".br"):
+        return True
     return domain in IRRELEVANT_EMAIL_DOMAINS
 
 
@@ -17368,10 +17376,9 @@ def admin_list_niche_requests():
 def create_saved_search():
     """Create or upsert a saved search for the authenticated user."""
     token = get_auth_header()
-    user = verify_token(token)
-    if not user:
+    user_id = verify_token(token)
+    if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    user_id = user['id']
 
     data = request.get_json() or {}
     name = (data.get('name') or '').strip()
@@ -17414,10 +17421,9 @@ def create_saved_search():
 def list_saved_searches():
     """List all saved searches for the authenticated user."""
     token = get_auth_header()
-    user = verify_token(token)
-    if not user:
+    user_id = verify_token(token)
+    if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    user_id = user['id']
 
     try:
         with get_db() as conn:
@@ -17449,10 +17455,9 @@ def list_saved_searches():
 def delete_saved_search(ss_id):
     """Delete a saved search (owner check enforced)."""
     token = get_auth_header()
-    user = verify_token(token)
-    if not user:
+    user_id = verify_token(token)
+    if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    user_id = user['id']
 
     try:
         with get_db() as conn:
@@ -17476,10 +17481,9 @@ def delete_saved_search(ss_id):
 def update_saved_search(ss_id):
     """Update a saved search (toggle notify_enabled, update email or name). Owner check enforced."""
     token = get_auth_header()
-    user = verify_token(token)
-    if not user:
+    user_id = verify_token(token)
+    if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    user_id = user['id']
 
     data = request.get_json() or {}
     updates = []

@@ -100,6 +100,21 @@ function ScoreBadge({ score }: { score: number }) {
   )
 }
 
+function TierBadge({ tier }: { tier: string | null }) {
+  if (!tier) return null
+  const map: Record<string, { label: string; cls: string }> = {
+    premium: { label: '⭐ Premium', cls: 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' },
+    medio:   { label: '🔵 Médio',   cls: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' },
+    basico:  { label: '⚪ Básico',  cls: 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400' },
+  }
+  const entry = map[tier] ?? { label: tier, cls: 'bg-gray-100 text-gray-500' }
+  return (
+    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold ${entry.cls}`}>
+      {entry.label}
+    </span>
+  )
+}
+
 function GradeBadge({ grade }: { grade: string | null }) {
   const colorMap: Record<string, string> = {
     A: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
@@ -918,14 +933,21 @@ export default function Leads() {
             onChange={(e) => { setQualityFilter(e.target.value); setPage(1) }}
             className="px-3 py-2.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500/30 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200"
           >
-            <option value="">Todos os grades</option>
-            <option value="A">A — Alta (80+)</option>
-            <option value="B">B — Boa (60-79)</option>
-            <option value="C">C — Regular (40-59)</option>
-            <option value="D">D — Fraca (20-39)</option>
-            <option value="F">F — Invalida (0-19)</option>
+            <option value="">Toda qualidade</option>
+            <optgroup label="Por Tier">
+              <option value="premium">⭐ Premium (A/B)</option>
+              <option value="medio">🔵 Médio (C)</option>
+              <option value="basico">⚪ Básico (D/F)</option>
+            </optgroup>
+            <optgroup label="Por Nota">
+              <option value="A">A — Excelente (80+)</option>
+              <option value="B">B — Boa (60-79)</option>
+              <option value="C">C — Regular (40-59)</option>
+              <option value="D">D — Fraca (20-39)</option>
+              <option value="F">F — Inválida (0-19)</option>
+            </optgroup>
           </select>
-          <Tooltip text="Filtra leads por qualidade calculada: pontuação 0-100 baseada em email corporativo, telefone válido, WhatsApp, CNPJ, redes sociais." />
+          <Tooltip text="Filtra leads por tier (Premium/Médio/Básico) ou nota (A-F). Score 0-100 baseado em email corporativo, telefone, WhatsApp, CNPJ e redes sociais." />
         </div>
 
         {/* Sort */}
@@ -1165,9 +1187,12 @@ export default function Leads() {
                       <ScoreBadge score={lead.lead_score ?? 0} />
                     </td>
                     <td className="px-4 py-3">
-                      <div className="flex items-center gap-1">
-                        <GradeBadge grade={lead.quality_grade} />
-                        <FreshnessIndicator capturedAt={lead.captured_at} />
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-1">
+                          <GradeBadge grade={lead.quality_grade} />
+                          <FreshnessIndicator capturedAt={lead.captured_at} />
+                        </div>
+                        <TierBadge tier={lead.quality_score} />
                       </div>
                     </td>
                     <td className="px-4 py-3">
