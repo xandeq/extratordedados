@@ -147,11 +147,15 @@ def deploy_backend(creds):
     print("\n2. Upload de arquivos...")
     IMAGE_GEN_PY = os.path.join(ROOT, 'app', 'backend', 'image_gen.py')
     EMAIL_PROVIDERS_PY = os.path.join(ROOT, 'app', 'backend', 'email_providers.py')
+    DB_UTILS_PY = os.path.join(ROOT, 'app', 'backend', 'db_utils.py')
     with ssh.open_sftp() as sftp:
         sftp.put(APP_PY,  '/opt/extrator-api/app.py')
         print("   app.py enviado")
         sftp.put(REQ_TXT, '/opt/extrator-api/requirements.txt')
         print("   requirements.txt enviado")
+        if os.path.exists(DB_UTILS_PY):
+            sftp.put(DB_UTILS_PY, '/opt/extrator-api/db_utils.py')
+            print("   db_utils.py enviado")
         if os.path.exists(IMAGE_GEN_PY):
             sftp.put(IMAGE_GEN_PY, '/opt/extrator-api/image_gen.py')
             print("   image_gen.py enviado")

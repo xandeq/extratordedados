@@ -658,13 +658,7 @@ limiter = Limiter(
 
 # ============= Config =============
 
-DB_CONFIG = {
-    'host': os.environ.get('DB_HOST', '127.0.0.1'),
-    'port': int(os.environ.get('DB_PORT', 5432)),
-    'dbname': os.environ.get('DB_NAME', 'extrator'),
-    'user': os.environ.get('DB_USER', 'extrator'),
-    'password': os.environ.get('DB_PASSWORD', ''),
-}
+from db_utils import DB_CONFIG, get_pool, get_db  # noqa: E402 — after Flask/limiter setup
 
 def _validate_startup():
     """Validate required environment variables at startup. Logs warnings for missing values."""
@@ -1953,30 +1947,6 @@ def build_lead_from_cnpj_enrichment(cnpj_raw, enrichment):
         updates['cnpj_status'] = enrichment['situacao']
     return updates
 
-
-# ============= Connection Pool =============
-
-db_pool = None
-
-def get_pool():
-    global db_pool
-    if db_pool is None or db_pool.closed:
-        db_pool = pool.ThreadedConnectionPool(1, 10, **DB_CONFIG)
-    return db_pool
-
-@contextmanager
-def get_db():
-    """Get a database connection from the pool."""
-    p = get_pool()
-    conn = p.getconn()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        p.putconn(conn)
 
 # ============= Database =============
 
