@@ -2757,6 +2757,45 @@ def init_db():
     except Exception as e:
         print(f'[DB] email_campaigns: {e}')
 
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS image_gen_log (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    prompt      TEXT NOT NULL,
+                    model_key   VARCHAR(60),
+                    model_id    VARCHAR(120),
+                    url         TEXT,
+                    cost_usd    NUMERIC(10,4),
+                    elapsed_s   NUMERIC(6,2),
+                    aspect_ratio VARCHAR(10),
+                    operation   VARCHAR(20) DEFAULT 'generate',
+                    error_msg   TEXT,
+                    created_at  TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_image_gen_log_user ON image_gen_log(user_id, created_at DESC)")
+            # Migrations for older image_gen_log schemas
+            for col, defn in [
+                ('url', 'TEXT'),
+                ('model_id', 'VARCHAR(120)'),
+                ('cost_usd', 'NUMERIC(10,4)'),
+                ('elapsed_s', 'NUMERIC(6,2)'),
+                ('aspect_ratio', 'VARCHAR(10)'),
+                ('operation', "VARCHAR(20) DEFAULT 'generate'"),
+                ('error_msg', 'TEXT'),
+            ]:
+                try:
+                    c.execute(f"ALTER TABLE image_gen_log ADD COLUMN IF NOT EXISTS {col} {defn}")
+                except Exception:
+                    pass
+            conn.commit()
+        print('[DB] image_gen_log ready')
+    except Exception as e:
+        print(f'[DB] image_gen_log: {e}')
+
     with get_db() as conn:
         c = conn.cursor()
 
@@ -19672,8 +19711,20 @@ def api_image_generate():
     model_key = data.get('model', 'nano-banana-2')
     enhance = bool(data.get('enhance', False))
     aspect_ratio = data.get('aspect_ratio', '1:1')
+    user_id = verify_token(get_auth_header())
     try:
         result = _img_generate(prompt, model_key=model_key, enhance=enhance, aspect_ratio=aspect_ratio)
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("""
+                    INSERT INTO image_gen_log (user_id, prompt, model_key, model_id, url, cost_usd, elapsed_s, aspect_ratio, operation, error_msg)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'generate',%s)
+                """, (user_id, prompt, result.get('model_key'), result.get('model_id'),
+                      result.get('url'), result.get('cost_usd'), result.get('elapsed_s'),
+                      aspect_ratio, result.get('error')))
+        except Exception:
+            pass
         if result.get('error') and not result.get('url'):
             return jsonify(result), 502
         return jsonify(result)
@@ -19695,8 +19746,20 @@ def api_image_edit():
     if not image_url or not prompt:
         return jsonify({'error': 'image_url and prompt are required'}), 400
     model_key = data.get('model', 'nano-banana-2')
+    user_id = verify_token(get_auth_header())
     try:
         result = _img_edit(image_url, prompt, model_key=model_key)
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("""
+                    INSERT INTO image_gen_log (user_id, prompt, model_key, model_id, url, cost_usd, elapsed_s, operation, error_msg)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,'edit',%s)
+                """, (user_id, prompt, result.get('model_key'), result.get('model_id'),
+                      result.get('url'), result.get('cost_usd'), result.get('elapsed_s'),
+                      result.get('error')))
+        except Exception:
+            pass
         return jsonify(result)
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
@@ -19715,6 +19778,46 @@ def api_image_enhance_prompt():
         return jsonify({'error': 'prompt is required'}), 400
     result = _img_enhance_prompt(prompt)
     return jsonify(result)
+
+
+@app.route('/api/images/history', methods=['GET'])
+@require_role('client')
+def api_image_history():
+    """Paginated history of generated/edited images for the authenticated user."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    page = max(1, int(request.args.get('page', 1)))
+    per_page = min(100, int(request.args.get('per_page', 20)))
+    offset = (page - 1) * per_page
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM image_gen_log WHERE user_id=%s", (user_id,))
+            total = c.fetchone()[0]
+            c.execute("""
+                SELECT id, prompt, model_key, url, cost_usd, elapsed_s, aspect_ratio, operation, error_msg, created_at
+                FROM image_gen_log WHERE user_id=%s
+                ORDER BY created_at DESC LIMIT %s OFFSET %s
+            """, (user_id, per_page, offset))
+            items = []
+            for row in c.fetchall():
+                items.append({
+                    'id': row[0],
+                    'prompt': row[1],
+                    'model_key': row[2],
+                    'url': row[3],
+                    'cost_usd': float(row[4]) if row[4] else None,
+                    'elapsed_s': float(row[5]) if row[5] else None,
+                    'aspect_ratio': row[6],
+                    'operation': row[7],
+                    'error_msg': row[8],
+                    'created_at': row[9].isoformat() if row[9] else None,
+                })
+        return jsonify({'total': total, 'page': page, 'per_page': per_page,
+                        'pages': max(1, (total + per_page - 1) // per_page), 'items': items})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/images/health', methods=['GET'])

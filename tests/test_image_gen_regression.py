@@ -259,3 +259,31 @@ class TestEnhancePromptEndpoint:
         assert resp.status_code == 200
         body = resp.json()
         assert body["enhanced"] is not None
+
+
+# ── /api/images/history ────────────────────────────────────────────────────────
+class TestImageHistoryEndpoint:
+    def test_requires_auth(self):
+        resp = requests.get(f"{API_BASE}/api/images/history", timeout=10)
+        assert resp.status_code == 401
+
+    def test_returns_paginated_structure(self, auth_headers):
+        resp = requests.get(f"{API_BASE}/api/images/history", headers=auth_headers, timeout=10)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "total" in data
+        assert "page" in data
+        assert "per_page" in data
+        assert "pages" in data
+        assert "items" in data
+        assert isinstance(data["items"], list)
+
+    def test_items_have_correct_schema(self, auth_headers):
+        resp = requests.get(f"{API_BASE}/api/images/history", headers=auth_headers, timeout=10)
+        assert resp.status_code == 200
+        for item in resp.json()["items"]:
+            assert "id" in item
+            assert "prompt" in item
+            assert "url" in item or item.get("error_msg")
+            assert "created_at" in item
+            assert "operation" in item
