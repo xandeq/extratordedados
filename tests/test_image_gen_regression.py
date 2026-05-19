@@ -63,10 +63,10 @@ class TestModelsEndpoint:
         body = resp.json()
         assert "models" in body
 
-    def test_has_seven_models(self, auth_headers):
+    def test_has_ten_models(self, auth_headers):
         resp = requests.get(f"{API_BASE}/api/images/models", headers=auth_headers, timeout=10)
         body = resp.json()
-        assert len(body["models"]) == 7
+        assert len(body["models"]) == 10  # 7 FAL.AI + 3 OpenRouter
 
     def test_models_have_correct_schema(self, auth_headers):
         resp = requests.get(f"{API_BASE}/api/images/models", headers=auth_headers, timeout=10)

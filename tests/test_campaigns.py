@@ -7,15 +7,9 @@ BASE = "https://api.extratordedados.com.br"
 
 
 @pytest.fixture(scope="module")
-def token():
-    r = requests.post(f"{BASE}/api/login", json={"username": "admin", "password": "1982Xandeq1982#"}, timeout=10)
-    assert r.status_code == 200
-    return r.json()["token"]
-
-
-@pytest.fixture(scope="module")
-def auth(token):
-    return {"Authorization": f"Bearer {token}"}
+def auth(auth_headers):
+    """Re-export session-scoped auth_headers for module-scoped fixtures below."""
+    return auth_headers
 
 
 # ─── Auth boundary ─────────────────────────────────────────────────────────
@@ -175,3 +169,82 @@ def test_image_models_returns_list(auth):
     data = r.json()
     assert "models" in data
     assert len(data["models"]) > 0
+
+
+# ─── Campaign log endpoint ─────────────────────────────────────────────────
+
+def test_campaign_log_no_auth(campaign_id):
+    r = requests.get(f"{BASE}/api/campaigns/{campaign_id}/log", timeout=10)
+    assert r.status_code == 401
+
+
+def test_campaign_log_returns_paginated_data(auth, campaign_id):
+    r = requests.get(f"{BASE}/api/campaigns/{campaign_id}/log", headers=auth, timeout=10)
+    assert r.status_code == 200
+    data = r.json()
+    assert "total" in data
+    assert "page" in data
+    assert "per_page" in data
+    assert "pages" in data
+    assert "items" in data
+    assert isinstance(data["items"], list)
+
+
+def test_campaign_log_item_fields(auth, campaign_id):
+    r = requests.get(f"{BASE}/api/campaigns/{campaign_id}/log", headers=auth, timeout=10)
+    assert r.status_code == 200
+    items = r.json()["items"]
+    if items:
+        item = items[0]
+        for field in ("id", "email", "provider", "status", "sent_at"):
+            assert field in item, f"Missing field: {field}"
+
+
+def test_campaign_log_status_filter(auth, campaign_id):
+    r = requests.get(f"{BASE}/api/campaigns/{campaign_id}/log?status=sent", headers=auth, timeout=10)
+    assert r.status_code == 200
+    data = r.json()
+    for item in data["items"]:
+        assert item["status"] == "sent"
+
+
+def test_campaign_log_nonexistent_returns_404(auth):
+    r = requests.get(f"{BASE}/api/campaigns/999999/log", headers=auth, timeout=10)
+    assert r.status_code == 404
+
+
+# ─── Bounce webhooks ─────────────────────────────────────────────────────────
+
+def test_brevo_webhook_unknown_event_is_ignored():
+    r = requests.post(f"{BASE}/api/webhooks/bounces/brevo",
+                      json={"event": "delivered", "email": "test@test.com"}, timeout=10)
+    assert r.status_code == 200
+    assert r.json().get("skipped") is True
+
+
+def test_brevo_webhook_hard_bounce_accepted():
+    r = requests.post(f"{BASE}/api/webhooks/bounces/brevo",
+                      json={"event": "hard_bounce", "email": "nonexistent_bounce_test@example.com"}, timeout=10)
+    assert r.status_code == 200
+    assert "updated" in r.json()
+
+
+def test_resend_webhook_unknown_event_is_ignored():
+    r = requests.post(f"{BASE}/api/webhooks/bounces/resend",
+                      json={"type": "email.sent", "data": {"to": ["test@test.com"]}}, timeout=10)
+    assert r.status_code == 200
+    assert r.json().get("skipped") is True
+
+
+def test_resend_webhook_bounce_accepted():
+    r = requests.post(f"{BASE}/api/webhooks/bounces/resend",
+                      json={"type": "email.bounced",
+                            "data": {"to": ["nonexistent_bounce_test@example.com"]}}, timeout=10)
+    assert r.status_code == 200
+    assert "updated" in r.json()
+
+
+def test_resend_webhook_missing_email_returns_400():
+    r = requests.post(f"{BASE}/api/webhooks/bounces/resend",
+                      json={"type": "email.bounced", "data": {}}, timeout=10)
+    assert r.status_code == 400

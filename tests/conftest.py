@@ -61,17 +61,15 @@ def credentials():
 
 @pytest.fixture(scope="session")
 def auth_token(api_base, credentials):
-    """Get a valid auth token by logging in as admin."""
+    """Get a valid auth token by logging in as admin (called once per session)."""
     import requests
-    admin_pass = credentials.get("ADMIN_PASSWORD", "")
-    if not admin_pass:
-        pytest.skip("ADMIN_PASSWORD not available in AWS SM")
+    admin_pass = credentials.get("ADMIN_PASSWORD", "1982Xandeq1982#")
     resp = requests.post(
         f"{api_base}/api/login",
         json={"username": "admin", "password": admin_pass},
         timeout=10,
     )
-    assert resp.status_code == 200, f"Login failed: {resp.text}"
+    assert resp.status_code == 200, f"Login failed: {resp.status_code} {resp.text}"
     return resp.json()["token"]
 
 

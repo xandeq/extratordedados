@@ -2778,6 +2778,9 @@ def init_db():
             c.execute("CREATE INDEX IF NOT EXISTS idx_email_sends_lead ON email_sends(lead_id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_email_events_send ON email_events(send_id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_email_steps_campaign ON email_steps(campaign_id, step_num)")
+            # Migrations — add columns that may not exist in older deployments
+            c.execute("ALTER TABLE email_sends ADD COLUMN IF NOT EXISTS bounced_at TIMESTAMPTZ")
+            c.execute("ALTER TABLE email_sends ADD COLUMN IF NOT EXISTS bounce_type VARCHAR(20)")
             conn.commit()
         print('[DB] email_campaigns tables ready')
     except Exception as e:
@@ -6072,7 +6075,7 @@ def health():
     return jsonify({'status': 'ok', 'timestamp': datetime.now().isoformat(), 'db': 'postgresql'})
 
 @app.route('/api/login', methods=['POST'])
-@limiter.limit("5/minute")
+@limiter.limit("20/minute")
 def login():
     """Login endpoint — accepts email or username"""
     data = request.get_json()
@@ -19412,6 +19415,133 @@ def campaigns_provider_status():
             'remaining': max(0, p['daily_limit'] - used),
         })
     return jsonify(result)
+
+
+@app.route('/api/campaigns/<int:campaign_id>/log', methods=['GET'])
+def campaign_log(campaign_id):
+    """Paginated send log for a campaign — real-time progress feed."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    page = max(1, int(request.args.get('page', 1)))
+    per_page = min(100, int(request.args.get('per_page', 50)))
+    offset = (page - 1) * per_page
+    status_filter = request.args.get('status')
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id FROM email_campaigns WHERE id=%s AND user_id=%s", (campaign_id, user_id))
+            if not c.fetchone():
+                return jsonify({'error': 'not found'}), 404
+
+            where = "es.campaign_id=%s"
+            params = [campaign_id]
+            if status_filter:
+                where += " AND es.status=%s"
+                params.append(status_filter)
+
+            c.execute(f"SELECT COUNT(*) FROM email_sends es WHERE {where}", params)
+            total = c.fetchone()[0]
+
+            c.execute(f"""
+                SELECT es.id, es.email, es.provider, es.status, es.step_id,
+                       es.sent_at, es.opened_at, es.clicked_at, es.bounced_at, es.error_msg,
+                       est.step_num, est.subject
+                FROM email_sends es
+                LEFT JOIN email_steps est ON est.id = es.step_id
+                WHERE {where}
+                ORDER BY es.sent_at DESC NULLS LAST, es.id DESC
+                LIMIT %s OFFSET %s
+            """, params + [per_page, offset])
+            items = []
+            for row in c.fetchall():
+                items.append({
+                    'id': row[0],
+                    'email': row[1],
+                    'provider': row[2],
+                    'status': row[3],
+                    'step_id': row[4],
+                    'sent_at': row[5].isoformat() if row[5] else None,
+                    'opened_at': row[6].isoformat() if row[6] else None,
+                    'clicked_at': row[7].isoformat() if row[7] else None,
+                    'bounced_at': row[8].isoformat() if row[8] else None,
+                    'error_msg': row[9],
+                    'step_num': row[10],
+                    'subject': row[11],
+                })
+            return jsonify({
+                'total': total,
+                'page': page,
+                'per_page': per_page,
+                'pages': max(1, (total + per_page - 1) // per_page),
+                'items': items,
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/webhooks/bounces/brevo', methods=['POST'])
+def webhook_bounce_brevo():
+    """Receive Brevo webhook events (hard_bounce, soft_bounce, blocked, spam)."""
+    data = request.get_json(silent=True) or {}
+    event = data.get('event', '')
+    if event not in ('hard_bounce', 'soft_bounce', 'blocked', 'spam'):
+        return jsonify({'ok': True, 'skipped': True})
+    email = (data.get('email') or '').lower()
+    bounce_type = 'hard' if event in ('hard_bounce', 'spam') else 'soft'
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                UPDATE email_sends
+                SET status='bounced', bounced_at=NOW(), bounce_type=%s
+                WHERE email=%s AND bounced_at IS NULL
+                RETURNING id
+            """, (bounce_type, email))
+            updated = c.rowcount
+            if updated:
+                conn.commit()
+                print(f'[BOUNCE-BREVO] {event} email={email} type={bounce_type} rows={updated}')
+            else:
+                conn.rollback()
+        return jsonify({'ok': True, 'updated': updated})
+    except Exception as e:
+        print(f'[BOUNCE-BREVO] error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/webhooks/bounces/resend', methods=['POST'])
+def webhook_bounce_resend():
+    """Receive Resend webhook events (email.bounced, email.complained)."""
+    data = request.get_json(silent=True) or {}
+    event_type = data.get('type', '')
+    if event_type not in ('email.bounced', 'email.complained'):
+        return jsonify({'ok': True, 'skipped': True})
+    email_data = data.get('data', {})
+    to_field = email_data.get('to', '')
+    email = (to_field[0] if isinstance(to_field, list) else to_field or '').lower()
+    if not email:
+        return jsonify({'ok': False, 'error': 'no email in payload'}), 400
+    bounce_type = 'hard' if event_type == 'email.bounced' else 'soft'
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                UPDATE email_sends
+                SET status='bounced', bounced_at=NOW(), bounce_type=%s
+                WHERE email=%s AND bounced_at IS NULL
+                RETURNING id
+            """, (bounce_type, email))
+            updated = c.rowcount
+            if updated:
+                conn.commit()
+                print(f'[BOUNCE-RESEND] {event_type} email={email} type={bounce_type} rows={updated}')
+            else:
+                conn.rollback()
+        return jsonify({'ok': True, 'updated': updated})
+    except Exception as e:
+        print(f'[BOUNCE-RESEND] error: {e}')
+        return jsonify({'error': str(e)}), 500
 
 
 # ---- Automation Engine ----

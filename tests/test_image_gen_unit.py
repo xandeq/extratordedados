@@ -261,7 +261,7 @@ class TestEditImage:
         return mock_resp
 
     def test_passes_image_url_to_api(self):
-        source_url = "https://example.com/source.jpg"
+        source_url = "https://fal.media/files/test/source_image.jpg"
         with patch.object(image_gen, '_get_fal_key', return_value="test-key"):
             with patch('image_gen.requests.post', return_value=self._mock_fal()) as mock_post:
                 image_gen.edit_image(source_url, "make it brighter")
@@ -271,19 +271,19 @@ class TestEditImage:
     def test_uses_editing_capable_model(self):
         with patch.object(image_gen, '_get_fal_key', return_value="test-key"):
             with patch('image_gen.requests.post', return_value=self._mock_fal()) as mock_post:
-                image_gen.edit_image("https://x.com/img.jpg", "edit it", model_key="nano-banana-2")
+                image_gen.edit_image("https://fal.media/files/test/img.jpg", "edit it", model_key="nano-banana-2")
                 call_url = mock_post.call_args[0][0]
                 assert "nano-banana" in call_url
 
     def test_falls_back_to_editing_model_when_non_editing_requested(self):
         with patch.object(image_gen, '_get_fal_key', return_value="test-key"):
             with patch('image_gen.requests.post', return_value=self._mock_fal()) as mock_post:
-                image_gen.edit_image("https://x.com/img.jpg", "edit it", model_key="flux-schnell")
+                image_gen.edit_image("https://fal.media/files/test/img.jpg", "edit it", model_key="flux-schnell")
                 call_url = mock_post.call_args[0][0]
                 assert "nano-banana" in call_url
 
     def test_result_includes_source_image_url(self):
-        source_url = "https://example.com/source.jpg"
+        source_url = "https://fal.media/files/test/source_image.jpg"
         with patch.object(image_gen, '_get_fal_key', return_value="test-key"):
             with patch('image_gen.requests.post', return_value=self._mock_fal()):
                 result = image_gen.edit_image(source_url, "make brighter")
@@ -292,7 +292,7 @@ class TestEditImage:
     def test_result_has_url(self):
         with patch.object(image_gen, '_get_fal_key', return_value="test-key"):
             with patch('image_gen.requests.post', return_value=self._mock_fal()):
-                result = image_gen.edit_image("https://x.com/img.jpg", "edit it")
+                result = image_gen.edit_image("https://fal.media/files/test/img.jpg", "edit it")
         assert result.get("url") == FAKE_IMAGE_URL
 
 
