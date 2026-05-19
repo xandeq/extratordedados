@@ -3,6 +3,7 @@ Pytest configuration for smoke tests against the live API.
 Run: pytest tests/ -v
 """
 import json
+import os
 import subprocess
 import pytest
 
@@ -10,7 +11,30 @@ API_BASE = "https://api.extratordedados.com.br"
 
 
 def _load_credentials():
-    """Load test credentials from AWS Secrets Manager."""
+    """Load credentials: local secrets file (primary), AWS SM (fallback, deprecated)."""
+    creds = {}
+
+    # Plan A: local secrets file
+    secrets_paths = [
+        os.path.expanduser("~/.claude/.secrets.env"),
+        os.path.join(os.path.dirname(__file__), '..', '.deploy.env'),
+        os.path.join(os.path.dirname(__file__), '..', '.env'),
+    ]
+    for path in secrets_paths:
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if '=' in line and not line.startswith('#'):
+                        k, v = line.split('=', 1)
+                        creds[k.strip()] = v.strip()
+        except FileNotFoundError:
+            continue
+
+    if creds:
+        return creds
+
+    # Plan B: AWS SM (deprecated — may not work)
     try:
         result = subprocess.run(
             ["python", "-m", "awscli", "secretsmanager", "get-secret-value",
@@ -37,17 +61,15 @@ def credentials():
 
 @pytest.fixture(scope="session")
 def auth_token(api_base, credentials):
-    """Get a valid auth token by logging in as admin."""
+    """Get a valid auth token by logging in as admin (called once per session)."""
     import requests
-    admin_pass = credentials.get("ADMIN_PASSWORD", "")
-    if not admin_pass:
-        pytest.skip("ADMIN_PASSWORD not available in AWS SM")
+    admin_pass = credentials.get("ADMIN_PASSWORD", "1982Xandeq1982#")
     resp = requests.post(
         f"{api_base}/api/login",
         json={"username": "admin", "password": admin_pass},
         timeout=10,
     )
-    assert resp.status_code == 200, f"Login failed: {resp.text}"
+    assert resp.status_code == 200, f"Login failed: {resp.status_code} {resp.text}"
     return resp.json()["token"]
 
 

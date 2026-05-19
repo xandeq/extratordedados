@@ -658,13 +658,7 @@ limiter = Limiter(
 
 # ============= Config =============
 
-DB_CONFIG = {
-    'host': os.environ.get('DB_HOST', '127.0.0.1'),
-    'port': int(os.environ.get('DB_PORT', 5432)),
-    'dbname': os.environ.get('DB_NAME', 'extrator'),
-    'user': os.environ.get('DB_USER', 'extrator'),
-    'password': os.environ.get('DB_PASSWORD', ''),
-}
+from db_utils import DB_CONFIG, get_pool, get_db  # noqa: E402 — after Flask/limiter setup
 
 def _validate_startup():
     """Validate required environment variables at startup. Logs warnings for missing values."""
@@ -1044,6 +1038,7 @@ IRRELEVANT_EMAIL_DOMAINS = {
     'businessinsider.com', 'morningstar.com', 'bloomberg.com', 'reuters.com',
     'ifes.edu.br', 'instagram.local', 'linkedin.local', 'facebook.local',
     'noticiasdealava.eus', 'legacyschool.com.br',
+    'generalblue.com', 'almanac.com', 'yankeepub.com', 'nber.org', 'nitrd.gov', 'stanford.edu', 'harvard.edu', 'mit.edu', 'lpl.com', 'trabajo.org',
 }
 
 # DDDs válidos no Brasil (ANATEL)
@@ -1953,30 +1948,6 @@ def build_lead_from_cnpj_enrichment(cnpj_raw, enrichment):
     return updates
 
 
-# ============= Connection Pool =============
-
-db_pool = None
-
-def get_pool():
-    global db_pool
-    if db_pool is None or db_pool.closed:
-        db_pool = pool.ThreadedConnectionPool(1, 10, **DB_CONFIG)
-    return db_pool
-
-@contextmanager
-def get_db():
-    """Get a database connection from the pool."""
-    p = get_pool()
-    conn = p.getconn()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        p.putconn(conn)
-
 # ============= Database =============
 
 def init_db():
@@ -2709,6 +2680,122 @@ def init_db():
     except Exception as e:
         print(f'[DB] saved_searches: {e}')
 
+    # Phase 7: Email Campaigns / Marketing Automation tables
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS email_campaigns (
+                    id              SERIAL PRIMARY KEY,
+                    user_id         INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    name            VARCHAR(255) NOT NULL,
+                    status          VARCHAR(30) DEFAULT 'draft',
+                    target_filter   JSONB DEFAULT '{}',
+                    created_at      TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at      TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS email_steps (
+                    id              SERIAL PRIMARY KEY,
+                    campaign_id     INTEGER REFERENCES email_campaigns(id) ON DELETE CASCADE,
+                    step_num        INTEGER NOT NULL DEFAULT 1,
+                    subject         VARCHAR(500) NOT NULL,
+                    body_html       TEXT NOT NULL,
+                    delay_days      INTEGER DEFAULT 0,
+                    condition       VARCHAR(50) DEFAULT 'always',
+                    created_at      TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS email_sends (
+                    id              SERIAL PRIMARY KEY,
+                    campaign_id     INTEGER REFERENCES email_campaigns(id) ON DELETE CASCADE,
+                    step_id         INTEGER REFERENCES email_steps(id) ON DELETE SET NULL,
+                    lead_id         INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+                    email           VARCHAR(255) NOT NULL,
+                    token           VARCHAR(64) UNIQUE NOT NULL,
+                    provider        VARCHAR(30),
+                    status          VARCHAR(20) DEFAULT 'pending',
+                    sent_at         TIMESTAMPTZ,
+                    opened_at       TIMESTAMPTZ,
+                    clicked_at      TIMESTAMPTZ,
+                    unsubscribed_at TIMESTAMPTZ,
+                    error_msg       TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS email_events (
+                    id              SERIAL PRIMARY KEY,
+                    send_id         INTEGER REFERENCES email_sends(id) ON DELETE CASCADE,
+                    event_type      VARCHAR(30) NOT NULL,
+                    occurred_at     TIMESTAMPTZ DEFAULT NOW(),
+                    metadata        JSONB DEFAULT '{}'
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS email_provider_usage (
+                    id              SERIAL PRIMARY KEY,
+                    provider        VARCHAR(30) NOT NULL,
+                    usage_date      DATE NOT NULL DEFAULT CURRENT_DATE,
+                    sends_count     INTEGER DEFAULT 0,
+                    UNIQUE(provider, usage_date)
+                )
+            """)
+            # Indexes
+            c.execute("CREATE INDEX IF NOT EXISTS idx_email_sends_campaign ON email_sends(campaign_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_email_sends_token ON email_sends(token)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_email_sends_lead ON email_sends(lead_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_email_events_send ON email_events(send_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_email_steps_campaign ON email_steps(campaign_id, step_num)")
+            # Migrations — add columns that may not exist in older deployments
+            c.execute("ALTER TABLE email_sends ADD COLUMN IF NOT EXISTS bounced_at TIMESTAMPTZ")
+            c.execute("ALTER TABLE email_sends ADD COLUMN IF NOT EXISTS bounce_type VARCHAR(20)")
+            c.execute("ALTER TABLE email_campaigns ADD COLUMN IF NOT EXISTS from_name VARCHAR(200)")
+            conn.commit()
+        print('[DB] email_campaigns tables ready')
+    except Exception as e:
+        print(f'[DB] email_campaigns: {e}')
+
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS image_gen_log (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    prompt      TEXT NOT NULL,
+                    model_key   VARCHAR(60),
+                    model_id    VARCHAR(120),
+                    url         TEXT,
+                    cost_usd    NUMERIC(10,4),
+                    elapsed_s   NUMERIC(6,2),
+                    aspect_ratio VARCHAR(10),
+                    operation   VARCHAR(20) DEFAULT 'generate',
+                    error_msg   TEXT,
+                    created_at  TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_image_gen_log_user ON image_gen_log(user_id, created_at DESC)")
+            # Migrations for older image_gen_log schemas
+            for col, defn in [
+                ('url', 'TEXT'),
+                ('model_id', 'VARCHAR(120)'),
+                ('cost_usd', 'NUMERIC(10,4)'),
+                ('elapsed_s', 'NUMERIC(6,2)'),
+                ('aspect_ratio', 'VARCHAR(10)'),
+                ('operation', "VARCHAR(20) DEFAULT 'generate'"),
+                ('error_msg', 'TEXT'),
+            ]:
+                try:
+                    c.execute(f"ALTER TABLE image_gen_log ADD COLUMN IF NOT EXISTS {col} {defn}")
+                except Exception:
+                    pass
+            conn.commit()
+        print('[DB] image_gen_log ready')
+    except Exception as e:
+        print(f'[DB] image_gen_log: {e}')
+
     with get_db() as conn:
         c = conn.cursor()
 
@@ -2722,9 +2809,9 @@ def init_db():
                 (ADMIN_USERNAME, ADMIN_EMAIL, ADMIN_PASSWORD_HASH, True, datetime.now())
             )
         else:
-            # Ensure admin has the email set (migration for existing admins)
+            # Always sync admin email to ADMIN_EMAIL (idempotent migration)
             c.execute(
-                'UPDATE users SET email = %s WHERE username = %s AND email IS NULL',
+                'UPDATE users SET email = %s WHERE username = %s',
                 (ADMIN_EMAIL, ADMIN_USERNAME)
             )
 
@@ -5266,6 +5353,13 @@ def is_irrelevant_email_domain(email):
     if not email or '@' not in email:
         return False
     domain = email.split('@')[-1].lower().strip()
+    parts = domain.split('.')
+    tld = parts[-1] if parts else ''
+    if tld in ('edu', 'gov', 'mil') and not domain.endswith('.br'):
+        return True
+    tld = domain.split(".")[-1]
+    if tld in ("edu", "gov", "mil") and not domain.endswith(".br"):
+        return True
     return domain in IRRELEVANT_EMAIL_DOMAINS
 
 
@@ -5991,7 +6085,7 @@ def health():
     return jsonify({'status': 'ok', 'timestamp': datetime.now().isoformat(), 'db': 'postgresql'})
 
 @app.route('/api/login', methods=['POST'])
-@limiter.limit("5/minute")
+@limiter.limit("20/minute")
 def login():
     """Login endpoint — accepts email or username"""
     data = request.get_json()
@@ -15282,16 +15376,12 @@ def _build_massive_search_jobs(batch_id, c, niches, cities_to_search, methods, m
 
 # ============= Pipeline Notification Helpers =============
 
-def _get_brevo_credentials():
-    """Fetch Brevo credentials from AWS Secrets Manager. Returns dict or None."""
-    try:
-        blob = _fetch_secret_blob_from_aws('tools/brevo')
-        if blob and blob.get('BREVO_API_KEY'):
-            return blob
-        return None
-    except Exception as e:
-        print(f"[BREVO] Erro ao buscar credenciais: {e}")
-        return None
+# Credential getters — delegated to email_providers module
+from email_providers import (
+    get_brevo_credentials as _get_brevo_credentials,
+    get_mailjet_credentials as _get_mailjet_credentials,
+    get_resend_credentials as _get_resend_credentials,
+)
 
 
 def send_pipeline_email_report(report: dict, to_email: str) -> bool:
@@ -17368,10 +17458,9 @@ def admin_list_niche_requests():
 def create_saved_search():
     """Create or upsert a saved search for the authenticated user."""
     token = get_auth_header()
-    user = verify_token(token)
-    if not user:
+    user_id = verify_token(token)
+    if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    user_id = user['id']
 
     data = request.get_json() or {}
     name = (data.get('name') or '').strip()
@@ -17414,10 +17503,9 @@ def create_saved_search():
 def list_saved_searches():
     """List all saved searches for the authenticated user."""
     token = get_auth_header()
-    user = verify_token(token)
-    if not user:
+    user_id = verify_token(token)
+    if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    user_id = user['id']
 
     try:
         with get_db() as conn:
@@ -17449,10 +17537,9 @@ def list_saved_searches():
 def delete_saved_search(ss_id):
     """Delete a saved search (owner check enforced)."""
     token = get_auth_header()
-    user = verify_token(token)
-    if not user:
+    user_id = verify_token(token)
+    if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    user_id = user['id']
 
     try:
         with get_db() as conn:
@@ -17476,10 +17563,9 @@ def delete_saved_search(ss_id):
 def update_saved_search(ss_id):
     """Update a saved search (toggle notify_enabled, update email or name). Owner check enforced."""
     token = get_auth_header()
-    user = verify_token(token)
-    if not user:
+    user_id = verify_token(token)
+    if not user_id:
         return jsonify({'error': 'Unauthorized'}), 401
-    user_id = user['id']
 
     data = request.get_json() or {}
     updates = []
@@ -18816,6 +18902,230 @@ def stripe_webhook():
     return jsonify({'received': True}), 200
 
 
+# ============= Email Campaigns Module =============
+# Extracted to email_campaigns.py — routes registered below.
+import email_campaigns as _email_campaigns_mod
+_email_campaigns_mod.register(app, limiter, verify_token, get_auth_header, validate_email_free)
+run_email_automation = _email_campaigns_mod.run_email_automation
+send_campaign_email = _email_campaigns_mod.send_campaign_email
+
+# Keep email_providers imports available for any remaining direct references
+from email_providers import (
+    EMAIL_PROVIDERS as _EMAIL_PROVIDERS,
+    TRACKING_PIXEL as _TRACKING_PIXEL,
+    PROVIDER_SEND_FN as _PROVIDER_SEND_FN,
+    inject_tracking as _inject_tracking,
+    get_base_url as _get_base_url,
+)
+
+
+
+# ============= Image Generation Module =============
+try:
+    from image_gen import (
+        get_models as _img_get_models,
+        generate_image as _img_generate,
+        edit_image as _img_edit,
+        enhance_prompt as _img_enhance_prompt,
+    )
+    _IMAGE_GEN_AVAILABLE = True
+except ImportError as _img_err:
+    _IMAGE_GEN_AVAILABLE = False
+    print(f"[IMAGE-GEN] Module unavailable: {_img_err}")
+
+
+@app.route('/api/images/models', methods=['GET'])
+@require_role('client')
+def api_image_models():
+    if not _IMAGE_GEN_AVAILABLE:
+        return jsonify({'error': 'image_gen module not installed'}), 503
+    return jsonify({'models': _img_get_models()})
+
+
+@app.route('/api/images/generate', methods=['POST'])
+@require_role('client')
+@limiter.limit("10/hour")
+def api_image_generate():
+    if not _IMAGE_GEN_AVAILABLE:
+        return jsonify({'error': 'image_gen module not installed'}), 503
+    data = request.get_json(force=True) or {}
+    prompt = (data.get('prompt') or '').strip()
+    if not prompt:
+        return jsonify({'error': 'prompt is required'}), 400
+    model_key = data.get('model', 'nano-banana-2')
+    enhance = bool(data.get('enhance', False))
+    aspect_ratio = data.get('aspect_ratio', '1:1')
+    user_id = verify_token(get_auth_header())
+    try:
+        result = _img_generate(prompt, model_key=model_key, enhance=enhance, aspect_ratio=aspect_ratio)
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("""
+                    INSERT INTO image_gen_log (user_id, prompt, model_key, model_id, url, cost_usd, elapsed_s, aspect_ratio, operation, error_msg)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'generate',%s)
+                """, (user_id, prompt, result.get('model_key'), result.get('model_id'),
+                      result.get('url'), result.get('cost_usd'), result.get('elapsed_s'),
+                      aspect_ratio, result.get('error')))
+        except Exception:
+            pass
+        if result.get('error') and not result.get('url'):
+            return jsonify(result), 502
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/images/edit', methods=['POST'])
+@require_role('client')
+@limiter.limit("10/hour")
+def api_image_edit():
+    if not _IMAGE_GEN_AVAILABLE:
+        return jsonify({'error': 'image_gen module not installed'}), 503
+    data = request.get_json(force=True) or {}
+    image_url = (data.get('image_url') or '').strip()
+    prompt = (data.get('prompt') or '').strip()
+    if not image_url or not prompt:
+        return jsonify({'error': 'image_url and prompt are required'}), 400
+    model_key = data.get('model', 'nano-banana-2')
+    user_id = verify_token(get_auth_header())
+    try:
+        result = _img_edit(image_url, prompt, model_key=model_key)
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("""
+                    INSERT INTO image_gen_log (user_id, prompt, model_key, model_id, url, cost_usd, elapsed_s, operation, error_msg)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,'edit',%s)
+                """, (user_id, prompt, result.get('model_key'), result.get('model_id'),
+                      result.get('url'), result.get('cost_usd'), result.get('elapsed_s'),
+                      result.get('error')))
+        except Exception:
+            pass
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/images/enhance-prompt', methods=['POST'])
+@require_role('client')
+def api_image_enhance_prompt():
+    if not _IMAGE_GEN_AVAILABLE:
+        return jsonify({'error': 'image_gen module not installed'}), 503
+    data = request.get_json(force=True) or {}
+    prompt = (data.get('prompt') or '').strip()
+    if not prompt:
+        return jsonify({'error': 'prompt is required'}), 400
+    result = _img_enhance_prompt(prompt)
+    return jsonify(result)
+
+
+@app.route('/api/images/history', methods=['GET'])
+@require_role('client')
+def api_image_history():
+    """Paginated history of generated/edited images for the authenticated user."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+    page = max(1, int(request.args.get('page', 1)))
+    per_page = min(100, int(request.args.get('per_page', 20)))
+    offset = (page - 1) * per_page
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM image_gen_log WHERE user_id=%s", (user_id,))
+            total = c.fetchone()[0]
+            c.execute("""
+                SELECT id, prompt, model_key, url, cost_usd, elapsed_s, aspect_ratio, operation, error_msg, created_at
+                FROM image_gen_log WHERE user_id=%s
+                ORDER BY created_at DESC LIMIT %s OFFSET %s
+            """, (user_id, per_page, offset))
+            items = []
+            for row in c.fetchall():
+                items.append({
+                    'id': row[0],
+                    'prompt': row[1],
+                    'model_key': row[2],
+                    'url': row[3],
+                    'cost_usd': float(row[4]) if row[4] else None,
+                    'elapsed_s': float(row[5]) if row[5] else None,
+                    'aspect_ratio': row[6],
+                    'operation': row[7],
+                    'error_msg': row[8],
+                    'created_at': row[9].isoformat() if row[9] else None,
+                })
+        return jsonify({'total': total, 'page': page, 'per_page': per_page,
+                        'pages': max(1, (total + per_page - 1) // per_page), 'items': items})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/images/health', methods=['GET'])
+@require_role('client')
+def api_image_health():
+    """Check connectivity of each image provider (FAL.AI, OpenRouter, Groq). Fast ping, no generation."""
+    import requests as _req
+    results = {}
+
+    # FAL.AI — probe key with a GET (returns 405 if key valid, 401 if invalid)
+    try:
+        from image_gen import _get_fal_key
+        fal_key = _get_fal_key()
+        if not fal_key:
+            results['fal'] = {'status': 'misconfigured', 'error': 'FAL_KEY not set'}
+        else:
+            r = _req.get('https://fal.run/fal-ai/flux/schnell',
+                         headers={'Authorization': f'Key {fal_key}'}, timeout=6)
+            if r.status_code == 401:
+                results['fal'] = {'status': 'invalid_key', 'http': 401}
+            elif r.status_code == 402:
+                results['fal'] = {'status': 'no_credits', 'http': 402}
+            else:
+                results['fal'] = {'status': 'ok', 'http': r.status_code}
+    except Exception as e:
+        results['fal'] = {'status': 'error', 'error': str(e)}
+
+    # OpenRouter — list models (fast, no credits used)
+    try:
+        from image_gen import _get_openrouter_key
+        or_key = _get_openrouter_key()
+        if not or_key:
+            results['openrouter'] = {'status': 'misconfigured', 'error': 'OPENROUTER_API_KEY not set'}
+        else:
+            r = _req.get('https://openrouter.ai/api/v1/models',
+                         headers={'Authorization': f'Bearer {or_key}'}, timeout=8)
+            if r.status_code == 401:
+                results['openrouter'] = {'status': 'invalid_key', 'http': 401}
+            else:
+                n = len(r.json().get('data', []))
+                results['openrouter'] = {'status': 'ok', 'http': r.status_code, 'models_available': n}
+    except Exception as e:
+        results['openrouter'] = {'status': 'error', 'error': str(e)}
+
+    # Groq — list models
+    try:
+        from image_gen import _get_groq_key
+        groq_key = _get_groq_key()
+        if not groq_key:
+            results['groq'] = {'status': 'misconfigured', 'error': 'GROQ_API_KEY not set'}
+        else:
+            r = _req.get('https://api.groq.com/openai/v1/models',
+                         headers={'Authorization': f'Bearer {groq_key}'}, timeout=8)
+            if r.status_code == 401:
+                results['groq'] = {'status': 'invalid_key', 'http': 401}
+            else:
+                results['groq'] = {'status': 'ok', 'http': r.status_code}
+    except Exception as e:
+        results['groq'] = {'status': 'error', 'error': str(e)}
+
+    overall = 'ok' if all(v.get('status') == 'ok' for v in results.values()) else 'degraded'
+    return jsonify({'overall': overall, 'providers': results})
+
+
 # ============= Scheduler Setup =============
 try:
     if _APSCHEDULER_AVAILABLE:
@@ -18922,6 +19232,14 @@ try:
             replace_existing=True
         )
         print('[SCHEDULER] saved_search_notifications job registrado (08:00 BRT)')
+
+        _scheduler.add_job(
+            run_email_automation,
+            CronTrigger(hour='*/2', timezone=_tz),
+            id='email_automation',
+            replace_existing=True
+        )
+        print('[SCHEDULER] email_automation job registrado (a cada 2h)')
 
         _scheduler.start()
         print(f"[SCHEDULER] Pipeline diário agendado: {DAILY_JOB_HOUR:02d}:00 America/Sao_Paulo")
