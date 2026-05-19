@@ -18929,6 +18929,9 @@ _TRACKING_PIXEL = _base64.b64decode(
     'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
 )
 
+import threading as _email_threading
+_EMAIL_AUTO_LOCK = _email_threading.Lock()
+
 # Provider daily quotas (free-tier defaults)
 _EMAIL_PROVIDERS = [
     {'name': 'brevo',     'daily_limit': 300},
@@ -18993,13 +18996,20 @@ def _send_via_brevo(to_email: str, to_name: str, subject: str, html_body: str, t
         }
         if text_body:
             payload['textContent'] = text_body
-        resp = requests.post(
-            'https://api.brevo.com/v3/smtp/email',
-            headers={'api-key': api_key, 'Content-Type': 'application/json'},
-            json=payload,
-            timeout=15,
-        )
-        return resp.status_code in (200, 201)
+        for _attempt in range(2):
+            resp = requests.post(
+                'https://api.brevo.com/v3/smtp/email',
+                headers={'api-key': api_key, 'Content-Type': 'application/json'},
+                json=payload,
+                timeout=15,
+            )
+            if resp.status_code in (200, 201):
+                return True
+            if resp.status_code == 429 and _attempt == 0:
+                import time as _t; _t.sleep(1)
+                continue
+            break
+        return False
     except Exception as e:
         print(f'[EMAIL/brevo] error: {e}')
         return False
@@ -19019,13 +19029,20 @@ def _send_via_mailjet(to_email: str, to_name: str, subject: str, html_body: str,
                 'TextPart': text_body or '',
             }]
         }
-        resp = requests.post(
-            'https://api.mailjet.com/v3.1/send',
-            auth=(creds['MAILJET_API_KEY'], creds['MAILJET_API_SECRET']),
-            json=payload,
-            timeout=15,
-        )
-        return resp.status_code == 200
+        for _attempt in range(2):
+            resp = requests.post(
+                'https://api.mailjet.com/v3.1/send',
+                auth=(creds['MAILJET_API_KEY'], creds['MAILJET_API_SECRET']),
+                json=payload,
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return True
+            if resp.status_code == 429 and _attempt == 0:
+                import time as _t; _t.sleep(1)
+                continue
+            break
+        return False
     except Exception as e:
         print(f'[EMAIL/mailjet] error: {e}')
         return False
@@ -19060,13 +19077,20 @@ def _send_via_sendpulse(to_email: str, to_name: str, subject: str, html_body: st
                 'to': [{'name': to_name or to_email, 'email': to_email}],
             }
         }
-        resp = requests.post(
-            'https://api.sendpulse.com/smtp/emails',
-            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
-            json=payload,
-            timeout=15,
-        )
-        return resp.status_code in (200, 201)
+        for _attempt in range(2):
+            resp = requests.post(
+                'https://api.sendpulse.com/smtp/emails',
+                headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+                json=payload,
+                timeout=15,
+            )
+            if resp.status_code in (200, 201):
+                return True
+            if resp.status_code == 429 and _attempt == 0:
+                import time as _t; _t.sleep(1)
+                continue
+            break
+        return False
     except Exception as e:
         print(f'[EMAIL/sendpulse] error: {e}')
         return False
@@ -19085,13 +19109,20 @@ def _send_via_resend(to_email: str, to_name: str, subject: str, html_body: str, 
         }
         if text_body:
             payload['text'] = text_body
-        resp = requests.post(
-            'https://api.resend.com/emails',
-            headers={'Authorization': f'Bearer {creds["RESEND_API_KEY"]}', 'Content-Type': 'application/json'},
-            json=payload,
-            timeout=15,
-        )
-        return resp.status_code in (200, 201)
+        for _attempt in range(2):
+            resp = requests.post(
+                'https://api.resend.com/emails',
+                headers={'Authorization': f'Bearer {creds["RESEND_API_KEY"]}', 'Content-Type': 'application/json'},
+                json=payload,
+                timeout=15,
+            )
+            if resp.status_code in (200, 201):
+                return True
+            if resp.status_code == 429 and _attempt == 0:
+                import time as _t; _t.sleep(1)
+                continue
+            break
+        return False
     except Exception as e:
         print(f'[EMAIL/resend] error: {e}')
         return False
@@ -19426,6 +19457,7 @@ def _run_campaign_send_background(campaign_id: int, step_id: int, subject: str, 
             if success:
                 sent_count += 1
                 already_sent.add(email_lower)
+                import time as _time_mod; _time_mod.sleep(0.5)
             else:
                 failed_count += 1
         c.execute("UPDATE email_campaigns SET status='active', updated_at=NOW() WHERE id=%s", (campaign_id,))
@@ -19445,6 +19477,7 @@ def _run_campaign_send_background(campaign_id: int, step_id: int, subject: str, 
 
 
 @app.route('/api/campaigns/<int:campaign_id>/send', methods=['POST'])
+@limiter.limit("5/hour")
 def send_campaign(campaign_id):
     """Queue campaign step-1 send in background thread. Returns 202 immediately."""
     user_id = verify_token(get_auth_header())
@@ -19584,6 +19617,22 @@ def run_email_automation():
     and trigger next steps based on conditions (if_opened, if_not_opened, if_clicked).
     """
     import datetime as _dt
+    import psycopg2 as _psy2_auto
+    # Within-worker guard
+    if not _EMAIL_AUTO_LOCK.acquire(blocking=False):
+        print('[EMAIL-AUTO] Skipping — already running in this worker')
+        return
+    # Cross-worker guard via DB session advisory lock (key 20260518)
+    _guard_conn = None
+    try:
+        _guard_conn = _psy2_auto.connect(**DB_CONFIG)
+        _guard_cur = _guard_conn.cursor()
+        _guard_cur.execute("SELECT pg_try_advisory_lock(20260518)")
+        if not _guard_cur.fetchone()[0]:
+            print('[EMAIL-AUTO] Skipping — another worker holds the advisory lock')
+            return
+    except Exception as _ge:
+        print(f'[EMAIL-AUTO] guard error: {_ge}')
     try:
         with get_db() as conn:
             c = conn.cursor()
@@ -19664,6 +19713,11 @@ def run_email_automation():
         print('[EMAIL-AUTO] Automation run complete')
     except Exception as e:
         print(f'[EMAIL-AUTO] Error: {e}')
+    finally:
+        if _guard_conn:
+            try: _guard_conn.close()
+            except: pass
+        _EMAIL_AUTO_LOCK.release()
 
 
 # ============= Image Generation Module =============

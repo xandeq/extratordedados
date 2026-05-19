@@ -299,7 +299,10 @@ def _call_llm_for_enhancement(api_url: str, model: str, headers: dict, prompt: s
     )
     resp.raise_for_status()
     data = resp.json()
-    content = data["choices"][0]["message"]["content"]
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError("LLM returned empty choices array")
+    content = (choices[0].get("message") or {}).get("content", "")
     if not content:
         raise ValueError("Empty response from LLM")
     return content.strip()
@@ -352,6 +355,7 @@ def generate_image(prompt: str, model_key: str = DEFAULT_MODEL, enhance: bool = 
     Generate image using FAL.AI.
     Returns {url, model, model_key, cost_usd, elapsed_s, prompt_used, enhanced, error?}
     """
+    prompt = prompt[:2000]  # guard against oversized inputs
     # Route to OpenRouter if model_key is an OpenRouter model
     if model_key in OPENROUTER_IMAGE_MODELS:
         prompt_info = enhance_prompt(prompt) if enhance else {"enhanced": prompt, "original": prompt, "used_llm": False}
@@ -403,6 +407,15 @@ def edit_image(image_url: str, prompt: str, model_key: str = "nano-banana-2", **
     Edit an existing image using FAL.AI (only editing-capable models).
     Returns same shape as generate_image.
     """
+    # SSRF guard: only allow https:// URLs pointing to known CDN/FAL domains
+    _allowed_hosts = (
+        "fal.media", "fal.run", "fal-cdn.com",
+        "storage.googleapis.com", "cdn.openai.com",
+        "extratordedados.com.br",
+    )
+    if not image_url.startswith("https://") or not any(h in image_url for h in _allowed_hosts):
+        raise ValueError(f"image_url must be an https:// URL from a trusted host: {image_url[:80]}")
+
     model_key = model_key if model_key in MODELS else "nano-banana-2"
     if not MODELS[model_key]["supports_editing"]:
         model_key = "nano-banana-2"
