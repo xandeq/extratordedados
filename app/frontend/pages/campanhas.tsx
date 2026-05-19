@@ -340,7 +340,10 @@ function CampaignCard({ campaign, onSend, onDelete, onViewStats }: {
         <div>
           <h3 className="font-semibold text-gray-900 dark:text-white">{campaign.name}</h3>
           <div className="flex items-center gap-2 mt-1">
-            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${statusColors[campaign.status]}`}>
+            <span className={`text-xs px-2 py-0.5 rounded-full font-medium flex items-center gap-1 ${statusColors[campaign.status]}`}>
+              {campaign.status === 'sending' && (
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
+              )}
               {statusLabel[campaign.status] || campaign.status}
             </span>
             <span className="text-xs text-gray-400 dark:text-gray-500">
@@ -642,6 +645,14 @@ export default function Campanhas() {
   }, [])
 
   useEffect(() => { fetchData() }, [fetchData])
+
+  // Auto-poll every 5s while any campaign is sending
+  useEffect(() => {
+    const hasSending = campaigns.some(c => c.status === 'sending')
+    if (!hasSending) return
+    const tid = setInterval(fetchData, 5000)
+    return () => clearInterval(tid)
+  }, [campaigns, fetchData])
 
   const handleSend = async (id: number) => {
     if (!confirm('Enviar campanha agora para todos os leads elegíveis?')) return

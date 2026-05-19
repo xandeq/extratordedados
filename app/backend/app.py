@@ -15363,41 +15363,12 @@ def _build_massive_search_jobs(batch_id, c, niches, cities_to_search, methods, m
 
 # ============= Pipeline Notification Helpers =============
 
-def _get_brevo_credentials():
-    """Fetch Brevo credentials from environment variables. Returns dict or None."""
-    api_key = os.environ.get('BREVO_API_KEY', '')
-    if not api_key:
-        return None
-    return {
-        'BREVO_API_KEY':    api_key,
-        'BREVO_FROM_EMAIL': os.environ.get('BREVO_FROM_EMAIL', 'noreply@extratordedados.com.br'),
-        'BREVO_FROM_NAME':  os.environ.get('BREVO_FROM_NAME', 'Extrator DIAX'),
-    }
-
-
-def _get_mailjet_credentials():
-    """Fetch Mailjet credentials from environment variables. Returns dict or None."""
-    api_key = os.environ.get('MAILJET_API_KEY', '')
-    api_secret = os.environ.get('MAILJET_API_SECRET', '')
-    if not api_key or not api_secret:
-        return None
-    return {
-        'MAILJET_API_KEY':    api_key,
-        'MAILJET_API_SECRET': api_secret,
-        'MAILJET_FROM_EMAIL': os.environ.get('MAILJET_FROM_EMAIL', 'noreply@extratordedados.com.br'),
-        'MAILJET_FROM_NAME':  os.environ.get('MAILJET_FROM_NAME', 'Extrator DIAX'),
-    }
-
-
-def _get_resend_credentials():
-    """Fetch Resend credentials from environment variables. Returns dict or None."""
-    api_key = os.environ.get('RESEND_API_KEY', '')
-    if not api_key:
-        return None
-    return {
-        'RESEND_API_KEY':    api_key,
-        'RESEND_FROM_EMAIL': os.environ.get('RESEND_FROM_EMAIL', 'noreply@extratordedados.com.br'),
-    }
+# Credential getters — delegated to email_providers module
+from email_providers import (
+    get_brevo_credentials as _get_brevo_credentials,
+    get_mailjet_credentials as _get_mailjet_credentials,
+    get_resend_credentials as _get_resend_credentials,
+)
 
 
 def send_pipeline_email_report(report: dict, to_email: str) -> bool:
@@ -18919,26 +18890,24 @@ def stripe_webhook():
 
 
 # ============= Email Campaigns Module =============
+# Pure provider helpers live in email_providers.py (no DB dependency).
+# DB-accessing orchestration stays here pending shared db_utils extraction.
 
 import uuid as _uuid
-import base64 as _base64
-import re as _re_email
-
-# 1x1 transparent GIF bytes
-_TRACKING_PIXEL = _base64.b64decode(
-    'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+import threading as _email_threading
+from email_providers import (
+    EMAIL_PROVIDERS as _EMAIL_PROVIDERS,
+    TRACKING_PIXEL as _TRACKING_PIXEL,
+    PROVIDER_SEND_FN as _PROVIDER_SEND_FN,
+    inject_tracking as _inject_tracking,
+    get_base_url as _get_base_url,
+    send_via_brevo as _send_via_brevo,
+    send_via_mailjet as _send_via_mailjet,
+    send_via_sendpulse as _send_via_sendpulse,
+    send_via_resend as _send_via_resend,
 )
 
-import threading as _email_threading
 _EMAIL_AUTO_LOCK = _email_threading.Lock()
-
-# Provider daily quotas (free-tier defaults)
-_EMAIL_PROVIDERS = [
-    {'name': 'brevo',     'daily_limit': 300},
-    {'name': 'mailjet',   'daily_limit': 200},
-    {'name': 'sendpulse', 'daily_limit': 500},  # 15k/month free (~500/day)
-    {'name': 'resend',    'daily_limit': 100},
-]
 
 
 def _get_provider_usage(provider: str) -> int:
@@ -18980,160 +18949,7 @@ def _pick_provider() -> str | None:
     return None
 
 
-def _send_via_brevo(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
-    try:
-        creds = _get_brevo_credentials()
-        if not creds:
-            return False
-        api_key = creds['BREVO_API_KEY']
-        from_email = creds.get('BREVO_FROM_EMAIL', 'noreply@extratordedados.com.br')
-        from_name = creds.get('BREVO_FROM_NAME', 'Extrator DIAX')
-        payload = {
-            'sender': {'name': from_name, 'email': from_email},
-            'to': [{'email': to_email, 'name': to_name or to_email}],
-            'subject': subject,
-            'htmlContent': html_body,
-        }
-        if text_body:
-            payload['textContent'] = text_body
-        for _attempt in range(2):
-            resp = requests.post(
-                'https://api.brevo.com/v3/smtp/email',
-                headers={'api-key': api_key, 'Content-Type': 'application/json'},
-                json=payload,
-                timeout=15,
-            )
-            if resp.status_code in (200, 201):
-                return True
-            if resp.status_code == 429 and _attempt == 0:
-                import time as _t; _t.sleep(1)
-                continue
-            break
-        return False
-    except Exception as e:
-        print(f'[EMAIL/brevo] error: {e}')
-        return False
-
-
-def _send_via_mailjet(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
-    try:
-        creds = _get_mailjet_credentials()
-        if not creds:
-            return False
-        payload = {
-            'Messages': [{
-                'From': {'Email': creds['MAILJET_FROM_EMAIL'], 'Name': creds['MAILJET_FROM_NAME']},
-                'To': [{'Email': to_email, 'Name': to_name or to_email}],
-                'Subject': subject,
-                'HTMLPart': html_body,
-                'TextPart': text_body or '',
-            }]
-        }
-        for _attempt in range(2):
-            resp = requests.post(
-                'https://api.mailjet.com/v3.1/send',
-                auth=(creds['MAILJET_API_KEY'], creds['MAILJET_API_SECRET']),
-                json=payload,
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                return True
-            if resp.status_code == 429 and _attempt == 0:
-                import time as _t; _t.sleep(1)
-                continue
-            break
-        return False
-    except Exception as e:
-        print(f'[EMAIL/mailjet] error: {e}')
-        return False
-
-
-def _send_via_sendpulse(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
-    """SendPulse SMTP API — free plan 15k/month."""
-    try:
-        client_id = os.environ.get('SENDPULSE_CLIENT_ID', '')
-        client_secret = os.environ.get('SENDPULSE_CLIENT_SECRET', '')
-        if not client_id or not client_secret:
-            return False
-        from_email = os.environ.get('SENDPULSE_FROM_EMAIL', 'noreply@extratordedados.com.br')
-        from_name = os.environ.get('SENDPULSE_FROM_NAME', 'Extrator DIAX')
-        # Get OAuth token
-        token_resp = requests.post('https://api.sendpulse.com/oauth/access_token', json={
-            'grant_type': 'client_credentials',
-            'client_id': client_id,
-            'client_secret': client_secret,
-        }, timeout=10)
-        if token_resp.status_code != 200:
-            return False
-        token = token_resp.json().get('access_token', '')
-        if not token:
-            return False
-        payload = {
-            'email': {
-                'html': html_body,
-                'text': text_body or '',
-                'subject': subject,
-                'from': {'name': from_name, 'email': from_email},
-                'to': [{'name': to_name or to_email, 'email': to_email}],
-            }
-        }
-        for _attempt in range(2):
-            resp = requests.post(
-                'https://api.sendpulse.com/smtp/emails',
-                headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
-                json=payload,
-                timeout=15,
-            )
-            if resp.status_code in (200, 201):
-                return True
-            if resp.status_code == 429 and _attempt == 0:
-                import time as _t; _t.sleep(1)
-                continue
-            break
-        return False
-    except Exception as e:
-        print(f'[EMAIL/sendpulse] error: {e}')
-        return False
-
-
-def _send_via_resend(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
-    try:
-        creds = _get_resend_credentials()
-        if not creds:
-            return False
-        payload = {
-            'from': creds['RESEND_FROM_EMAIL'],
-            'to': [to_email],
-            'subject': subject,
-            'html': html_body,
-        }
-        if text_body:
-            payload['text'] = text_body
-        for _attempt in range(2):
-            resp = requests.post(
-                'https://api.resend.com/emails',
-                headers={'Authorization': f'Bearer {creds["RESEND_API_KEY"]}', 'Content-Type': 'application/json'},
-                json=payload,
-                timeout=15,
-            )
-            if resp.status_code in (200, 201):
-                return True
-            if resp.status_code == 429 and _attempt == 0:
-                import time as _t; _t.sleep(1)
-                continue
-            break
-        return False
-    except Exception as e:
-        print(f'[EMAIL/resend] error: {e}')
-        return False
-
-
-_PROVIDER_SEND_FN = {
-    'brevo':      _send_via_brevo,
-    'mailjet':    _send_via_mailjet,
-    'sendpulse':  _send_via_sendpulse,
-    'resend':     _send_via_resend,
-}
+# _send_via_* functions and _PROVIDER_SEND_FN imported from email_providers above
 
 
 def send_campaign_email(to_email: str, to_name: str, subject: str, html_body: str,
@@ -19159,31 +18975,7 @@ def send_campaign_email(to_email: str, to_name: str, subject: str, html_body: st
     return False, 'all_failed'
 
 
-def _inject_tracking(html_body: str, send_token: str, base_url: str) -> str:
-    """Inject open pixel and rewrite links for click tracking."""
-    pixel_url = f"{base_url}/api/track/o/{send_token}.png"
-    pixel_tag = f'<img src="{pixel_url}" width="1" height="1" alt="" style="display:none"/>'
-    # Rewrite <a href="..."> links
-    def replace_link(m):
-        original_url = m.group(1)
-        if 'track/o/' in original_url or 'track/c/' in original_url:
-            return m.group(0)
-        import urllib.parse
-        encoded = urllib.parse.quote(original_url, safe='')
-        tracked = f'{base_url}/api/track/c/{send_token}?url={encoded}'
-        return f'href="{tracked}"'
-    tracked_html = _re_email.sub(r'href="([^"]+)"', replace_link, html_body)
-    # Add pixel before </body> or at end
-    if '</body>' in tracked_html.lower():
-        tracked_html = tracked_html.replace('</body>', f'{pixel_tag}</body>')
-    else:
-        tracked_html += pixel_tag
-    return tracked_html
-
-
-def _get_base_url() -> str:
-    return os.environ.get('API_BASE_URL', 'https://api.extratordedados.com.br')
-
+# _inject_tracking and _get_base_url imported from email_providers above
 
 # ---- Tracking endpoints ----
 
@@ -19420,20 +19212,27 @@ def _run_campaign_send_background(campaign_id: int, step_id: int, subject: str, 
                                    leads: list, already_sent: set, unsubscribed: set):
     """Background daemon thread: send campaign step 1 to eligible leads."""
     import psycopg2 as _psy2
+    import time as _bg_time
     conn = _psy2.connect(**DB_CONFIG)
     c = conn.cursor()
     base_url = _get_base_url()
     sent_count = 0
     failed_count = 0
+    skipped_count = 0
+    t0_bg = _bg_time.time()
+    print(f'[CAMPAIGN-SEND] campaign={campaign_id} starting: {len(leads)} leads queued')
     try:
         for lead_id, email, company_name in leads:
             if not email or email.lower() in already_sent:
+                skipped_count += 1
                 continue
             email_lower = email.lower()
             if email_lower in unsubscribed:
+                skipped_count += 1
                 continue
             validation = validate_email_free(email)
             if not validation.get('valid') or validation.get('is_disposable'):
+                skipped_count += 1
                 continue
             token = str(_uuid.uuid4()).replace('-', '')
             tracked_html = _inject_tracking(body_html, token, base_url)
@@ -19457,12 +19256,19 @@ def _run_campaign_send_background(campaign_id: int, step_id: int, subject: str, 
             if success:
                 sent_count += 1
                 already_sent.add(email_lower)
+                print(f'[CAMPAIGN-SEND] campaign={campaign_id} sent email={email} provider={provider}')
                 import time as _time_mod; _time_mod.sleep(0.5)
             else:
                 failed_count += 1
+                print(f'[CAMPAIGN-SEND] campaign={campaign_id} failed email={email} provider={provider}')
+        elapsed = round(_bg_time.time() - t0_bg, 1)
         c.execute("UPDATE email_campaigns SET status='active', updated_at=NOW() WHERE id=%s", (campaign_id,))
         conn.commit()
-        print(f'[CAMPAIGN-SEND] campaign={campaign_id} done: sent={sent_count} failed={failed_count}')
+        print(f'[CAMPAIGN-SEND] campaign={campaign_id} COMPLETE: sent={sent_count} failed={failed_count} skipped={skipped_count} elapsed={elapsed}s')
+        # Log quota usage after batch
+        for _p in _EMAIL_PROVIDERS:
+            _used = _get_provider_usage(_p['name'])
+            print(f'[EMAIL-QUOTA] {_p["name"]}: used={_used}/{_p["daily_limit"]} remaining={max(0, _p["daily_limit"] - _used)}')
     except Exception as e:
         print(f'[CAMPAIGN-SEND] campaign={campaign_id} error: {e}')
         try:
@@ -19709,6 +19515,7 @@ def run_email_automation():
                             VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())
                             ON CONFLICT (token) DO NOTHING
                         """, (campaign_id, step_id, lead_id, email, token, provider if success else None, status))
+                        print(f'[EMAIL-AUTO] campaign={campaign_id} step={step_num} email={email} result={status} provider={provider}')
                     conn.commit()
         print('[EMAIL-AUTO] Automation run complete')
     except Exception as e:
