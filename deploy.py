@@ -148,6 +148,7 @@ def deploy_backend(creds):
     IMAGE_GEN_PY = os.path.join(ROOT, 'app', 'backend', 'image_gen.py')
     EMAIL_PROVIDERS_PY = os.path.join(ROOT, 'app', 'backend', 'email_providers.py')
     DB_UTILS_PY = os.path.join(ROOT, 'app', 'backend', 'db_utils.py')
+    EMAIL_CAMPAIGNS_PY = os.path.join(ROOT, 'app', 'backend', 'email_campaigns.py')
     with ssh.open_sftp() as sftp:
         sftp.put(APP_PY,  '/opt/extrator-api/app.py')
         print("   app.py enviado")
@@ -162,6 +163,9 @@ def deploy_backend(creds):
         if os.path.exists(EMAIL_PROVIDERS_PY):
             sftp.put(EMAIL_PROVIDERS_PY, '/opt/extrator-api/email_providers.py')
             print("   email_providers.py enviado")
+        if os.path.exists(EMAIL_CAMPAIGNS_PY):
+            sftp.put(EMAIL_CAMPAIGNS_PY, '/opt/extrator-api/email_campaigns.py')
+            print("   email_campaigns.py enviado")
 
     # 3. Dependências
     print("\n3. Instalando dependências...")
