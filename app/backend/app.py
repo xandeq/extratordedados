@@ -2781,6 +2781,7 @@ def init_db():
             # Migrations — add columns that may not exist in older deployments
             c.execute("ALTER TABLE email_sends ADD COLUMN IF NOT EXISTS bounced_at TIMESTAMPTZ")
             c.execute("ALTER TABLE email_sends ADD COLUMN IF NOT EXISTS bounce_type VARCHAR(20)")
+            c.execute("ALTER TABLE email_campaigns ADD COLUMN IF NOT EXISTS from_name VARCHAR(200)")
             conn.commit()
         print('[DB] email_campaigns tables ready')
     except Exception as e:
@@ -18956,13 +18957,13 @@ def _pick_provider() -> str | None:
 
 
 def send_campaign_email(to_email: str, to_name: str, subject: str, html_body: str,
-                        text_body: str = '') -> tuple[bool, str]:
+                        text_body: str = '', from_name: str = None) -> tuple[bool, str]:
     """Send email via whichever provider has quota. Returns (success, provider_used)."""
     provider = _pick_provider()
     if not provider:
         return False, 'quota_exceeded'
     fn = _PROVIDER_SEND_FN.get(provider)
-    if fn and fn(to_email, to_name, subject, html_body, text_body):
+    if fn and fn(to_email, to_name, subject, html_body, text_body, from_name=from_name):
         _increment_provider_usage(provider)
         return True, provider
     # Try next providers
@@ -18972,7 +18973,7 @@ def send_campaign_email(to_email: str, to_name: str, subject: str, html_body: st
         used = _get_provider_usage(p['name'])
         if used < p['daily_limit']:
             fn2 = _PROVIDER_SEND_FN.get(p['name'])
-            if fn2 and fn2(to_email, to_name, subject, html_body, text_body):
+            if fn2 and fn2(to_email, to_name, subject, html_body, text_body, from_name=from_name):
                 _increment_provider_usage(p['name'])
                 return True, p['name']
     return False, 'all_failed'
@@ -19063,12 +19064,13 @@ def create_campaign():
         return jsonify({'error': 'name required'}), 400
     steps = data.get('steps', [])
     target_filter = data.get('target_filter', {})
+    from_name = (data.get('from_name') or '').strip() or None
     try:
         with get_db() as conn:
             c = conn.cursor()
             c.execute(
-                "INSERT INTO email_campaigns (user_id, name, status, target_filter) VALUES (%s,%s,'draft',%s) RETURNING id",
-                (user_id, name, json.dumps(target_filter))
+                "INSERT INTO email_campaigns (user_id, name, status, target_filter, from_name) VALUES (%s,%s,'draft',%s,%s) RETURNING id",
+                (user_id, name, json.dumps(target_filter), from_name)
             )
             campaign_id = c.fetchone()[0]
             for i, step in enumerate(steps, start=1):
@@ -19137,7 +19139,7 @@ def get_campaign(campaign_id):
     try:
         with get_db() as conn:
             c = conn.cursor()
-            c.execute("SELECT id, name, status, target_filter, created_at FROM email_campaigns WHERE id=%s AND user_id=%s",
+            c.execute("SELECT id, name, status, target_filter, created_at, from_name FROM email_campaigns WHERE id=%s AND user_id=%s",
                       (campaign_id, user_id))
             row = c.fetchone()
             if not row:
@@ -19150,6 +19152,7 @@ def get_campaign(campaign_id):
                 'id': row[0], 'name': row[1], 'status': row[2],
                 'target_filter': row[3] or {},
                 'created_at': row[4].isoformat() if row[4] else None,
+                'from_name': row[5],
                 'steps': steps,
             }
         return jsonify(campaign)
@@ -19205,6 +19208,10 @@ def update_campaign(campaign_id):
             if 'target_filter' in data:
                 c.execute("UPDATE email_campaigns SET target_filter=%s, updated_at=NOW() WHERE id=%s",
                           (json.dumps(data['target_filter']), campaign_id))
+            if 'from_name' in data:
+                from_name = (data['from_name'] or '').strip() or None
+                c.execute("UPDATE email_campaigns SET from_name=%s, updated_at=NOW() WHERE id=%s",
+                          (from_name, campaign_id))
             conn.commit()
         return jsonify({'updated': True})
     except Exception as e:
@@ -19212,7 +19219,8 @@ def update_campaign(campaign_id):
 
 
 def _run_campaign_send_background(campaign_id: int, step_id: int, subject: str, body_html: str,
-                                   leads: list, already_sent: set, unsubscribed: set):
+                                   leads: list, already_sent: set, unsubscribed: set,
+                                   from_name: str = None):
     """Background daemon thread: send campaign step 1 to eligible leads."""
     import psycopg2 as _psy2
     import time as _bg_time
@@ -19244,7 +19252,7 @@ def _run_campaign_send_background(campaign_id: int, step_id: int, subject: str, 
                 f'<p style="font-size:11px;color:#999;text-align:center;margin-top:30px">'
                 f'Para descadastrar: <a href="{unsub_url}">clique aqui</a></p>'
             )
-            success, provider = send_campaign_email(email, company_name or '', subject, tracked_html)
+            success, provider = send_campaign_email(email, company_name or '', subject, tracked_html, from_name=from_name)
             status = 'sent' if success else 'failed'
             try:
                 c.execute("""
@@ -19295,13 +19303,14 @@ def send_campaign(campaign_id):
     try:
         with get_db() as conn:
             c = conn.cursor()
-            c.execute("SELECT id, name, status, target_filter FROM email_campaigns WHERE id=%s AND user_id=%s",
+            c.execute("SELECT id, name, status, target_filter, from_name FROM email_campaigns WHERE id=%s AND user_id=%s",
                       (campaign_id, user_id))
             camp = c.fetchone()
             if not camp:
                 return jsonify({'error': 'not found'}), 404
             if camp[2] == 'sending':
                 return jsonify({'error': 'already sending'}), 409
+            camp_from_name = camp[4]
 
             c.execute("SELECT id, subject, body_html FROM email_steps WHERE campaign_id=%s AND step_num=1", (campaign_id,))
             step = c.fetchone()
@@ -19335,6 +19344,7 @@ def send_campaign(campaign_id):
         t = _thr.Thread(
             target=_run_campaign_send_background,
             args=(campaign_id, step_id, subject, body_html, leads, already_sent, unsubscribed),
+            kwargs={'from_name': camp_from_name},
             daemon=True,
         )
         t.start()
@@ -19574,7 +19584,7 @@ def run_email_automation():
             c = conn.cursor()
             # Find campaigns with >1 step that are active
             c.execute("""
-                SELECT DISTINCT ec.id, ec.user_id
+                SELECT DISTINCT ec.id, ec.user_id, ec.from_name
                 FROM email_campaigns ec
                 JOIN email_steps es ON es.campaign_id=ec.id AND es.step_num > 1
                 WHERE ec.status = 'active'
@@ -19583,7 +19593,7 @@ def run_email_automation():
 
             base_url = _get_base_url()
 
-            for campaign_id, user_id in campaigns:
+            for campaign_id, user_id, camp_from_name in campaigns:
                 # Load all steps (step_num >= 2)
                 c.execute("""
                     SELECT id, step_num, subject, body_html, delay_days, condition
@@ -19638,7 +19648,7 @@ def run_email_automation():
                         tracked_html = _inject_tracking(body_html, token, base_url)
                         unsub_url = f"{base_url}/api/track/unsubscribe/{token}"
                         tracked_html += f'<p style="font-size:11px;color:#999;text-align:center;margin-top:30px">Para descadastrar: <a href="{unsub_url}">clique aqui</a></p>'
-                        success, provider = send_campaign_email(email, '', subject, tracked_html)
+                        success, provider = send_campaign_email(email, '', subject, tracked_html, from_name=camp_from_name)
                         status = 'sent' if success else 'failed'
                         c.execute("""
                             INSERT INTO email_sends (campaign_id, step_id, lead_id, email, token, provider, status, sent_at)

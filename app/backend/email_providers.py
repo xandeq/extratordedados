@@ -95,13 +95,14 @@ def inject_tracking(html_body: str, send_token: str, base_url: str) -> str:
 
 # ── Provider send functions ───────────────────────────────────────────────────
 
-def send_via_brevo(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
+def send_via_brevo(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '',
+                   from_name: str = None) -> bool:
     try:
         creds = get_brevo_credentials()
         if not creds:
             return False
         payload = {
-            'sender': {'name': creds['BREVO_FROM_NAME'], 'email': creds['BREVO_FROM_EMAIL']},
+            'sender': {'name': from_name or creds['BREVO_FROM_NAME'], 'email': creds['BREVO_FROM_EMAIL']},
             'to': [{'email': to_email, 'name': to_name or to_email}],
             'subject': subject,
             'htmlContent': html_body,
@@ -127,14 +128,15 @@ def send_via_brevo(to_email: str, to_name: str, subject: str, html_body: str, te
         return False
 
 
-def send_via_mailjet(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
+def send_via_mailjet(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '',
+                     from_name: str = None) -> bool:
     try:
         creds = get_mailjet_credentials()
         if not creds:
             return False
         payload = {
             'Messages': [{
-                'From': {'Email': creds['MAILJET_FROM_EMAIL'], 'Name': creds['MAILJET_FROM_NAME']},
+                'From': {'Email': creds['MAILJET_FROM_EMAIL'], 'Name': from_name or creds['MAILJET_FROM_NAME']},
                 'To': [{'Email': to_email, 'Name': to_name or to_email}],
                 'Subject': subject,
                 'HTMLPart': html_body,
@@ -160,7 +162,8 @@ def send_via_mailjet(to_email: str, to_name: str, subject: str, html_body: str, 
         return False
 
 
-def send_via_sendpulse(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
+def send_via_sendpulse(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '',
+                       from_name: str = None) -> bool:
     """SendPulse SMTP API — free plan 15k/month."""
     try:
         client_id = os.environ.get('SENDPULSE_CLIENT_ID', '')
@@ -168,7 +171,7 @@ def send_via_sendpulse(to_email: str, to_name: str, subject: str, html_body: str
         if not client_id or not client_secret:
             return False
         from_email = os.environ.get('SENDPULSE_FROM_EMAIL', 'noreply@extratordedados.com.br')
-        from_name = os.environ.get('SENDPULSE_FROM_NAME', 'Extrator DIAX')
+        from_name = from_name or os.environ.get('SENDPULSE_FROM_NAME', 'Extrator DIAX')
         token_resp = requests.post('https://api.sendpulse.com/oauth/access_token', json={
             'grant_type': 'client_credentials',
             'client_id': client_id,
@@ -207,13 +210,17 @@ def send_via_sendpulse(to_email: str, to_name: str, subject: str, html_body: str
         return False
 
 
-def send_via_resend(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
+def send_via_resend(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '',
+                    from_name: str = None) -> bool:
     try:
         creds = get_resend_credentials()
         if not creds:
             return False
+        resend_from = creds['RESEND_FROM_EMAIL']
+        if from_name:
+            resend_from = f"{from_name} <{resend_from}>"
         payload = {
-            'from': creds['RESEND_FROM_EMAIL'],
+            'from': resend_from,
             'to': [to_email],
             'subject': subject,
             'html': html_body,

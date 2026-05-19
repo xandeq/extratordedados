@@ -161,6 +161,7 @@ function StepEditor({ step, index, onChange, onRemove }: {
 function CreateCampaignModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const { addToast: showToast } = useToast()
   const [name, setName] = useState('')
+  const [fromName, setFromName] = useState('')
   const [steps, setSteps] = useState<Step[]>([{
     step_num: 1,
     subject: '',
@@ -198,6 +199,7 @@ function CreateCampaignModal({ onClose, onCreated }: { onClose: () => void; onCr
     try {
       await api.post('/api/campaigns', {
         name,
+        from_name: fromName.trim() || undefined,
         steps: steps.map((s, i) => ({ ...s, step_num: i + 1 })),
         target_filter: { limit },
       })
@@ -227,18 +229,32 @@ function CreateCampaignModal({ onClose, onCreated }: { onClose: () => void; onCr
 
         {/* Body */}
         <div className="overflow-y-auto flex-1 px-6 py-4 space-y-5">
-          {/* Name */}
-          <div>
-            <label className="block text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1.5">
-              Nome da campanha
-            </label>
-            <input
-              type="text"
-              placeholder="Ex: Follow-up Leads Novos — Abril"
-              value={name}
-              onChange={e => setName(e.target.value)}
-              className="w-full px-3 py-2.5 rounded-xl border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
+          {/* Name + Sender */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1.5">
+                Nome da campanha
+              </label>
+              <input
+                type="text"
+                placeholder="Ex: Follow-up Leads Novos — Abril"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                className="w-full px-3 py-2.5 rounded-xl border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1.5">
+                Nome do remetente <span className="font-normal text-gray-400">(opcional)</span>
+              </label>
+              <input
+                type="text"
+                placeholder="Ex: Alexandre Queiroz"
+                value={fromName}
+                onChange={e => setFromName(e.target.value)}
+                className="w-full px-3 py-2.5 rounded-xl border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
           </div>
 
           {/* Audience */}
