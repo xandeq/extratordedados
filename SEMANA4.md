@@ -82,7 +82,42 @@ e entregar visibilidade aos usuários sobre o que está acontecendo com seus env
 ## Métricas de Sucesso para Semana 4
 
 - [ ] 1 campanha com envio real validado (entrega + abertura + unsubscribe)
-- [ ] PR semana3 mergeado em main
-- [ ] Endpoint de log de campanha funcionando
-- [ ] Webhook de bounces configurado em pelo menos 1 provider
-- [ ] db_utils.py extraído, app.py < 19.500 linhas
+- [ ] PR semana3 mergeado em main (PR #2 aberto, aguardando merge)
+- [x] Endpoint de log de campanha funcionando — `GET /api/campaigns/<id>/log`
+- [x] Webhook de bounces configurado em pelo menos 1 provider — Brevo + Resend
+- [x] db_utils.py extraído, app.py < 19.500 linhas — **19.252 linhas** ✓
+
+## Progresso Semana 4 — Concluído
+
+### P0
+- [ ] PR semana3 → main (abrir PR ✅, merge pendente)
+- [x] Regression test para double-send (test_send_already_sending_returns_409)
+- [ ] Testar envio real com lead real — **PENDENTE** (requer ação do usuário)
+
+### P1 ✅ Completo
+- [x] `GET /api/campaigns/<id>/log` — paginado com campos: id, email, provider, status, sent_at, opened_at, clicked_at, bounced_at, error_msg, step_num, subject
+- [x] Webhook Brevo (`POST /api/webhooks/bounces/brevo`) — hard_bounce, soft_bounce, blocked, spam
+- [x] Webhook Resend (`POST /api/webhooks/bounces/resend`) — email.bounced, email.complained
+- [ ] Alertas de quota (log já funciona: `[EMAIL-QUOTA]`, toast pendente)
+- [ ] Admin dashboard básico
+
+### P2 Parcial
+- [x] Sender name personalizado por campanha (campo `from_name` no CRUD)
+- [ ] Preview do email antes de enviar (modal frontend)
+- [ ] Segmento por quality_grade no UI
+- [x] Descadastro global — comportamento já era global; texto da página corrigido
+
+### P3 ✅ Completo
+- [x] `db_utils.py` extraído (get_db, DB_CONFIG, get_pool)
+- [x] `email_campaigns.py` extraído — 774 linhas saíram do app.py
+- [x] `app.py` → **19.252 linhas** (meta: <19.500) ✓
+- [ ] `stripe_routes.py` — dispensável (meta já atingida)
+
+### P4 Parcial
+- [x] Histórico de imagens — tabela `image_gen_log` + `GET /api/images/history`
+- [ ] Estimativa de custo antes de gerar
+- [ ] Download direto (FAL URLs expiram em 24h)
+
+### Qualidade / Segurança (bônus)
+- [x] `run_email_automation`: global unsubscribe list verificada antes de enviar follow-ups
+- [x] 182 testes passando (167 suite principal + tests anteriores), 57 skipped
