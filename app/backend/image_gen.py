@@ -140,11 +140,11 @@ OPENROUTER_IMAGE_API_URL = "https://openrouter.ai/api/v1/images/generations"
 
 # ── OpenRouter config ──────────────────────────────────────────────────────────
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_ENHANCE_MODEL = "google/gemma-3-27b-it:free"
+OPENROUTER_ENHANCE_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
 OPENROUTER_ENHANCE_FALLBACKS = [
     "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemma-4-31b-it:free",
-    "qwen/qwen3-coder:free",
+    "mistralai/mistral-7b-instruct:free",
+    "google/gemma-2-9b-it:free",
 ]
 
 # ── Groq config (primary for prompt enhancement — free, fast, reliable) ────────
