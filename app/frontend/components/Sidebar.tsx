@@ -20,6 +20,8 @@ import {
   MessageSquarePlus,
   Bookmark,
   Tag,
+  History,
+  Mail,
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import api from '../lib/api'
@@ -29,9 +31,11 @@ const clientNavItems = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/portal', label: 'Portal de Leads', icon: BookMarked },
   { href: '/leads', label: 'Leads', icon: Database },
+  { href: '/ai', label: 'Histórico de Análises', icon: History },
   { href: '/plans', label: 'Planos', icon: Zap },
   { href: '/request-niche', label: 'Solicitar Nicho', icon: MessageSquarePlus },
   { href: '/saved-searches', label: 'Buscas Salvas', icon: Bookmark },
+  { href: '/campanhas', label: 'Campanhas', icon: Mail },
 ]
 
 const adminNavItems = [
@@ -193,7 +197,7 @@ export default function Sidebar({ isOpen = true, onClose }: SidebarProps) {
 
   const isActive = (href: string) => {
     // exact match for root-like admin pages to avoid /admin matching /admin/users
-    if (href === '/admin' || href === '/dashboard' || href === '/leads' || href === '/plans' || href === '/portal' || href === '/request-niche' || href === '/saved-searches' || href === '/admin/niches' || href === '/admin/pipeline-config') {
+    if (href === '/admin' || href === '/dashboard' || href === '/leads' || href === '/plans' || href === '/portal' || href === '/request-niche' || href === '/saved-searches' || href === '/ai' || href === '/admin/niches' || href === '/admin/pipeline-config' || href === '/campanhas') {
       return router.pathname === href
     }
     return router.pathname.startsWith(href)

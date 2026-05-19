@@ -2710,6 +2710,79 @@ def init_db():
     except Exception as e:
         print(f'[DB] saved_searches: {e}')
 
+    # Phase 7: Email Campaigns / Marketing Automation tables
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS email_campaigns (
+                    id              SERIAL PRIMARY KEY,
+                    user_id         INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    name            VARCHAR(255) NOT NULL,
+                    status          VARCHAR(30) DEFAULT 'draft',
+                    target_filter   JSONB DEFAULT '{}',
+                    created_at      TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at      TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS email_steps (
+                    id              SERIAL PRIMARY KEY,
+                    campaign_id     INTEGER REFERENCES email_campaigns(id) ON DELETE CASCADE,
+                    step_num        INTEGER NOT NULL DEFAULT 1,
+                    subject         VARCHAR(500) NOT NULL,
+                    body_html       TEXT NOT NULL,
+                    delay_days      INTEGER DEFAULT 0,
+                    condition       VARCHAR(50) DEFAULT 'always',
+                    created_at      TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS email_sends (
+                    id              SERIAL PRIMARY KEY,
+                    campaign_id     INTEGER REFERENCES email_campaigns(id) ON DELETE CASCADE,
+                    step_id         INTEGER REFERENCES email_steps(id) ON DELETE SET NULL,
+                    lead_id         INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+                    email           VARCHAR(255) NOT NULL,
+                    token           VARCHAR(64) UNIQUE NOT NULL,
+                    provider        VARCHAR(30),
+                    status          VARCHAR(20) DEFAULT 'pending',
+                    sent_at         TIMESTAMPTZ,
+                    opened_at       TIMESTAMPTZ,
+                    clicked_at      TIMESTAMPTZ,
+                    unsubscribed_at TIMESTAMPTZ,
+                    error_msg       TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS email_events (
+                    id              SERIAL PRIMARY KEY,
+                    send_id         INTEGER REFERENCES email_sends(id) ON DELETE CASCADE,
+                    event_type      VARCHAR(30) NOT NULL,
+                    occurred_at     TIMESTAMPTZ DEFAULT NOW(),
+                    metadata        JSONB DEFAULT '{}'
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS email_provider_usage (
+                    id              SERIAL PRIMARY KEY,
+                    provider        VARCHAR(30) NOT NULL,
+                    usage_date      DATE NOT NULL DEFAULT CURRENT_DATE,
+                    sends_count     INTEGER DEFAULT 0,
+                    UNIQUE(provider, usage_date)
+                )
+            """)
+            # Indexes
+            c.execute("CREATE INDEX IF NOT EXISTS idx_email_sends_campaign ON email_sends(campaign_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_email_sends_token ON email_sends(token)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_email_sends_lead ON email_sends(lead_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_email_events_send ON email_events(send_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_email_steps_campaign ON email_steps(campaign_id, step_num)")
+            conn.commit()
+        print('[DB] email_campaigns tables ready')
+    except Exception as e:
+        print(f'[DB] email_campaigns: {e}')
+
     with get_db() as conn:
         c = conn.cursor()
 
@@ -15291,15 +15364,40 @@ def _build_massive_search_jobs(batch_id, c, niches, cities_to_search, methods, m
 # ============= Pipeline Notification Helpers =============
 
 def _get_brevo_credentials():
-    """Fetch Brevo credentials from AWS Secrets Manager. Returns dict or None."""
-    try:
-        blob = _fetch_secret_blob_from_aws('tools/brevo')
-        if blob and blob.get('BREVO_API_KEY'):
-            return blob
+    """Fetch Brevo credentials from environment variables. Returns dict or None."""
+    api_key = os.environ.get('BREVO_API_KEY', '')
+    if not api_key:
         return None
-    except Exception as e:
-        print(f"[BREVO] Erro ao buscar credenciais: {e}")
+    return {
+        'BREVO_API_KEY':    api_key,
+        'BREVO_FROM_EMAIL': os.environ.get('BREVO_FROM_EMAIL', 'noreply@extratordedados.com.br'),
+        'BREVO_FROM_NAME':  os.environ.get('BREVO_FROM_NAME', 'Extrator DIAX'),
+    }
+
+
+def _get_mailjet_credentials():
+    """Fetch Mailjet credentials from environment variables. Returns dict or None."""
+    api_key = os.environ.get('MAILJET_API_KEY', '')
+    api_secret = os.environ.get('MAILJET_API_SECRET', '')
+    if not api_key or not api_secret:
         return None
+    return {
+        'MAILJET_API_KEY':    api_key,
+        'MAILJET_API_SECRET': api_secret,
+        'MAILJET_FROM_EMAIL': os.environ.get('MAILJET_FROM_EMAIL', 'noreply@extratordedados.com.br'),
+        'MAILJET_FROM_NAME':  os.environ.get('MAILJET_FROM_NAME', 'Extrator DIAX'),
+    }
+
+
+def _get_resend_credentials():
+    """Fetch Resend credentials from environment variables. Returns dict or None."""
+    api_key = os.environ.get('RESEND_API_KEY', '')
+    if not api_key:
+        return None
+    return {
+        'RESEND_API_KEY':    api_key,
+        'RESEND_FROM_EMAIL': os.environ.get('RESEND_FROM_EMAIL', 'noreply@extratordedados.com.br'),
+    }
 
 
 def send_pipeline_email_report(report: dict, to_email: str) -> bool:
@@ -18820,6 +18918,894 @@ def stripe_webhook():
     return jsonify({'received': True}), 200
 
 
+# ============= Email Campaigns Module =============
+
+import uuid as _uuid
+import base64 as _base64
+import re as _re_email
+
+# 1x1 transparent GIF bytes
+_TRACKING_PIXEL = _base64.b64decode(
+    'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+)
+
+# Provider daily quotas (free-tier defaults)
+_EMAIL_PROVIDERS = [
+    {'name': 'brevo',     'daily_limit': 300},
+    {'name': 'mailjet',   'daily_limit': 200},
+    {'name': 'sendpulse', 'daily_limit': 500},  # 15k/month free (~500/day)
+    {'name': 'resend',    'daily_limit': 100},
+]
+
+
+def _get_provider_usage(provider: str) -> int:
+    """Return how many emails were sent today by this provider."""
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT sends_count FROM email_provider_usage WHERE provider=%s AND usage_date=CURRENT_DATE",
+                (provider,)
+            )
+            row = c.fetchone()
+            return row[0] if row else 0
+    except Exception:
+        return 0
+
+
+def _increment_provider_usage(provider: str):
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO email_provider_usage (provider, usage_date, sends_count)
+                VALUES (%s, CURRENT_DATE, 1)
+                ON CONFLICT (provider, usage_date)
+                DO UPDATE SET sends_count = email_provider_usage.sends_count + 1
+            """, (provider,))
+            conn.commit()
+    except Exception as e:
+        print(f'[EMAIL] _increment_provider_usage error: {e}')
+
+
+def _pick_provider() -> str | None:
+    """Return name of a provider that still has quota today, or None."""
+    for p in _EMAIL_PROVIDERS:
+        used = _get_provider_usage(p['name'])
+        if used < p['daily_limit']:
+            return p['name']
+    return None
+
+
+def _send_via_brevo(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
+    try:
+        creds = _get_brevo_credentials()
+        if not creds:
+            return False
+        api_key = creds['BREVO_API_KEY']
+        from_email = creds.get('BREVO_FROM_EMAIL', 'noreply@extratordedados.com.br')
+        from_name = creds.get('BREVO_FROM_NAME', 'Extrator DIAX')
+        payload = {
+            'sender': {'name': from_name, 'email': from_email},
+            'to': [{'email': to_email, 'name': to_name or to_email}],
+            'subject': subject,
+            'htmlContent': html_body,
+        }
+        if text_body:
+            payload['textContent'] = text_body
+        resp = requests.post(
+            'https://api.brevo.com/v3/smtp/email',
+            headers={'api-key': api_key, 'Content-Type': 'application/json'},
+            json=payload,
+            timeout=15,
+        )
+        return resp.status_code in (200, 201)
+    except Exception as e:
+        print(f'[EMAIL/brevo] error: {e}')
+        return False
+
+
+def _send_via_mailjet(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
+    try:
+        creds = _get_mailjet_credentials()
+        if not creds:
+            return False
+        payload = {
+            'Messages': [{
+                'From': {'Email': creds['MAILJET_FROM_EMAIL'], 'Name': creds['MAILJET_FROM_NAME']},
+                'To': [{'Email': to_email, 'Name': to_name or to_email}],
+                'Subject': subject,
+                'HTMLPart': html_body,
+                'TextPart': text_body or '',
+            }]
+        }
+        resp = requests.post(
+            'https://api.mailjet.com/v3.1/send',
+            auth=(creds['MAILJET_API_KEY'], creds['MAILJET_API_SECRET']),
+            json=payload,
+            timeout=15,
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        print(f'[EMAIL/mailjet] error: {e}')
+        return False
+
+
+def _send_via_sendpulse(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
+    """SendPulse SMTP API — free plan 15k/month."""
+    try:
+        client_id = os.environ.get('SENDPULSE_CLIENT_ID', '')
+        client_secret = os.environ.get('SENDPULSE_CLIENT_SECRET', '')
+        if not client_id or not client_secret:
+            return False
+        from_email = os.environ.get('SENDPULSE_FROM_EMAIL', 'noreply@extratordedados.com.br')
+        from_name = os.environ.get('SENDPULSE_FROM_NAME', 'Extrator DIAX')
+        # Get OAuth token
+        token_resp = requests.post('https://api.sendpulse.com/oauth/access_token', json={
+            'grant_type': 'client_credentials',
+            'client_id': client_id,
+            'client_secret': client_secret,
+        }, timeout=10)
+        if token_resp.status_code != 200:
+            return False
+        token = token_resp.json().get('access_token', '')
+        if not token:
+            return False
+        payload = {
+            'email': {
+                'html': html_body,
+                'text': text_body or '',
+                'subject': subject,
+                'from': {'name': from_name, 'email': from_email},
+                'to': [{'name': to_name or to_email, 'email': to_email}],
+            }
+        }
+        resp = requests.post(
+            'https://api.sendpulse.com/smtp/emails',
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            json=payload,
+            timeout=15,
+        )
+        return resp.status_code in (200, 201)
+    except Exception as e:
+        print(f'[EMAIL/sendpulse] error: {e}')
+        return False
+
+
+def _send_via_resend(to_email: str, to_name: str, subject: str, html_body: str, text_body: str = '') -> bool:
+    try:
+        creds = _get_resend_credentials()
+        if not creds:
+            return False
+        payload = {
+            'from': creds['RESEND_FROM_EMAIL'],
+            'to': [to_email],
+            'subject': subject,
+            'html': html_body,
+        }
+        if text_body:
+            payload['text'] = text_body
+        resp = requests.post(
+            'https://api.resend.com/emails',
+            headers={'Authorization': f'Bearer {creds["RESEND_API_KEY"]}', 'Content-Type': 'application/json'},
+            json=payload,
+            timeout=15,
+        )
+        return resp.status_code in (200, 201)
+    except Exception as e:
+        print(f'[EMAIL/resend] error: {e}')
+        return False
+
+
+_PROVIDER_SEND_FN = {
+    'brevo':      _send_via_brevo,
+    'mailjet':    _send_via_mailjet,
+    'sendpulse':  _send_via_sendpulse,
+    'resend':     _send_via_resend,
+}
+
+
+def send_campaign_email(to_email: str, to_name: str, subject: str, html_body: str,
+                        text_body: str = '') -> tuple[bool, str]:
+    """Send email via whichever provider has quota. Returns (success, provider_used)."""
+    provider = _pick_provider()
+    if not provider:
+        return False, 'quota_exceeded'
+    fn = _PROVIDER_SEND_FN.get(provider)
+    if fn and fn(to_email, to_name, subject, html_body, text_body):
+        _increment_provider_usage(provider)
+        return True, provider
+    # Try next providers
+    for p in _EMAIL_PROVIDERS:
+        if p['name'] == provider:
+            continue
+        used = _get_provider_usage(p['name'])
+        if used < p['daily_limit']:
+            fn2 = _PROVIDER_SEND_FN.get(p['name'])
+            if fn2 and fn2(to_email, to_name, subject, html_body, text_body):
+                _increment_provider_usage(p['name'])
+                return True, p['name']
+    return False, 'all_failed'
+
+
+def _inject_tracking(html_body: str, send_token: str, base_url: str) -> str:
+    """Inject open pixel and rewrite links for click tracking."""
+    pixel_url = f"{base_url}/api/track/o/{send_token}.png"
+    pixel_tag = f'<img src="{pixel_url}" width="1" height="1" alt="" style="display:none"/>'
+    # Rewrite <a href="..."> links
+    def replace_link(m):
+        original_url = m.group(1)
+        if 'track/o/' in original_url or 'track/c/' in original_url:
+            return m.group(0)
+        import urllib.parse
+        encoded = urllib.parse.quote(original_url, safe='')
+        tracked = f'{base_url}/api/track/c/{send_token}?url={encoded}'
+        return f'href="{tracked}"'
+    tracked_html = _re_email.sub(r'href="([^"]+)"', replace_link, html_body)
+    # Add pixel before </body> or at end
+    if '</body>' in tracked_html.lower():
+        tracked_html = tracked_html.replace('</body>', f'{pixel_tag}</body>')
+    else:
+        tracked_html += pixel_tag
+    return tracked_html
+
+
+def _get_base_url() -> str:
+    return os.environ.get('API_BASE_URL', 'https://api.extratordedados.com.br')
+
+
+# ---- Tracking endpoints ----
+
+@app.route('/api/track/o/<token>.png', methods=['GET'])
+def track_open(token):
+    """Open tracking pixel."""
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, opened_at FROM email_sends WHERE token=%s", (token,))
+            row = c.fetchone()
+            if row:
+                send_id, opened_at = row
+                if not opened_at:
+                    c.execute("UPDATE email_sends SET opened_at=NOW(), status='opened' WHERE token=%s", (token,))
+                    c.execute("INSERT INTO email_events (send_id, event_type) VALUES (%s, 'open')", (send_id,))
+                    conn.commit()
+    except Exception as e:
+        print(f'[TRACK/open] {e}')
+    from flask import Response
+    return Response(_TRACKING_PIXEL, mimetype='image/gif',
+                    headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
+
+
+@app.route('/api/track/c/<token>', methods=['GET'])
+def track_click(token):
+    """Click tracking redirect."""
+    import urllib.parse
+    from flask import redirect
+    raw_url = request.args.get('url', '')
+    original_url = urllib.parse.unquote(raw_url)
+    # Prevent open redirect: only allow http/https URLs
+    if not original_url.startswith(('http://', 'https://')):
+        original_url = 'https://extratordedados.com.br'
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, clicked_at FROM email_sends WHERE token=%s", (token,))
+            row = c.fetchone()
+            if row:
+                send_id, clicked_at = row
+                if not clicked_at:
+                    c.execute("UPDATE email_sends SET clicked_at=NOW(), status='clicked' WHERE token=%s", (token,))
+                c.execute("INSERT INTO email_events (send_id, event_type, metadata) VALUES (%s, 'click', %s)",
+                          (send_id, json.dumps({'url': original_url})))
+                conn.commit()
+    except Exception as e:
+        print(f'[TRACK/click] {e}')
+    return redirect(original_url, code=302)
+
+
+@app.route('/api/track/unsubscribe/<token>', methods=['GET'])
+def track_unsubscribe(token):
+    """Unsubscribe link handler."""
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id FROM email_sends WHERE token=%s", (token,))
+            row = c.fetchone()
+            if row:
+                send_id = row[0]
+                c.execute("UPDATE email_sends SET unsubscribed_at=NOW(), status='unsubscribed' WHERE token=%s", (token,))
+                c.execute("INSERT INTO email_events (send_id, event_type) VALUES (%s, 'unsubscribe')", (send_id,))
+                conn.commit()
+    except Exception as e:
+        print(f'[TRACK/unsubscribe] {e}')
+    from flask import make_response
+    html = '<html><body style="font-family:sans-serif;text-align:center;padding:60px"><h2>Descadastrado com sucesso</h2><p>Você não receberá mais emails desta campanha.</p></body></html>'
+    return make_response(html, 200)
+
+
+# ---- Campaign CRUD endpoints ----
+
+@app.route('/api/campaigns', methods=['POST'])
+def create_campaign():
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'name required'}), 400
+    steps = data.get('steps', [])
+    target_filter = data.get('target_filter', {})
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO email_campaigns (user_id, name, status, target_filter) VALUES (%s,%s,'draft',%s) RETURNING id",
+                (user_id, name, json.dumps(target_filter))
+            )
+            campaign_id = c.fetchone()[0]
+            for i, step in enumerate(steps, start=1):
+                c.execute("""
+                    INSERT INTO email_steps (campaign_id, step_num, subject, body_html, delay_days, condition)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                """, (
+                    campaign_id, i,
+                    step.get('subject', ''),
+                    step.get('body_html', ''),
+                    step.get('delay_days', 0),
+                    step.get('condition', 'always'),
+                ))
+            conn.commit()
+        return jsonify({'id': campaign_id, 'name': name}), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/campaigns', methods=['GET'])
+def list_campaigns():
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT ec.id, ec.name, ec.status, ec.created_at,
+                    COUNT(DISTINCT es.id) AS total_sends,
+                    COUNT(DISTINCT CASE WHEN es.opened_at IS NOT NULL THEN es.id END) AS opens,
+                    COUNT(DISTINCT CASE WHEN es.clicked_at IS NOT NULL THEN es.id END) AS clicks,
+                    COUNT(DISTINCT CASE WHEN es.unsubscribed_at IS NOT NULL THEN es.id END) AS unsubs,
+                    (SELECT COUNT(*) FROM email_steps WHERE campaign_id=ec.id) AS steps_count
+                FROM email_campaigns ec
+                LEFT JOIN email_sends es ON es.campaign_id = ec.id AND es.status != 'pending'
+                WHERE ec.user_id = %s
+                GROUP BY ec.id
+                ORDER BY ec.created_at DESC
+            """, (user_id,))
+            rows = c.fetchall()
+            campaigns = []
+            for r in rows:
+                total = r[4] or 0
+                opens = r[5] or 0
+                clicks = r[6] or 0
+                campaigns.append({
+                    'id': r[0], 'name': r[1], 'status': r[2],
+                    'created_at': r[3].isoformat() if r[3] else None,
+                    'total_sends': total,
+                    'open_rate': round(opens / total * 100, 1) if total else 0,
+                    'click_rate': round(clicks / total * 100, 1) if total else 0,
+                    'unsubs': r[7] or 0,
+                    'steps_count': r[8] or 0,
+                })
+        return jsonify(campaigns)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/campaigns/<int:campaign_id>', methods=['GET'])
+def get_campaign(campaign_id):
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, name, status, target_filter, created_at FROM email_campaigns WHERE id=%s AND user_id=%s",
+                      (campaign_id, user_id))
+            row = c.fetchone()
+            if not row:
+                return jsonify({'error': 'not found'}), 404
+            c.execute("SELECT id, step_num, subject, body_html, delay_days, condition FROM email_steps WHERE campaign_id=%s ORDER BY step_num",
+                      (campaign_id,))
+            steps = [{'id': s[0], 'step_num': s[1], 'subject': s[2], 'body_html': s[3],
+                      'delay_days': s[4], 'condition': s[5]} for s in c.fetchall()]
+            campaign = {
+                'id': row[0], 'name': row[1], 'status': row[2],
+                'target_filter': row[3] or {},
+                'created_at': row[4].isoformat() if row[4] else None,
+                'steps': steps,
+            }
+        return jsonify(campaign)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/campaigns/<int:campaign_id>', methods=['DELETE'])
+def delete_campaign(campaign_id):
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM email_campaigns WHERE id=%s AND user_id=%s", (campaign_id, user_id))
+            conn.commit()
+        return jsonify({'deleted': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/campaigns/<int:campaign_id>', methods=['PUT'])
+def update_campaign(campaign_id):
+    """Update campaign name and steps (only allowed when status=draft)."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.get_json() or {}
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, status FROM email_campaigns WHERE id=%s AND user_id=%s",
+                      (campaign_id, user_id))
+            row = c.fetchone()
+            if not row:
+                return jsonify({'error': 'not found'}), 404
+            if row[1] not in ('draft',):
+                return jsonify({'error': 'can only edit draft campaigns'}), 409
+            if 'name' in data:
+                name = (data['name'] or '').strip()
+                if name:
+                    c.execute("UPDATE email_campaigns SET name=%s, updated_at=NOW() WHERE id=%s",
+                              (name, campaign_id))
+            if 'steps' in data:
+                c.execute("DELETE FROM email_steps WHERE campaign_id=%s", (campaign_id,))
+                for i, step in enumerate(data['steps'], start=1):
+                    c.execute("""
+                        INSERT INTO email_steps (campaign_id, step_num, subject, body_html, delay_days, condition)
+                        VALUES (%s,%s,%s,%s,%s,%s)
+                    """, (campaign_id, i, step.get('subject', ''), step.get('body_html', ''),
+                          step.get('delay_days', 0), step.get('condition', 'always')))
+            if 'target_filter' in data:
+                c.execute("UPDATE email_campaigns SET target_filter=%s, updated_at=NOW() WHERE id=%s",
+                          (json.dumps(data['target_filter']), campaign_id))
+            conn.commit()
+        return jsonify({'updated': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def _run_campaign_send_background(campaign_id: int, step_id: int, subject: str, body_html: str,
+                                   leads: list, already_sent: set, unsubscribed: set):
+    """Background daemon thread: send campaign step 1 to eligible leads."""
+    import psycopg2 as _psy2
+    conn = _psy2.connect(**DB_CONFIG)
+    c = conn.cursor()
+    base_url = _get_base_url()
+    sent_count = 0
+    failed_count = 0
+    try:
+        for lead_id, email, company_name in leads:
+            if not email or email.lower() in already_sent:
+                continue
+            email_lower = email.lower()
+            if email_lower in unsubscribed:
+                continue
+            validation = validate_email_free(email)
+            if not validation.get('valid') or validation.get('is_disposable'):
+                continue
+            token = str(_uuid.uuid4()).replace('-', '')
+            tracked_html = _inject_tracking(body_html, token, base_url)
+            unsub_url = f"{base_url}/api/track/unsubscribe/{token}"
+            tracked_html += (
+                f'<p style="font-size:11px;color:#999;text-align:center;margin-top:30px">'
+                f'Para descadastrar: <a href="{unsub_url}">clique aqui</a></p>'
+            )
+            success, provider = send_campaign_email(email, company_name or '', subject, tracked_html)
+            status = 'sent' if success else 'failed'
+            try:
+                c.execute("""
+                    INSERT INTO email_sends (campaign_id, step_id, lead_id, email, token, provider, status, sent_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())
+                    ON CONFLICT (token) DO NOTHING
+                """, (campaign_id, step_id, lead_id, email, token, provider if success else None, status))
+                conn.commit()
+            except Exception:
+                try: conn.rollback()
+                except: pass
+            if success:
+                sent_count += 1
+                already_sent.add(email_lower)
+            else:
+                failed_count += 1
+        c.execute("UPDATE email_campaigns SET status='active', updated_at=NOW() WHERE id=%s", (campaign_id,))
+        conn.commit()
+        print(f'[CAMPAIGN-SEND] campaign={campaign_id} done: sent={sent_count} failed={failed_count}')
+    except Exception as e:
+        print(f'[CAMPAIGN-SEND] campaign={campaign_id} error: {e}')
+        try:
+            c.execute("UPDATE email_campaigns SET status='draft', updated_at=NOW() WHERE id=%s", (campaign_id,))
+            conn.commit()
+        except: pass
+    finally:
+        try: c.close()
+        except: pass
+        try: conn.close()
+        except: pass
+
+
+@app.route('/api/campaigns/<int:campaign_id>/send', methods=['POST'])
+def send_campaign(campaign_id):
+    """Queue campaign step-1 send in background thread. Returns 202 immediately."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, name, status, target_filter FROM email_campaigns WHERE id=%s AND user_id=%s",
+                      (campaign_id, user_id))
+            camp = c.fetchone()
+            if not camp:
+                return jsonify({'error': 'not found'}), 404
+            if camp[2] == 'sending':
+                return jsonify({'error': 'already sending'}), 409
+
+            c.execute("SELECT id, subject, body_html FROM email_steps WHERE campaign_id=%s AND step_num=1", (campaign_id,))
+            step = c.fetchone()
+            if not step:
+                return jsonify({'error': 'no step 1 defined'}), 400
+            step_id, subject, body_html = step
+
+            tf = camp[3] or {}
+            quality_filter = tf.get('quality_grade')
+            limit = min(int(tf.get('limit', 500)), 2000)
+
+            query = "SELECT id, email, company_name FROM leads WHERE email IS NOT NULL AND email != '' AND quality_grade != 'F'"
+            params = []
+            if quality_filter:
+                query += " AND quality_grade=%s"
+                params.append(quality_filter)
+            query += f" LIMIT {limit}"
+            c.execute(query, params)
+            leads = c.fetchall()
+
+            c.execute("SELECT DISTINCT email FROM email_sends WHERE campaign_id=%s", (campaign_id,))
+            already_sent = {r[0].lower() for r in c.fetchall()}
+
+            c.execute("SELECT DISTINCT email FROM email_sends WHERE unsubscribed_at IS NOT NULL")
+            unsubscribed = {r[0].lower() for r in c.fetchall()}
+
+            c.execute("UPDATE email_campaigns SET status='sending', updated_at=NOW() WHERE id=%s", (campaign_id,))
+            conn.commit()
+
+        import threading as _thr
+        t = _thr.Thread(
+            target=_run_campaign_send_background,
+            args=(campaign_id, step_id, subject, body_html, leads, already_sent, unsubscribed),
+            daemon=True,
+        )
+        t.start()
+        return jsonify({
+            'status': 'queued',
+            'campaign_id': campaign_id,
+            'leads_to_process': len(leads),
+            'message': f'Envio iniciado para até {len(leads)} leads. Acompanhe o status da campanha.',
+        }), 202
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/campaigns/<int:campaign_id>/stats', methods=['GET'])
+def campaign_stats(campaign_id):
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id FROM email_campaigns WHERE id=%s AND user_id=%s", (campaign_id, user_id))
+            if not c.fetchone():
+                return jsonify({'error': 'not found'}), 404
+
+            c.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE status='sent') AS sent,
+                    COUNT(*) FILTER (WHERE status='opened') AS opened,
+                    COUNT(*) FILTER (WHERE status='clicked') AS clicked,
+                    COUNT(*) FILTER (WHERE status='failed') AS failed,
+                    COUNT(*) FILTER (WHERE status='unsubscribed') AS unsubscribed,
+                    COUNT(*) AS total
+                FROM email_sends WHERE campaign_id=%s
+            """, (campaign_id,))
+            r = c.fetchone()
+            total = r[5] or 0
+            sent = (r[0] or 0) + (r[1] or 0) + (r[2] or 0)
+            opens = r[1] or 0
+            clicks = r[2] or 0
+
+            # Timeline (last 14 days)
+            c.execute("""
+                SELECT DATE(occurred_at) AS day, event_type, COUNT(*) AS cnt
+                FROM email_events ee
+                JOIN email_sends es ON es.id=ee.send_id
+                WHERE es.campaign_id=%s AND occurred_at >= NOW()-INTERVAL '14 days'
+                GROUP BY day, event_type ORDER BY day
+            """, (campaign_id,))
+            timeline = [{'date': str(r[0]), 'event': r[1], 'count': r[2]} for r in c.fetchall()]
+
+            return jsonify({
+                'total': total,
+                'sent': sent,
+                'open_rate': round(opens / sent * 100, 1) if sent else 0,
+                'click_rate': round(clicks / sent * 100, 1) if sent else 0,
+                'failed': r[3] or 0,
+                'unsubscribed': r[4] or 0,
+                'timeline': timeline,
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/campaigns/provider-status', methods=['GET'])
+def campaigns_provider_status():
+    """Return daily quota usage per provider."""
+    user_id = verify_token(get_auth_header())
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    result = []
+    for p in _EMAIL_PROVIDERS:
+        used = _get_provider_usage(p['name'])
+        result.append({
+            'provider': p['name'],
+            'used': used,
+            'limit': p['daily_limit'],
+            'remaining': max(0, p['daily_limit'] - used),
+        })
+    return jsonify(result)
+
+
+# ---- Automation Engine ----
+
+def run_email_automation():
+    """
+    Called by scheduler every 2 hours.
+    For each active campaign with multiple steps, check email_sends
+    and trigger next steps based on conditions (if_opened, if_not_opened, if_clicked).
+    """
+    import datetime as _dt
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            # Find campaigns with >1 step that are active
+            c.execute("""
+                SELECT DISTINCT ec.id, ec.user_id
+                FROM email_campaigns ec
+                JOIN email_steps es ON es.campaign_id=ec.id AND es.step_num > 1
+                WHERE ec.status = 'active'
+            """)
+            campaigns = c.fetchall()
+
+            base_url = _get_base_url()
+
+            for campaign_id, user_id in campaigns:
+                # Load all steps (step_num >= 2)
+                c.execute("""
+                    SELECT id, step_num, subject, body_html, delay_days, condition
+                    FROM email_steps WHERE campaign_id=%s AND step_num > 1 ORDER BY step_num
+                """, (campaign_id,))
+                steps = c.fetchall()
+
+                for step_id, step_num, subject, body_html, delay_days, condition in steps:
+                    # For each send at step_num-1, check if this step should fire
+                    c.execute("""
+                        SELECT es.id, es.lead_id, es.email, es.opened_at, es.clicked_at, es.sent_at
+                        FROM email_sends es
+                        JOIN email_steps prev_step ON prev_step.campaign_id=%s AND prev_step.step_num=%s
+                        WHERE es.campaign_id=%s AND es.step_id=prev_step.id
+                          AND es.status NOT IN ('pending','unsubscribed')
+                    """, (campaign_id, step_num - 1, campaign_id))
+                    prev_sends = c.fetchall()
+
+                    for ps_id, lead_id, email, opened_at, clicked_at, sent_at in prev_sends:
+                        if not sent_at:
+                            continue
+                        # Check if already sent this step to this email
+                        c.execute("""
+                            SELECT id FROM email_sends
+                            WHERE campaign_id=%s AND step_id=%s AND email=%s
+                        """, (campaign_id, step_id, email))
+                        if c.fetchone():
+                            continue  # already sent
+
+                        # Check delay
+                        now = _dt.datetime.now(_dt.timezone.utc)
+                        delta = (now - sent_at.replace(tzinfo=_dt.timezone.utc)).days if sent_at.tzinfo is None else (now - sent_at).days
+                        if delta < delay_days:
+                            continue
+
+                        # Check condition
+                        should_send = False
+                        if condition == 'always':
+                            should_send = True
+                        elif condition == 'if_opened':
+                            should_send = opened_at is not None
+                        elif condition == 'if_not_opened':
+                            should_send = opened_at is None
+                        elif condition == 'if_clicked':
+                            should_send = clicked_at is not None
+
+                        if not should_send:
+                            continue
+
+                        # Send!
+                        token = str(_uuid.uuid4()).replace('-', '')
+                        tracked_html = _inject_tracking(body_html, token, base_url)
+                        unsub_url = f"{base_url}/api/track/unsubscribe/{token}"
+                        tracked_html += f'<p style="font-size:11px;color:#999;text-align:center;margin-top:30px">Para descadastrar: <a href="{unsub_url}">clique aqui</a></p>'
+                        success, provider = send_campaign_email(email, '', subject, tracked_html)
+                        status = 'sent' if success else 'failed'
+                        c.execute("""
+                            INSERT INTO email_sends (campaign_id, step_id, lead_id, email, token, provider, status, sent_at)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())
+                            ON CONFLICT (token) DO NOTHING
+                        """, (campaign_id, step_id, lead_id, email, token, provider if success else None, status))
+                    conn.commit()
+        print('[EMAIL-AUTO] Automation run complete')
+    except Exception as e:
+        print(f'[EMAIL-AUTO] Error: {e}')
+
+
+# ============= Image Generation Module =============
+try:
+    from image_gen import (
+        get_models as _img_get_models,
+        generate_image as _img_generate,
+        edit_image as _img_edit,
+        enhance_prompt as _img_enhance_prompt,
+    )
+    _IMAGE_GEN_AVAILABLE = True
+except ImportError as _img_err:
+    _IMAGE_GEN_AVAILABLE = False
+    print(f"[IMAGE-GEN] Module unavailable: {_img_err}")
+
+
+@app.route('/api/images/models', methods=['GET'])
+@require_role('client')
+def api_image_models():
+    if not _IMAGE_GEN_AVAILABLE:
+        return jsonify({'error': 'image_gen module not installed'}), 503
+    return jsonify({'models': _img_get_models()})
+
+
+@app.route('/api/images/generate', methods=['POST'])
+@require_role('client')
+def api_image_generate():
+    if not _IMAGE_GEN_AVAILABLE:
+        return jsonify({'error': 'image_gen module not installed'}), 503
+    data = request.get_json(force=True) or {}
+    prompt = (data.get('prompt') or '').strip()
+    if not prompt:
+        return jsonify({'error': 'prompt is required'}), 400
+    model_key = data.get('model', 'nano-banana-2')
+    enhance = bool(data.get('enhance', False))
+    aspect_ratio = data.get('aspect_ratio', '1:1')
+    try:
+        result = _img_generate(prompt, model_key=model_key, enhance=enhance, aspect_ratio=aspect_ratio)
+        if result.get('error') and not result.get('url'):
+            return jsonify(result), 502
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/images/edit', methods=['POST'])
+@require_role('client')
+def api_image_edit():
+    if not _IMAGE_GEN_AVAILABLE:
+        return jsonify({'error': 'image_gen module not installed'}), 503
+    data = request.get_json(force=True) or {}
+    image_url = (data.get('image_url') or '').strip()
+    prompt = (data.get('prompt') or '').strip()
+    if not image_url or not prompt:
+        return jsonify({'error': 'image_url and prompt are required'}), 400
+    model_key = data.get('model', 'nano-banana-2')
+    try:
+        result = _img_edit(image_url, prompt, model_key=model_key)
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/images/enhance-prompt', methods=['POST'])
+@require_role('client')
+def api_image_enhance_prompt():
+    if not _IMAGE_GEN_AVAILABLE:
+        return jsonify({'error': 'image_gen module not installed'}), 503
+    data = request.get_json(force=True) or {}
+    prompt = (data.get('prompt') or '').strip()
+    if not prompt:
+        return jsonify({'error': 'prompt is required'}), 400
+    result = _img_enhance_prompt(prompt)
+    return jsonify(result)
+
+
+@app.route('/api/images/health', methods=['GET'])
+@require_role('client')
+def api_image_health():
+    """Check connectivity of each image provider (FAL.AI, OpenRouter, Groq). Fast ping, no generation."""
+    import requests as _req
+    results = {}
+
+    # FAL.AI — probe key with a GET (returns 405 if key valid, 401 if invalid)
+    try:
+        from image_gen import _get_fal_key
+        fal_key = _get_fal_key()
+        if not fal_key:
+            results['fal'] = {'status': 'misconfigured', 'error': 'FAL_KEY not set'}
+        else:
+            r = _req.get('https://fal.run/fal-ai/flux/schnell',
+                         headers={'Authorization': f'Key {fal_key}'}, timeout=6)
+            if r.status_code == 401:
+                results['fal'] = {'status': 'invalid_key', 'http': 401}
+            elif r.status_code == 402:
+                results['fal'] = {'status': 'no_credits', 'http': 402}
+            else:
+                results['fal'] = {'status': 'ok', 'http': r.status_code}
+    except Exception as e:
+        results['fal'] = {'status': 'error', 'error': str(e)}
+
+    # OpenRouter — list models (fast, no credits used)
+    try:
+        from image_gen import _get_openrouter_key
+        or_key = _get_openrouter_key()
+        if not or_key:
+            results['openrouter'] = {'status': 'misconfigured', 'error': 'OPENROUTER_API_KEY not set'}
+        else:
+            r = _req.get('https://openrouter.ai/api/v1/models',
+                         headers={'Authorization': f'Bearer {or_key}'}, timeout=8)
+            if r.status_code == 401:
+                results['openrouter'] = {'status': 'invalid_key', 'http': 401}
+            else:
+                n = len(r.json().get('data', []))
+                results['openrouter'] = {'status': 'ok', 'http': r.status_code, 'models_available': n}
+    except Exception as e:
+        results['openrouter'] = {'status': 'error', 'error': str(e)}
+
+    # Groq — list models
+    try:
+        from image_gen import _get_groq_key
+        groq_key = _get_groq_key()
+        if not groq_key:
+            results['groq'] = {'status': 'misconfigured', 'error': 'GROQ_API_KEY not set'}
+        else:
+            r = _req.get('https://api.groq.com/openai/v1/models',
+                         headers={'Authorization': f'Bearer {groq_key}'}, timeout=8)
+            if r.status_code == 401:
+                results['groq'] = {'status': 'invalid_key', 'http': 401}
+            else:
+                results['groq'] = {'status': 'ok', 'http': r.status_code}
+    except Exception as e:
+        results['groq'] = {'status': 'error', 'error': str(e)}
+
+    overall = 'ok' if all(v.get('status') == 'ok' for v in results.values()) else 'degraded'
+    return jsonify({'overall': overall, 'providers': results})
+
+
 # ============= Scheduler Setup =============
 try:
     if _APSCHEDULER_AVAILABLE:
@@ -18926,6 +19912,14 @@ try:
             replace_existing=True
         )
         print('[SCHEDULER] saved_search_notifications job registrado (08:00 BRT)')
+
+        _scheduler.add_job(
+            run_email_automation,
+            CronTrigger(hour='*/2', timezone=_tz),
+            id='email_automation',
+            replace_existing=True
+        )
+        print('[SCHEDULER] email_automation job registrado (a cada 2h)')
 
         _scheduler.start()
         print(f"[SCHEDULER] Pipeline diário agendado: {DAILY_JOB_HOUR:02d}:00 America/Sao_Paulo")
