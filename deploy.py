@@ -123,8 +123,14 @@ def deploy_backend(creds):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     print(f"Conectando a {creds['VPS_HOST']}...")
-    ssh.connect(creds['VPS_HOST'], username=creds['VPS_USER'],
-                password=creds['VPS_PASS'], timeout=15)
+    _vps_key_path = r'C:\Users\acq20\.ssh\id_ed25519_vps'
+    if os.path.exists(_vps_key_path):
+        _pkey = paramiko.Ed25519Key.from_private_key_file(_vps_key_path)
+        ssh.connect(creds['VPS_HOST'], username=creds['VPS_USER'],
+                    pkey=_pkey, timeout=15)
+    else:
+        ssh.connect(creds['VPS_HOST'], username=creds['VPS_USER'],
+                    password=creds['VPS_PASS'], timeout=15)
     print("   Conectado\n")
 
     def run(cmd, timeout=60):
@@ -139,11 +145,15 @@ def deploy_backend(creds):
 
     # 2. Upload
     print("\n2. Upload de arquivos...")
+    IMAGE_GEN_PY = os.path.join(ROOT, 'app', 'backend', 'image_gen.py')
     with ssh.open_sftp() as sftp:
         sftp.put(APP_PY,  '/opt/extrator-api/app.py')
         print("   app.py enviado")
         sftp.put(REQ_TXT, '/opt/extrator-api/requirements.txt')
         print("   requirements.txt enviado")
+        if os.path.exists(IMAGE_GEN_PY):
+            sftp.put(IMAGE_GEN_PY, '/opt/extrator-api/image_gen.py')
+            print("   image_gen.py enviado")
 
     # 3. Dependências
     print("\n3. Instalando dependências...")
@@ -306,8 +316,14 @@ def rollback_backend(creds):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     print(f"Conectando a {creds['VPS_HOST']}...")
-    ssh.connect(creds['VPS_HOST'], username=creds['VPS_USER'],
-                password=creds['VPS_PASS'], timeout=15)
+    _vps_key_path = r'C:\Users\acq20\.ssh\id_ed25519_vps'
+    if os.path.exists(_vps_key_path):
+        _pkey = paramiko.Ed25519Key.from_private_key_file(_vps_key_path)
+        ssh.connect(creds['VPS_HOST'], username=creds['VPS_USER'],
+                    pkey=_pkey, timeout=15)
+    else:
+        ssh.connect(creds['VPS_HOST'], username=creds['VPS_USER'],
+                    password=creds['VPS_PASS'], timeout=15)
     print("   Conectado\n")
 
     def run(cmd, timeout=60):
