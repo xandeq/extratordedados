@@ -203,6 +203,10 @@ def run_email_automation():
             """)
             campaigns = c.fetchall()
 
+            # Global unsubscribe list — skip these in ALL automation steps
+            c.execute("SELECT DISTINCT email FROM email_sends WHERE unsubscribed_at IS NOT NULL")
+            global_unsubs = {r[0].lower() for r in c.fetchall()}
+
             base_url = _get_base_url()
 
             for campaign_id, user_id, camp_from_name in campaigns:
@@ -223,6 +227,8 @@ def run_email_automation():
                     prev_sends = c.fetchall()
 
                     for ps_id, lead_id, email, opened_at, clicked_at, sent_at in prev_sends:
+                        if email.lower() in global_unsubs:
+                            continue
                         if not sent_at:
                             continue
                         c.execute("""
@@ -344,7 +350,7 @@ def register(app, limiter, verify_token_fn, get_auth_header_fn, validate_email_f
                     conn.commit()
         except Exception as e:
             print(f'[TRACK/unsubscribe] {e}')
-        html = '<html><body style="font-family:sans-serif;text-align:center;padding:60px"><h2>Descadastrado com sucesso</h2><p>Você não receberá mais emails desta campanha.</p></body></html>'
+        html = '<html><body style="font-family:sans-serif;text-align:center;padding:60px"><h2>Descadastrado com sucesso</h2><p>Você não receberá mais emails de nossas campanhas.</p></body></html>'
         return make_response(html, 200)
 
     # ── Campaign CRUD ─────────────────────────────────────────────────────────
