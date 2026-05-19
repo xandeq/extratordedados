@@ -19551,6 +19551,7 @@ def api_image_models():
 
 @app.route('/api/images/generate', methods=['POST'])
 @require_role('client')
+@limiter.limit("10/hour")
 def api_image_generate():
     if not _IMAGE_GEN_AVAILABLE:
         return jsonify({'error': 'image_gen module not installed'}), 503
@@ -19574,6 +19575,7 @@ def api_image_generate():
 
 @app.route('/api/images/edit', methods=['POST'])
 @require_role('client')
+@limiter.limit("10/hour")
 def api_image_edit():
     if not _IMAGE_GEN_AVAILABLE:
         return jsonify({'error': 'image_gen module not installed'}), 503
